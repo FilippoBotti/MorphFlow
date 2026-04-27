@@ -9,22 +9,27 @@ class MorphFlow(nn.Module):
     def __init__(self, sigma_min=1e-5,):
         super().__init__()
         self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
-        self.cond_fusion = cond_encoder.PairConditionFusion()
+        self.cond_fusion = cond_encoder.PairConditionFusionV2(
+            cond_dim=128,
+            alpha_dim=64,
+            hidden_dim=512,
+            out_dim=512,
+        )
 
         self.sparse_structure_flow = sparse_structure_flow.SparseStructureFlowModel(
-                resolution=16,
-                in_channels=8,
-                out_channels=8,
-                model_channels=256,
-                cond_channels=256,
-                num_blocks=12,
-                num_heads=16,
-                mlp_ratio=4,
-                patch_size=1,
-                pe_mode="ape",
-                qk_rms_norm=True,
-                use_fp16=True
-            )
+            resolution=16,
+            in_channels=8,
+            out_channels=8,
+            model_channels=256,
+            cond_channels=512,
+            num_blocks=12,
+            num_heads=16,
+            mlp_ratio=4,
+            patch_size=1,
+            pe_mode="ape",
+            qk_rms_norm=True,
+            use_fp16=False
+        )
         self.sigma_min = sigma_min
         
     def get_v(self, x_0, noise, t):
@@ -45,7 +50,8 @@ class MorphFlow(nn.Module):
         cond = self.cond_fusion(cond1, cond2, alpha)
 
         # diffusion
-        out = self.sparse_structure_flow(x_t, t, cond)
+        t_flow = t.float() * 1000.0
+        out = self.sparse_structure_flow(x_t, t_flow, cond)
 
         return out
 

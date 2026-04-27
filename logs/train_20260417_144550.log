@@ -1,0 +1,88 @@
+The following values were not passed to `accelerate launch` and had defaults used instead:
+	`--num_machines` was set to a value of `1`
+	`--mixed_precision` was set to a value of `'no'`
+	`--dynamo_backend` was set to a value of `'no'`
+To avoid this warning pass in values for each of the problematic parameters or run `accelerate config`.
+[SPARSE] Backend: spconv, Attention: xformers
+[SPARSE][CONV] spconv algo: auto
+[ATTENTION] Using backend: xformers
+[SPARSE] Backend: spconv, Attention: xformers
+[SPARSE][CONV] spconv algo: auto
+[ATTENTION] Using backend: xformers
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:211: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_fwd")
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:211: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_fwd")
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:344: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_bwd")
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:344: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_bwd")
+[MorphingDistillDataset] valid samples: 17922 | skipped missing/corrupted candidates: 3
+[MorphingDistillDataset][skip] target=1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_sparse_structure_latent.pt
+[MorphingDistillDataset][skip] target=1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_sparse_structure_latent.pt
+[MorphingDistillDataset][skip] target=1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_sparse_structure_latent.pt
+[MorphingDistillDataset] valid samples: 17922 | skipped missing/corrupted candidates: 3
+[MorphingDistillDataset][skip] target=1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1188_bard-like-anthropomorphic-rat-warrior+7097_moss-covered-mushroom-folk-warrior+a0p3469/mid_sparse_structure_latent.pt
+[MorphingDistillDataset][skip] target=1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_sparse_structure_latent.pt
+[MorphingDistillDataset][skip] target=1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_slat_feats.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_slat_coords.pt
+  missing: /home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1194_jungle-ice-beast-sneaky-pose+0022_bard-like-anthropomorphic-manta-ray+a0p8288/mid_sparse_structure_latent.pt
+Using device: cuda:0
+Num processes: 2
+Dataset size: 17922
+Checkpoints and logs in: ./outputs/morphflow/20260417_144550
+TensorBoard logs in: ./outputs/morphflow/20260417_144550/tb
+Epoch 1/100:   0%|          | 0/641 [00:00<?, ?it/s]Epoch 1/100:   0%|          | 0/641 [00:04<?, ?it/s, avg=1.376602, loss=1.376602, step=1]Epoch 1/100:   0%|          | 1/641 [00:04<48:12,  4.52s/it, avg=1.376602, loss=1.376602, step=1]Epoch 1/100:   0%|          | 1/641 [00:08<48:12,  4.52s/it, avg=1.392216, loss=1.407830, step=2]Epoch 1/100:   0%|          | 2/641 [00:08<44:08,  4.15s/it, avg=1.392216, loss=1.407830, step=2]Epoch 1/100:   0%|          | 2/641 [00:12<44:08,  4.15s/it, avg=1.397556, loss=1.408235, step=3]Epoch 1/100:   0%|          | 3/641 [00:12<42:42,  4.02s/it, avg=1.397556, loss=1.408235, step=3]Epoch 1/100:   0%|          | 3/641 [00:16<42:42,  4.02s/it, avg=1.398281, loss=1.400458, step=4]Epoch 1/100:   1%|          | 4/641 [00:16<41:36,  3.92s/it, avg=1.398281, loss=1.400458, step=4]Epoch 1/100:   1%|          | 4/641 [00:19<41:36,  3.92s/it, avg=1.400910, loss=1.411422, step=5]Epoch 1/100:   1%|          | 5/641 [00:19<41:31,  3.92s/it, avg=1.400910, loss=1.411422, step=5]Epoch 1/100:   1%|          | 5/641 [00:23<41:31,  3.92s/it, avg=1.398157, loss=1.384394, step=6]Epoch 1/100:   1%|          | 6/641 [00:23<41:19,  3.90s/it, avg=1.398157, loss=1.384394, step=6]Epoch 1/100:   1%|          | 6/641 [00:27<41:19,  3.90s/it, avg=1.401235, loss=1.419705, step=7]Epoch 1/100:   1%|          | 7/641 [00:27<40:55,  3.87s/it, avg=1.401235, loss=1.419705, step=7]Epoch 1/100:   1%|          | 7/641 [00:31<40:55,  3.87s/it, avg=1.396525, loss=1.363557, step=8]Epoch 1/100:   1%|          | 8/641 [00:31<40:45,  3.86s/it, avg=1.396525, loss=1.363557, step=8]Epoch 1/100:   1%|          | 8/641 [00:35<40:45,  3.86s/it, avg=1.393968, loss=1.373513, step=9]Epoch 1/100:   1%|▏         | 9/641 [00:35<40:19,  3.83s/it, avg=1.393968, loss=1.373513, step=9]Epoch 1/100:   1%|▏         | 9/641 [00:39<40:19,  3.83s/it, avg=1.391281, loss=1.367089, step=10]Epoch 1/100:   2%|▏         | 10/641 [00:39<40:13,  3.83s/it, avg=1.391281, loss=1.367089, step=10]Epoch 1/100:   2%|▏         | 10/641 [00:42<40:13,  3.83s/it, avg=1.392174, loss=1.401107, step=11]Epoch 1/100:   2%|▏         | 11/641 [00:42<40:09,  3.82s/it, avg=1.392174, loss=1.401107, step=11]Epoch 1/100:   2%|▏         | 11/641 [00:46<40:09,  3.82s/it, avg=1.389453, loss=1.359519, step=12]Epoch 1/100:   2%|▏         | 12/641 [00:46<39:54,  3.81s/it, avg=1.389453, loss=1.359519, step=12]Epoch 1/100:   2%|▏         | 12/641 [00:50<39:54,  3.81s/it, avg=1.388706, loss=1.379746, step=13]Epoch 1/100:   2%|▏         | 13/641 [00:50<39:58,  3.82s/it, avg=1.388706, loss=1.379746, step=13]Epoch 1/100:   2%|▏         | 13/641 [00:54<39:58,  3.82s/it, avg=1.385987, loss=1.350636, step=14]Epoch 1/100:   2%|▏         | 14/641 [00:54<39:59,  3.83s/it, avg=1.385987, loss=1.350636, step=14]Epoch 1/100:   2%|▏         | 14/641 [00:58<39:59,  3.83s/it, avg=1.383214, loss=1.344394, step=15]Epoch 1/100:   2%|▏         | 15/641 [00:58<40:03,  3.84s/it, avg=1.383214, loss=1.344394, step=15]Epoch 1/100:   2%|▏         | 15/641 [01:02<40:03,  3.84s/it, avg=1.382197, loss=1.366945, step=16]Epoch 1/100:   2%|▏         | 16/641 [01:02<39:56,  3.83s/it, avg=1.382197, loss=1.366945, step=16]Epoch 1/100:   2%|▏         | 16/641 [01:05<39:56,  3.83s/it, avg=1.381236, loss=1.365868, step=17]Epoch 1/100:   3%|▎         | 17/641 [01:05<39:57,  3.84s/it, avg=1.381236, loss=1.365868, step=17]E0417 14:47:02.742000 140709697762368 torch/distributed/elastic/multiprocessing/api.py:833] failed (exitcode: -15) local_rank: 0 (pid: 2925098) of binary: /home/filippo/.conda/envs/trellis/bin/python
+Traceback (most recent call last):
+  File "/home/filippo/.conda/envs/trellis/bin/accelerate", line 6, in <module>
+    sys.exit(main())
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/accelerate_cli.py", line 50, in main
+    args.func(args)
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/launch.py", line 1396, in launch_command
+    multi_gpu_launcher(args)
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/launch.py", line 1023, in multi_gpu_launcher
+    distrib_run.run(args)
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 133, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 264, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+=========================================================
+main.py FAILED
+---------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-04-17_14:47:02
+  host      : implabmonster
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 2925099)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 2925099
+---------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-17_14:47:02
+  host      : implabmonster
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 2925098)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 2925098
+=========================================================

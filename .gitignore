@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directory
+outputs/
+scripts/
+tmp/
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

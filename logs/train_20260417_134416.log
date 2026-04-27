@@ -1,0 +1,37 @@
+[SPARSE] Backend: spconv, Attention: xformers
+[SPARSE][CONV] spconv algo: auto
+[ATTENTION] Using backend: xformers
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:211: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_fwd")
+/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:344: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("xformers_flash::flash_bwd")
+Using device: cuda:0
+Dataset size: 17925
+Checkpoints and logs in: ./outputs/morphflow/20260417_134418
+TensorBoard logs in: ./outputs/morphflow/20260417_134418/tb
+Traceback (most recent call last):
+  File "/home/filippo/projects/MorphFlow/main.py", line 9, in <module>
+    train(args)
+  File "/home/filippo/projects/MorphFlow/train.py", line 64, in train
+    for batch_idx, batch in enumerate(loader, start=1):
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 630, in __next__
+    data = self._next_data()
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 673, in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/filippo/projects/MorphFlow/data/morph_dataset.py", line 78, in __getitem__
+    target_feats, target_coords = self._load_slat(target_dir, prefix="mid_slat")
+  File "/home/filippo/projects/MorphFlow/data/morph_dataset.py", line 58, in _load_slat
+    feats = self._torch_load_safe(
+  File "/home/filippo/projects/MorphFlow/data/morph_dataset.py", line 53, in _torch_load_safe
+    return torch.load(path, map_location="cpu", weights_only=True)
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/serialization.py", line 1065, in load
+    with _open_file_like(f, 'rb') as opened_file:
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/serialization.py", line 468, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/serialization.py", line 449, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: '/home/filippo/datasets/3d/morphing_dataset_flux/pairs_2/1193_bard-like-anthropomorphic-hamster-monk+6952_compact-anthropomorphic-tortoise-guarding-stance+a0p7349/mid_slat_feats.pt'

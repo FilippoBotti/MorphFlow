@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/filippo/.local/bin/accelerate", line 5, in <module>
+    from accelerate.commands.accelerate_cli import main
+  File "/home/filippo/.local/lib/python3.11/site-packages/accelerate/__init__.py", line 16, in <module>
+    from .accelerator import Accelerator
+  File "/home/filippo/.local/lib/python3.11/site-packages/accelerate/accelerator.py", line 34, in <module>
+    from huggingface_hub import split_torch_state_dict_into_shards
+ImportError: cannot import name 'split_torch_state_dict_into_shards' from 'huggingface_hub' (/anaconda3/lib/python3.11/site-packages/huggingface_hub/__init__.py)
