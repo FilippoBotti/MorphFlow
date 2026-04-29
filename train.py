@@ -36,15 +36,10 @@ def build_parser():
     parser.add_argument("--val_examples", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
-    parser.add_argument(
-        "--exclude_val_assets_from_train",
-        type=int,
-        choices=[0, 1],
-        default=1,
-        help="If 1, training excludes entries that use src assets found in val metadata.",
-    )
+    parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1, help="If 1, training excludes entries that use src assets found in val metadata.",)
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
     return parser
 
 
@@ -201,7 +196,66 @@ def train(args):
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
     model = MorphFlow()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    try:
+        accelerator.print("Caricamento pesi pre-addestrati TRELLIS dalla cache...")
+        ckpt_path = hf_hub_download(
+            repo_id="microsoft/TRELLIS-text-base", 
+            filename="ckpts/ss_flow_txt_dit_B_16l8_fp16.safetensors"
+        )
+        trellis_state_dict = load_file(ckpt_path)
+        
+        # Carichiamo i pesi ESCLUSIVAMENTE dentro al sottomodulo 'sparse_structure_flow'
+        model.sparse_structure_flow.load_state_dict(trellis_state_dict, strict=True)
+        accelerator.print("Pesi TRELLIS (SparseStructureFlowModel) caricati con successo!")
+    except Exception as e:
+        accelerator.print(f"Errore nel caricamento dei pesi pre-addestrati: {e}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+
+    from transformers import get_cosine_schedule_with_warmup
+   
+    total_training_steps = args.train_epochs * len(loader)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=1000, 
+        num_training_steps=total_training_steps
+    )
+
+    model, optimizer, loader, scheduler = accelerator.prepare(
+        model, optimizer, loader, scheduler
+    )
+
+    start_epoch = 1
+    global_step = 0
+    ckpt_for_ema = None
+
+    if args.resume_from:
+        if os.path.exists(args.resume_from):
+            accelerator.print(f"Resuming from checkpoint: {args.resume_from}")
+            # Use weights_only=False inside torch.load per modern PyTorch conventions when loading optimizers to avoid warnings/errors
+            try:
+                ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+            except Exception:
+                ckpt = torch.load(args.resume_from, map_location="cpu")
+            
+            # Clean module. prefix in case it was saved from DataParallel/DDP
+            cleaned_model_dict = {}
+            for k, v in ckpt["model"].items():
+                new_key = k[7:] if k.startswith("module.") else k
+                cleaned_model_dict[new_key] = v
+            
+            accelerator.unwrap_model(model).load_state_dict(cleaned_model_dict, strict=True)
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_epoch = ckpt["epoch"] + 1
+            global_step = ckpt["step"]
+            ckpt_for_ema = ckpt
+        else:
+            accelerator.print(f"Checkpoint path {args.resume_from} does not exist, starting from scratch.")
 
     if val_loader is not None:
         model, optimizer, loader, val_loader = accelerator.prepare(model, optimizer, loader, val_loader)
@@ -211,7 +265,11 @@ def train(args):
     unwrapped_model = accelerator.unwrap_model(model)
     ema_state = None
     if args.use_ema == 1 and accelerator.is_main_process:
-        ema_state = init_ema_state_dict(unwrapped_model)
+        if ckpt_for_ema and "model_ema" in ckpt_for_ema:
+            accelerator.print("Restoring EMA state from checkpoint.")
+            ema_state = ckpt_for_ema["model_ema"]
+        else:
+            ema_state = init_ema_state_dict(unwrapped_model)
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.out_dir, run_name)
@@ -238,10 +296,9 @@ def train(args):
     if args.use_ema == 1:
         accelerator.print(f"EMA decay: {args.ema_decay}")
 
-    global_step = 0
     model.train()
 
-    for epoch in range(1, args.train_epochs + 1):
+    for epoch in range(start_epoch, args.train_epochs + 1):
         running_loss = 0.0
 
         progress_bar = tqdm(
@@ -275,6 +332,8 @@ def train(args):
 
             accelerator.backward(loss)
             optimizer.step()
+            scheduler.step()  
+            optimizer.zero_grad()
 
             if args.use_ema == 1 and accelerator.is_main_process:
                 update_ema_state_dict(ema_state, unwrapped_model, args.ema_decay)

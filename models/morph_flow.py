@@ -9,26 +9,28 @@ class MorphFlow(nn.Module):
     def __init__(self, sigma_min=1e-5,):
         super().__init__()
         self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
+        
+        # Usa il modello 'Base' per occupare molta meno memoria
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
             alpha_dim=64,
             hidden_dim=512,
-            out_dim=512,
+            out_dim=768, # <-- CAMBIATO DA 1024 a 768 per versione base
         )
 
         self.sparse_structure_flow = sparse_structure_flow.SparseStructureFlowModel(
             resolution=16,
             in_channels=8,
             out_channels=8,
-            model_channels=256,
-            cond_channels=512,
-            num_blocks=12,
-            num_heads=16,
+            model_channels=768,  # <-- CAMBIATO DA 1024 a 768
+            cond_channels=768,   # <-- CAMBIATO DA 1024 a 768
+            num_blocks=12,       # <-- CAMBIATO DA 24 a 12
+            num_heads=12,        # <-- CAMBIATO DA 16 a 12
             mlp_ratio=4,
             patch_size=1,
             pe_mode="ape",
             qk_rms_norm=True,
-            use_fp16=False
+            use_fp16=False        
         )
         self.sigma_min = sigma_min
         
