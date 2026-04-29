@@ -1,57 +1,0 @@
-The following values were not passed to `accelerate launch` and had defaults used instead:
-	`--num_machines` was set to a value of `1`
-	`--mixed_precision` was set to a value of `'no'`
-	`--dynamo_backend` was set to a value of `'no'`
-To avoid this warning pass in values for each of the problematic parameters or run `accelerate config`.
-[SPARSE] Backend: spconv, Attention: xformers
-[SPARSE][CONV] spconv algo: auto
-[ATTENTION] Using backend: xformers
-[SPARSE] Backend: spconv, Attention: xformers
-[SPARSE][CONV] spconv algo: auto
-[ATTENTION] Using backend: xformers
-/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:211: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
-  @torch.library.impl_abstract("xformers_flash::flash_fwd")
-/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:344: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
-  @torch.library.impl_abstract("xformers_flash::flash_bwd")
-/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:211: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
-  @torch.library.impl_abstract("xformers_flash::flash_fwd")
-/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/xformers/ops/fmha/flash.py:344: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
-  @torch.library.impl_abstract("xformers_flash::flash_bwd")
-[MorphingDistillDataset] valid samples: 17571 | skipped missing/corrupted candidates: 0 | skipped by asset exclusion: 354
-[MorphingDistillDataset] valid samples: 200 | skipped missing/corrupted candidates: 0 | skipped by asset exclusion: 0
-Using device: cuda:0
-Num processes: 2
-Dataset size: 17571
-Excluded train assets from validation metadata: 84
-Validation dataset size: 200
-Checkpoints and logs in: ./outputs/morphflow/20260424_124706
-TensorBoard logs in: ./outputs/morphflow/20260424_124706/tb
-EMA enabled: True
-EMA decay: 0.9999
-Epoch 1/100:   0%|          | 0/628 [00:00<?, ?it/s]Epoch 1/100:   0%|          | 0/628 [00:14<?, ?it/s, avg=1.419073, loss=1.419073, step=1]Epoch 1/100:   0%|          | 1/628 [00:14<2:34:37, 14.80s/it, avg=1.419073, loss=1.419073, step=1]Epoch 1/100:   0%|          | 1/628 [00:28<2:34:37, 14.80s/it, avg=1.412360, loss=1.405646, step=2]Epoch 1/100:   0%|          | 2/628 [00:28<2:25:35, 13.95s/it, avg=1.412360, loss=1.405646, step=2]Epoch 1/100:   0%|          | 2/628 [00:42<2:25:35, 13.95s/it, avg=1.412523, loss=1.412849, step=3]Epoch 1/100:   0%|          | 3/628 [00:42<2:25:40, 13.98s/it, avg=1.412523, loss=1.412849, step=3]Epoch 1/100:   0%|          | 3/628 [00:55<2:25:40, 13.98s/it, avg=1.412683, loss=1.413163, step=4]Epoch 1/100:   1%|          | 4/628 [00:55<2:21:57, 13.65s/it, avg=1.412683, loss=1.413163, step=4]W0424 12:48:10.140000 140207739114560 torch/distributed/elastic/agent/server/api.py:688] Received Signals.SIGTERM death signal, shutting down workers
-W0424 12:48:10.140000 140207739114560 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 3245382 closing signal SIGTERM
-W0424 12:48:10.141000 140207739114560 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 3245383 closing signal SIGTERM
-Traceback (most recent call last):
-  File "/home/filippo/.conda/envs/trellis/bin/accelerate", line 6, in <module>
-    sys.exit(main())
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/accelerate_cli.py", line 50, in main
-    args.func(args)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/launch.py", line 1396, in launch_command
-    multi_gpu_launcher(args)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/accelerate/commands/launch.py", line 1023, in multi_gpu_launcher
-    distrib_run.run(args)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/run.py", line 892, in run
-    elastic_launch(
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 133, in __call__
-    return launch_agent(self._config, self._entrypoint, list(args))
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 255, in launch_agent
-    result = agent.run()
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 124, in wrapper
-    result = f(*args, **kwargs)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 680, in run
-    result = self._invoke_run(role)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 835, in _invoke_run
-    time.sleep(monitor_interval)
-  File "/home/filippo/.conda/envs/trellis/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 79, in _terminate_process_handler
-    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
-torch.distributed.elastic.multiprocessing.api.SignalException: Process 3245297 got signal: 15
