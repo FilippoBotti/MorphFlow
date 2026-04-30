@@ -40,6 +40,7 @@ def build_parser():
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
+    parser.add_argument("--trellis_model", type=str, choices=["text_base", "image_large"], default="text_base")
     return parser
 
 
@@ -195,22 +196,28 @@ def train(args):
     elif val_metadata_path:
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
-    model = MorphFlow()
+    model = MorphFlow(model_type=args.trellis_model)
 
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
     try:
-        accelerator.print("Caricamento pesi pre-addestrati TRELLIS dalla cache...")
+        if args.trellis_model == "text_base":
+            repo_id = "microsoft/TRELLIS-text-base"
+            filename = "ckpts/ss_flow_txt_dit_B_16l8_fp16.safetensors"
+        else:
+            repo_id = "microsoft/TRELLIS-image-large"
+            filename = "ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors"
+
+        accelerator.print(f"Caricamento pesi pre-addestrati {repo_id} dalla cache...")
         ckpt_path = hf_hub_download(
-            repo_id="microsoft/TRELLIS-text-base", 
-            filename="ckpts/ss_flow_txt_dit_B_16l8_fp16.safetensors"
+            repo_id=repo_id, 
+            filename=filename
         )
         trellis_state_dict = load_file(ckpt_path)
         
-        # Carichiamo i pesi ESCLUSIVAMENTE dentro al sottomodulo 'sparse_structure_flow'
         model.sparse_structure_flow.load_state_dict(trellis_state_dict, strict=True)
-        accelerator.print("Pesi TRELLIS (SparseStructureFlowModel) caricati con successo!")
+        accelerator.print(f"Pesi TRELLIS ({args.trellis_model}) caricati con successo!")
     except Exception as e:
         accelerator.print(f"Errore nel caricamento dei pesi pre-addestrati: {e}")
 

@@ -6,26 +6,36 @@ from models import sparse_structure_flow
 from models import cond_encoder
 
 class MorphFlow(nn.Module):
-    def __init__(self, sigma_min=1e-5,):
+    def __init__(self, sigma_min=1e-5, model_type="text_base"):
         super().__init__()
-        self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
         
-        # Usa il modello 'Base' per occupare molta meno memoria
+        if model_type == "text_base":
+            model_channels = 768
+            num_blocks = 12
+            num_heads = 12
+        elif model_type == "image_large":
+            model_channels = 1024
+            num_blocks = 24
+            num_heads = 16
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
             alpha_dim=64,
             hidden_dim=512,
-            out_dim=768, # <-- CAMBIATO DA 1024 a 768 per versione base
+            out_dim=model_channels, 
         )
 
         self.sparse_structure_flow = sparse_structure_flow.SparseStructureFlowModel(
             resolution=16,
             in_channels=8,
             out_channels=8,
-            model_channels=768,  # <-- CAMBIATO DA 1024 a 768
-            cond_channels=768,   # <-- CAMBIATO DA 1024 a 768
-            num_blocks=12,       # <-- CAMBIATO DA 24 a 12
-            num_heads=12,        # <-- CAMBIATO DA 16 a 12
+            model_channels=model_channels, 
+            cond_channels=model_channels, 
+            num_blocks=num_blocks,    
+            num_heads=num_heads,  
             mlp_ratio=4,
             patch_size=1,
             pe_mode="ape",
