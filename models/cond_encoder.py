@@ -49,7 +49,7 @@ class PairConditionFusionV2(nn.Module):
 
 
 class BlockPoolConditionEncoder(nn.Module):
-    def __init__(self, feat_dim=8, proj_dim=64, block_size=8, out_dim=128):
+    def __init__(self, feat_dim=8, proj_dim=64, block_size=4, out_dim=128):
         super().__init__()
         self.block_size = block_size
         self.grid_size = 64

@@ -18,6 +18,7 @@ if os.environ.get("TRELLIS_REPO"):
 from torch.utils.data import DataLoader
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.morph_flow import MorphFlow
+from models.lora import add_lora_to_cross_attention, freeze_module
 from trellis.models import from_pretrained as trellis_from_pretrained
 from trellis.modules.sparse.basic import SparseTensor
 
@@ -29,6 +30,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./outputs/eval_simplified")
     parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--trellis_model", type=str, choices=["auto", "text_base", "image_large"], default="auto")
+    parser.add_argument("--use_ema", type=int, choices=[0, 1], default=1)
     return parser.parse_args()
 
 def find_latest_checkpoint(checkpoints_root):
@@ -104,8 +107,44 @@ def main():
     ckpt_path = find_latest_checkpoint(args.checkpoints_root)
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = MorphFlow().to(device)
-    model.load_state_dict(unwrap_state_dict(ckpt), strict=True)
+
+    model_type = args.trellis_model
+    if model_type == "auto":
+        model_type = "text_base"
+        if isinstance(ckpt, dict):
+            model_type = ckpt.get("model_type", model_type)
+            if "args" in ckpt and isinstance(ckpt["args"], dict):
+                model_type = ckpt["args"].get("trellis_model", model_type)
+
+    state_to_load = ckpt
+    if args.use_ema == 1 and isinstance(ckpt, dict) and "model_ema" in ckpt:
+        print("Loading EMA weights from checkpoint")
+        state_to_load = ckpt["model_ema"]
+
+    print(f"Using MorphFlow model_type: {model_type}")
+    model = MorphFlow(model_type=model_type).to(device)
+
+    ckpt_args = {}
+    if isinstance(ckpt, dict) and "args" in ckpt and isinstance(ckpt["args"], dict):
+        ckpt_args = ckpt["args"]
+
+    if int(ckpt_args.get("use_lora", 0)) == 1:
+        freeze_module(model.sparse_structure_flow)
+
+        lora_targets = ckpt_args.get("lora_target_modules", "to_q,to_kv")
+        lora_targets = [x.strip() for x in lora_targets.split(",") if x.strip()]
+
+        lora_modules = add_lora_to_cross_attention(
+            model.sparse_structure_flow,
+            rank=int(ckpt_args.get("lora_rank", 8)),
+            alpha=int(ckpt_args.get("lora_alpha", 16)),
+            dropout=float(ckpt_args.get("lora_dropout", 0.0)),
+            target_modules=tuple(lora_targets),
+        )
+
+        print(f"LoRA enabled for eval on {len(lora_modules)} cross-attention modules")
+
+    model.load_state_dict(unwrap_state_dict(state_to_load), strict=True)
     model.eval()
 
     print("Loading TRELLIS decoders...")

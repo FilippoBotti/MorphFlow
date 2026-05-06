@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.morph_flow import MorphFlow
+from models.lora import add_lora_to_cross_attention, freeze_module, trainable_parameters, print_trainable_parameters
 
 try:
     import matplotlib.pyplot as plt
@@ -30,6 +31,14 @@ def build_parser():
     parser.add_argument("--val_bs", type=int, default=1)
     parser.add_argument("--train_epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--cond_lr", type=float, default=None, help="Learning rate for added conditioning modules. Defaults to --lr.")
+    parser.add_argument("--flow_lr", type=float, default=None, help="Learning rate for pretrained TRELLIS sparse_structure_flow. Defaults to --lr.")
+    parser.add_argument("--use_lora", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--lora_lr", type=float, default=None)
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_target_modules", type=str, default="to_q,to_kv")
     parser.add_argument("--out_dir", type=str, default="./outputs")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -221,7 +230,62 @@ def train(args):
     except Exception as e:
         accelerator.print(f"Errore nel caricamento dei pesi pre-addestrati: {e}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    lora_modules = []
+
+    if args.use_lora == 1:
+        freeze_module(model.sparse_structure_flow)
+
+        lora_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
+        lora_modules = add_lora_to_cross_attention(
+            model.sparse_structure_flow,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=tuple(lora_targets),
+        )
+
+        accelerator.print(f"LoRA enabled on cross-attention modules: {len(lora_modules)}")
+        for name in lora_modules[:20]:
+            accelerator.print(f"  LoRA: {name}")
+        if len(lora_modules) > 20:
+            accelerator.print(f"  ... and {len(lora_modules) - 20} more")
+
+        if len(lora_modules) == 0:
+            raise RuntimeError(
+                "No LoRA modules were inserted. Check lora_target_modules and TRELLIS module names."
+        )
+
+    cond_lr = args.lr if args.cond_lr is None else args.cond_lr
+    flow_lr = args.lr if args.flow_lr is None else args.flow_lr
+    lora_lr = args.lr if args.lora_lr is None else args.lora_lr
+
+    cond_params = list(model.cond_encoder.parameters()) + list(model.cond_fusion.parameters())
+
+    if args.use_lora == 1:
+        lora_params = trainable_parameters(model.sparse_structure_flow)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": cond_params, "lr": cond_lr},
+                {"params": lora_params, "lr": lora_lr},
+            ],
+            weight_decay=1e-4,
+        )
+
+        accelerator.print(f"Condition LR: {cond_lr}")
+        accelerator.print(f"LoRA LR: {lora_lr}")
+        accelerator.print("TRELLIS sparse_structure_flow: frozen except LoRA")
+    else:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": cond_params, "lr": cond_lr},
+                {"params": model.sparse_structure_flow.parameters(), "lr": flow_lr},
+            ],
+            weight_decay=1e-4,
+        )
+
+        accelerator.print(f"Condition LR: {cond_lr}")
+        accelerator.print(f"TRELLIS flow LR: {flow_lr}")
 
     from transformers import get_cosine_schedule_with_warmup
    
@@ -233,9 +297,17 @@ def train(args):
         num_training_steps=total_training_steps
     )
 
-    model, optimizer, loader, scheduler = accelerator.prepare(
-        model, optimizer, loader, scheduler
-    )
+    if accelerator.is_main_process:
+        print_trainable_parameters(model)
+
+    if val_loader is not None:
+        model, optimizer, loader, val_loader, scheduler = accelerator.prepare(
+            model, optimizer, loader, val_loader, scheduler
+        )
+    else:
+        model, optimizer, loader, scheduler = accelerator.prepare(
+            model, optimizer, loader, scheduler
+        )
 
     start_epoch = 1
     global_step = 0
@@ -257,17 +329,20 @@ def train(args):
                 cleaned_model_dict[new_key] = v
             
             accelerator.unwrap_model(model).load_state_dict(cleaned_model_dict, strict=True)
-            optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception as e:
+                accelerator.print(f"Could not restore optimizer state: {e}")
+            if "scheduler" in ckpt:
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                except Exception as e:
+                    accelerator.print(f"Could not restore scheduler state: {e}")
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt["step"]
             ckpt_for_ema = ckpt
         else:
             accelerator.print(f"Checkpoint path {args.resume_from} does not exist, starting from scratch.")
-
-    if val_loader is not None:
-        model, optimizer, loader, val_loader = accelerator.prepare(model, optimizer, loader, val_loader)
-    else:
-        model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
 
     unwrapped_model = accelerator.unwrap_model(model)
     ema_state = None
@@ -300,6 +375,8 @@ def train(args):
     accelerator.print(f"Checkpoints and logs in: {out_dir}")
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
     accelerator.print(f"EMA enabled: {args.use_ema == 1}")
+    accelerator.print(f"Condition LR: {cond_lr}")
+    accelerator.print(f"TRELLIS flow LR: {flow_lr}")
     if args.use_ema == 1:
         accelerator.print(f"EMA decay: {args.ema_decay}")
 
@@ -353,8 +430,12 @@ def train(args):
 
             if writer is not None:
                 writer.add_scalar("train/loss_step", loss_value, global_step)
-                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-
+                writer.add_scalar("train/cond_lr", optimizer.param_groups[0]["lr"], global_step)
+                if args.use_lora == 1:
+                    writer.add_scalar("train/lora_lr", optimizer.param_groups[1]["lr"], global_step)
+                else:
+                    writer.add_scalar("train/flow_lr", optimizer.param_groups[1]["lr"], global_step)
+            
             if accelerator.is_local_main_process:
                 progress_bar.set_postfix(
                     loss=f"{loss_value:.6f}",
@@ -459,6 +540,12 @@ def train(args):
                 "step": global_step,
                 "model": accelerator.get_state_dict(model),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "model_type": args.trellis_model,
+                "sigma_min": accelerator.unwrap_model(model).sigma_min,
+                "args": vars(args),
+                "train_loss": epoch_avg,
+                "val_loss": val_avg,
             }
             if args.use_ema == 1 and ema_state is not None:
                 ckpt["model_ema"] = ema_state
@@ -478,6 +565,10 @@ def train(args):
             "step": global_step,
             "model": accelerator.get_state_dict(model),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "model_type": args.trellis_model,
+            "sigma_min": accelerator.unwrap_model(model).sigma_min,
+            "args": vars(args),
         }
         if args.use_ema == 1 and ema_state is not None:
             ckpt["model_ema"] = ema_state

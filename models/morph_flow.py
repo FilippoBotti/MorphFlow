@@ -44,7 +44,7 @@ class MorphFlow(nn.Module):
         )
         self.sigma_min = sigma_min
         
-    def get_v(self, x_0, noise, t):
+    def get_v(self, x_0, noise):
         return (1 - self.sigma_min) * noise - x_0
     
     def diffuse(self, x_0, t):
@@ -73,7 +73,7 @@ class MorphFlow(nn.Module):
         t = torch.rand(B).to(x_0.device).float()
         x_t, noise = self.diffuse(x_0, t)
 
-        velocity = self.get_v(x_0, noise, t)
+        velocity = self.get_v(x_0, noise)
 
         pred = self.forward_flow(x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha)
 
