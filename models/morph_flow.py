@@ -69,9 +69,14 @@ class MorphFlow(nn.Module):
         if self.training and self.cfg_drop_prob > 0.0:
             B = cond.shape[0]
             drop_mask = torch.rand(B, device=cond.device) < self.cfg_drop_prob
-            if drop_mask.any():
-                null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
-                cond = torch.where(drop_mask.view(B, 1, 1), null_cond, cond)
+
+            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+
+            cond = torch.where(
+                drop_mask.view(B, 1, 1),
+                null_cond,
+                cond,
+            )
 
         # diffusion
         t_flow = t.float() * 1000.0
