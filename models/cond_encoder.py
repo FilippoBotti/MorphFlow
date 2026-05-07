@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import time
+import math
 
 class AlphaEmbedder(nn.Module):
     def __init__(self, emb_dim=64):
@@ -35,17 +36,17 @@ class PairConditionFusionV2(nn.Module):
         )
 
     def forward(self, cond1, cond2, alpha):
-        alpha_emb = self.alpha_embed(alpha)                    # [B, 64]
-        alpha_emb = alpha_emb.unsqueeze(1).expand(-1, cond1.shape[1], -1)  # [B, 512, 64]
+        alpha_emb = self.alpha_embed(alpha)                    
+        alpha_emb = alpha_emb.unsqueeze(1).expand(-1, cond1.shape[1], -1)  
 
         delta = cond2 - cond1
         fusion_input = torch.cat([cond1, cond2, delta, alpha_emb], dim=-1)
 
-        gate = self.gate_mlp(fusion_input)                    # [B, 512, 128]
+        gate = self.gate_mlp(fusion_input)                    
         mixed = gate * cond2 + (1.0 - gate) * cond1
 
         out_input = torch.cat([mixed, delta, cond1 * cond2, alpha_emb], dim=-1)
-        return self.out_mlp(out_input)                        # [B, 512, 512]
+        return self.out_mlp(out_input)                        
 
 
 class BlockPoolConditionEncoder(nn.Module):
@@ -64,7 +65,7 @@ class BlockPoolConditionEncoder(nn.Module):
         )
 
         self.global_mlp = nn.Sequential(
-            nn.Linear(proj_dim * 2, 512),
+            nn.Linear(proj_dim * 2 + 2, 512),
             nn.ReLU(),
             nn.Linear(512, out_dim),
         )
@@ -129,39 +130,69 @@ class BlockPoolConditionEncoder(nn.Module):
         bz = xyz[:, 2] // self.block_size
 
         block_idx = bx * (self.n_blocks * self.n_blocks) + by * self.n_blocks + bz
+        global_idx = batch_ids * self.num_blocks + block_idx   # [sumN]
 
-        pooled_blocks = []
+        total_blocks = B * self.num_blocks
 
-        for b in range(B):
-            mask_b = (batch_ids == b)
-            f = feats[mask_b]
-            idx = block_idx[mask_b]
+        mean_pool = torch.zeros(
+            total_blocks, D,
+            device=feats.device,
+            dtype=feats.dtype,
+        )
 
-            mean_pool = torch.zeros(self.num_blocks, D, device=f.device, dtype=f.dtype)
-            max_pool = torch.zeros(self.num_blocks, D, device=f.device, dtype=f.dtype)
-            counts = torch.zeros(self.num_blocks, 1, device=f.device, dtype=f.dtype)
+        counts = torch.zeros(
+            total_blocks, 1,
+            device=feats.device,
+            dtype=feats.dtype,
+        )
 
-            mean_pool.index_add_(0, idx, f)
-            counts.index_add_(
-                0,
-                idx,
-                torch.ones((f.shape[0], 1), device=f.device, dtype=f.dtype)
-            )
-            mean_pool = mean_pool / counts.clamp(min=1.0)
+        mean_pool.index_add_(0, global_idx, feats)
 
-            for k in range(self.num_blocks):
-                mask_k = (idx == k)
-                if mask_k.any():
-                    max_pool[k] = f[mask_k].max(dim=0).values
+        ones = torch.ones(
+            feats.shape[0], 1,
+            device=feats.device,
+            dtype=feats.dtype,
+        )
+        counts.index_add_(0, global_idx, ones)
 
-            block_feat = torch.cat([mean_pool, max_pool], dim=-1)
-            pooled_blocks.append(block_feat)
+        mean_pool = mean_pool / counts.clamp(min=1.0)
 
-        pooled_blocks = torch.stack(pooled_blocks, dim=0)   # [B, num_blocks, 2D]
-        cond = self.global_mlp(pooled_blocks)               # [B, num_blocks, out_dim]
+        max_pool = torch.full(
+            (total_blocks, D),
+            -torch.inf,
+            device=feats.device,
+            dtype=feats.dtype,
+        )
 
-        coord_emb = self.coord_mlp(self.block_coords)       # [num_blocks, out_dim]
-        coord_emb = coord_emb.unsqueeze(0)                  # [1, num_blocks, out_dim]
+        expanded_idx = global_idx.view(-1, 1).expand(-1, D)
+
+        max_pool.scatter_reduce_(
+            0,
+            expanded_idx,
+            feats,
+            reduce="amax",
+            include_self=True,
+        )
+
+        max_pool = torch.where(
+            torch.isinf(max_pool),
+            torch.zeros_like(max_pool),
+            max_pool,
+        )
+
+        occupancy = (counts > 0).to(dtype=feats.dtype)
+        log_count = torch.log1p(counts) / math.log1p(float(self.block_size ** 3))
+
+        block_feat = torch.cat(
+            [mean_pool, max_pool, occupancy, log_count],
+            dim=-1,
+        )
+
+        pooled_blocks = block_feat.view(B, self.num_blocks, -1)
+        cond = self.global_mlp(pooled_blocks)
+
+        coord_emb = self.coord_mlp(self.block_coords)
+        coord_emb = coord_emb.unsqueeze(0)
 
         cond = cond + self.pos_scale * self.pos_emb + self.coord_scale * coord_emb
         return cond

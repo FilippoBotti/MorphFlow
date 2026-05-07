@@ -28,6 +28,11 @@ class MorphFlow(nn.Module):
             out_dim=model_channels, 
         )
 
+        self.cfg_drop_prob = 0.0
+        self.null_cond = nn.Parameter(
+            torch.zeros(1, self.cond_encoder.num_blocks, model_channels)
+        )
+
         self.sparse_structure_flow = sparse_structure_flow.SparseStructureFlowModel(
             resolution=16,
             in_channels=8,
@@ -61,11 +66,44 @@ class MorphFlow(nn.Module):
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
         cond = self.cond_fusion(cond1, cond2, alpha)
 
+        if self.training and self.cfg_drop_prob > 0.0:
+            B = cond.shape[0]
+            drop_mask = torch.rand(B, device=cond.device) < self.cfg_drop_prob
+            if drop_mask.any():
+                null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+                cond = torch.where(drop_mask.view(B, 1, 1), null_cond, cond)
+
         # diffusion
         t_flow = t.float() * 1000.0
         out = self.sparse_structure_flow(x_t, t_flow, cond)
 
         return out
+    
+    def forward_flow_cfg(self, x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha, guidance_scale=1.0):
+        if guidance_scale == 1.0:
+            return self.forward_flow(
+                x_t,
+                t,
+                src_1_feats,
+                src_2_feats,
+                src_1_coords,
+                src_2_coords,
+                alpha,
+            )
+
+        cond1 = self.cond_encoder(src_1_feats, src_1_coords)
+        cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond = self.cond_fusion(cond1, cond2, alpha)
+
+        B = cond.shape[0]
+        null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+
+        t_flow = t.float() * 1000.0
+
+        v_cond = self.sparse_structure_flow(x_t, t_flow, cond)
+        v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond)
+
+        return v_uncond + guidance_scale * (v_cond - v_uncond)
 
     def forward(self, x_0, src_1_feats, src_1_coords, src_2_feats, src_2_coords, alpha):
         B = x_0.shape[0]

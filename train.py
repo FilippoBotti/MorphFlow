@@ -33,6 +33,7 @@ def build_parser():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--cond_lr", type=float, default=None, help="Learning rate for added conditioning modules. Defaults to --lr.")
     parser.add_argument("--flow_lr", type=float, default=None, help="Learning rate for pretrained TRELLIS sparse_structure_flow. Defaults to --lr.")
+    parser.add_argument("--cfg_drop_prob", type=float, default=0.0)
     parser.add_argument("--use_lora", type=int, choices=[0, 1], default=0)
     parser.add_argument("--lora_lr", type=float, default=None)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -206,6 +207,7 @@ def train(args):
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
     model = MorphFlow(model_type=args.trellis_model)
+    model.cfg_drop_prob = args.cfg_drop_prob
 
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
@@ -275,6 +277,7 @@ def train(args):
         accelerator.print(f"Condition LR: {cond_lr}")
         accelerator.print(f"LoRA LR: {lora_lr}")
         accelerator.print("TRELLIS sparse_structure_flow: frozen except LoRA")
+        accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     else:
         optimizer = torch.optim.AdamW(
             [

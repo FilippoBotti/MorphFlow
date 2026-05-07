@@ -54,7 +54,7 @@ def unwrap_state_dict(obj):
         cleaned[new_key] = value
     return cleaned
 
-def run_reverse_flow_sample(model, x0_shape, src1_feats, src2_feats, src1_coords, src2_coords, alpha, steps, device):
+def run_reverse_flow_sample(model, x0_shape, src1_feats, src2_feats, src1_coords, src2_coords, alpha, steps, device, cfg_scale=1.0):
     x_t = torch.randn(x0_shape, device=device, dtype=torch.float32)
     t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     for i in range(steps):
@@ -62,8 +62,28 @@ def run_reverse_flow_sample(model, x0_shape, src1_feats, src2_feats, src1_coords
         t_next = t_seq[i + 1]
         dt = t_curr - t_next
         t_batch = t_curr.unsqueeze(0)
-        v_pred = model.forward_flow(x_t, t_batch, src1_feats, src2_feats, src1_coords, src2_coords, alpha)
-        x_t = x_t - dt * v_pred
+        if cfg_scale == 1.0:
+            v_pred = model.forward_flow(
+            x_t,
+            t_batch,
+            src1_feats,
+            src2_feats,
+            src1_coords,
+            src2_coords,
+            alpha,
+        )
+    else:
+        v_pred = model.forward_flow_cfg(
+            x_t,
+            t_batch,
+            src1_feats,
+            src2_feats,
+            src1_coords,
+            src2_coords,
+            alpha,
+            guidance_scale=cfg_scale,
+        )
+    x_t = x_t - dt * v_pred
     return x_t
 
 def ensure_batch_coords(coords):
@@ -122,6 +142,7 @@ def main():
         state_to_load = ckpt["model_ema"]
 
     print(f"Using MorphFlow model_type: {model_type}")
+    print(f"CFG scale: {args.cfg_scale}")
     model = MorphFlow(model_type=model_type).to(device)
 
     ckpt_args = {}
@@ -187,10 +208,16 @@ def main():
 
             # Predict SS
             x0_pred = run_reverse_flow_sample(
-                model=model, x0_shape=target_ss.shape,
-                src1_feats=src1_feats.to(device), src2_feats=src2_feats.to(device),
-                src1_coords=src1_coords.to(device), src2_coords=src2_coords.to(device),
-                alpha=alpha, steps=args.steps, device=device
+                model=model,
+                x0_shape=target_ss.shape,
+                src1_feats=src1_feats.to(device),
+                src2_feats=src2_feats.to(device),
+                src1_coords=src1_coords.to(device),
+                src2_coords=src2_coords.to(device),
+                alpha=alpha,
+                steps=args.steps,
+                device=device,
+                cfg_scale=args.cfg_scale,
             )
             
             # SS exports
