@@ -1,19 +1,24 @@
 import os
-os.environ['ATTN_BACKEND'] = 'xformers'
+os.environ["ATTN_BACKEND"] = "xformers"
 
 import argparse
 import json
 from datetime import datetime
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.morph_flow import MorphFlow
-from models.lora import add_lora_to_cross_attention, freeze_module, trainable_parameters, print_trainable_parameters
+from models.lora import (
+    add_lora_to_cross_attention,
+    freeze_module,
+    trainable_parameters,
+    print_trainable_parameters,
+)
 
 try:
     import matplotlib.pyplot as plt
@@ -46,7 +51,13 @@ def build_parser():
     parser.add_argument("--val_examples", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
-    parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1, help="If 1, training excludes entries that use src assets found in val metadata.",)
+    parser.add_argument(
+        "--exclude_val_assets_from_train",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="If 1, training excludes entries that use src assets found in val metadata.",
+    )
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
@@ -152,7 +163,8 @@ def build_validation_figure(example):
 
 
 def train(args):
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
 
     metadata_path = os.path.join(args.root_dir, args.metadata)
@@ -222,11 +234,11 @@ def train(args):
 
         accelerator.print(f"Caricamento pesi pre-addestrati {repo_id} dalla cache...")
         ckpt_path = hf_hub_download(
-            repo_id=repo_id, 
-            filename=filename
+            repo_id=repo_id,
+            filename=filename,
         )
         trellis_state_dict = load_file(ckpt_path)
-        
+
         model.sparse_structure_flow.load_state_dict(trellis_state_dict, strict=True)
         accelerator.print(f"Pesi TRELLIS ({args.trellis_model}) caricati con successo!")
     except Exception as e:
@@ -235,6 +247,7 @@ def train(args):
     lora_modules = []
 
     if args.use_lora == 1:
+        # Deve girare su tutti i rank, non solo sul main process.
         freeze_module(model.sparse_structure_flow)
 
         lora_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
@@ -246,16 +259,35 @@ def train(args):
             target_modules=tuple(lora_targets),
         )
 
+        if len(lora_modules) == 0:
+            raise RuntimeError(
+                "No LoRA modules were inserted. Check lora_target_modules and TRELLIS module names."
+            )
+
+        # Sicurezza: dopo il freeze del flow, forza i parametri LoRA trainabili.
+        for module in model.sparse_structure_flow.modules():
+            if hasattr(module, "lora_A"):
+                for p in module.lora_A.parameters():
+                    p.requires_grad = True
+            if hasattr(module, "lora_B"):
+                for p in module.lora_B.parameters():
+                    p.requires_grad = True
+
         accelerator.print(f"LoRA enabled on cross-attention modules: {len(lora_modules)}")
         for name in lora_modules[:20]:
             accelerator.print(f"  LoRA: {name}")
         if len(lora_modules) > 20:
             accelerator.print(f"  ... and {len(lora_modules) - 20} more")
 
-        if len(lora_modules) == 0:
-            raise RuntimeError(
-                "No LoRA modules were inserted. Check lora_target_modules and TRELLIS module names."
-        )
+    # Sicurezza: questi moduli devono sempre restare trainabili.
+    for p in model.cond_encoder.parameters():
+        p.requires_grad = True
+
+    for p in model.cond_fusion.parameters():
+        p.requires_grad = True
+
+    if hasattr(model, "null_cond"):
+        model.null_cond.requires_grad = True
 
     cond_lr = args.lr if args.cond_lr is None else args.cond_lr
     flow_lr = args.lr if args.flow_lr is None else args.flow_lr
@@ -263,8 +295,11 @@ def train(args):
 
     cond_params = list(model.cond_encoder.parameters()) + list(model.cond_fusion.parameters())
 
+    if hasattr(model, "null_cond"):
+        cond_params = cond_params + [model.null_cond]
+
     if args.use_lora == 1:
-        lora_params = trainable_parameters(model.sparse_structure_flow)
+        lora_params = [p for p in model.sparse_structure_flow.parameters() if p.requires_grad]
 
         optimizer = torch.optim.AdamW(
             [
@@ -289,19 +324,32 @@ def train(args):
 
         accelerator.print(f"Condition LR: {cond_lr}")
         accelerator.print(f"TRELLIS flow LR: {flow_lr}")
+        accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
 
     from transformers import get_cosine_schedule_with_warmup
-   
+
     total_training_steps = args.train_epochs * len(loader)
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=1000, 
-        num_training_steps=total_training_steps
+        num_warmup_steps=1000,
+        num_training_steps=total_training_steps,
     )
 
-    if accelerator.is_main_process:
-        print_trainable_parameters(model)
+    trainable_tensors = [p for p in model.parameters() if p.requires_grad]
+    trainable_params_count = sum(p.numel() for p in trainable_tensors)
+    total_params_count = sum(p.numel() for p in model.parameters())
+
+    print(
+        f"[rank {accelerator.process_index}] before prepare | "
+        f"trainable tensors={len(trainable_tensors)} | "
+        f"trainable params={trainable_params_count} | "
+        f"total params={total_params_count} | "
+        f"lora_modules={len(lora_modules)}",
+        flush=True,
+    )
+
+    accelerator.wait_for_everyone()
 
     if val_loader is not None:
         model, optimizer, loader, val_loader, scheduler = accelerator.prepare(
@@ -319,28 +367,29 @@ def train(args):
     if args.resume_from:
         if os.path.exists(args.resume_from):
             accelerator.print(f"Resuming from checkpoint: {args.resume_from}")
-            # Use weights_only=False inside torch.load per modern PyTorch conventions when loading optimizers to avoid warnings/errors
             try:
                 ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
             except Exception:
                 ckpt = torch.load(args.resume_from, map_location="cpu")
-            
-            # Clean module. prefix in case it was saved from DataParallel/DDP
+
             cleaned_model_dict = {}
             for k, v in ckpt["model"].items():
                 new_key = k[7:] if k.startswith("module.") else k
                 cleaned_model_dict[new_key] = v
-            
+
             accelerator.unwrap_model(model).load_state_dict(cleaned_model_dict, strict=True)
+
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
             except Exception as e:
                 accelerator.print(f"Could not restore optimizer state: {e}")
+
             if "scheduler" in ckpt:
                 try:
                     scheduler.load_state_dict(ckpt["scheduler"])
                 except Exception as e:
                     accelerator.print(f"Could not restore scheduler state: {e}")
+
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt["step"]
             ckpt_for_ema = ckpt
@@ -379,7 +428,15 @@ def train(args):
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
     accelerator.print(f"EMA enabled: {args.use_ema == 1}")
     accelerator.print(f"Condition LR: {cond_lr}")
-    accelerator.print(f"TRELLIS flow LR: {flow_lr}")
+
+    if args.use_lora == 1:
+        accelerator.print(f"LoRA LR: {lora_lr}")
+        accelerator.print("TRELLIS flow LR: frozen except LoRA")
+    else:
+        accelerator.print(f"TRELLIS flow LR: {flow_lr}")
+
+    accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
+
     if args.use_ema == 1:
         accelerator.print(f"EMA decay: {args.ema_decay}")
 
@@ -419,8 +476,8 @@ def train(args):
 
             accelerator.backward(loss)
             optimizer.step()
-            scheduler.step()  
-            optimizer.zero_grad()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
             if args.use_ema == 1 and accelerator.is_main_process:
                 update_ema_state_dict(ema_state, unwrapped_model, args.ema_decay)
@@ -434,11 +491,14 @@ def train(args):
             if writer is not None:
                 writer.add_scalar("train/loss_step", loss_value, global_step)
                 writer.add_scalar("train/cond_lr", optimizer.param_groups[0]["lr"], global_step)
+
                 if args.use_lora == 1:
                     writer.add_scalar("train/lora_lr", optimizer.param_groups[1]["lr"], global_step)
                 else:
                     writer.add_scalar("train/flow_lr", optimizer.param_groups[1]["lr"], global_step)
-            
+
+                writer.add_scalar("train/cfg_drop_prob", args.cfg_drop_prob, global_step)
+
             if accelerator.is_local_main_process:
                 progress_bar.set_postfix(
                     loss=f"{loss_value:.6f}",
@@ -459,6 +519,7 @@ def train(args):
 
         val_avg = None
         val_examples = []
+
         if val_loader is not None and (epoch % max(1, args.val_every) == 0):
             model.eval()
             val_running_loss = 0.0
@@ -547,16 +608,16 @@ def train(args):
                 "model_type": args.trellis_model,
                 "sigma_min": accelerator.unwrap_model(model).sigma_min,
                 "args": vars(args),
+                "lora_modules": lora_modules,
                 "train_loss": epoch_avg,
                 "val_loss": val_avg,
             }
+
             if args.use_ema == 1 and ema_state is not None:
                 ckpt["model_ema"] = ema_state
                 ckpt["ema_decay"] = args.ema_decay
-            accelerator.save(
-                ckpt,
-                ckpt_path,
-            )
+
+            accelerator.save(ckpt, ckpt_path)
             accelerator.print(f"Checkpoint saved: {ckpt_path}")
 
     accelerator.wait_for_everyone()
@@ -572,14 +633,14 @@ def train(args):
             "model_type": args.trellis_model,
             "sigma_min": accelerator.unwrap_model(model).sigma_min,
             "args": vars(args),
+            "lora_modules": lora_modules,
         }
+
         if args.use_ema == 1 and ema_state is not None:
             ckpt["model_ema"] = ema_state
             ckpt["ema_decay"] = args.ema_decay
-        accelerator.save(
-            ckpt,
-            final_ckpt,
-        )
+
+        accelerator.save(ckpt, final_ckpt)
         accelerator.print(f"Training completed. Final checkpoint: {final_ckpt}")
 
         if writer is not None:
