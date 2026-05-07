@@ -163,7 +163,7 @@ def build_validation_figure(example):
 
 
 def train(args):
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
     device = accelerator.device
