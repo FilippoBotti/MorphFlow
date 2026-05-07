@@ -3,10 +3,10 @@ os.environ["ATTN_BACKEND"] = "xformers"
 
 import argparse
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import torch
-from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
@@ -164,8 +164,7 @@ def build_validation_figure(example):
 
 def train(args):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
 
     metadata_path = os.path.join(args.root_dir, args.metadata)
@@ -350,7 +349,7 @@ def train(args):
         flush=True,
     )
 
-    print(f"[rank {accelerator.process_index}] entering accelerator.prepare", flush=True)
+    accelerator.wait_for_everyone()
 
     if val_loader is not None:
         model, optimizer, loader, val_loader, scheduler = accelerator.prepare(
@@ -360,8 +359,6 @@ def train(args):
         model, optimizer, loader, scheduler = accelerator.prepare(
             model, optimizer, loader, scheduler
         )
-
-    print(f"[rank {accelerator.process_index}] finished accelerator.prepare", flush=True)
 
     start_epoch = 1
     global_step = 0
