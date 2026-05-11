@@ -34,14 +34,14 @@ def _set_module(root, name, module):
     setattr(parent, parts[-1], module)
 
 
-def add_lora_to_cross_attention(model, rank=8, alpha=16, dropout=0.0, target_modules=("to_q", "to_kv")):
+def add_lora_to_attention(model, rank=8, alpha=16, dropout=0.0, target_modules=("to_q", "to_kv")):
     replaced = []
 
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
 
-        if ".cross_attn." not in name:
+        if "_attn." not in name:
             continue
 
         short_name = name.split(".")[-1]

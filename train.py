@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.morph_flow import MorphFlow
 from models.lora import (
-    add_lora_to_cross_attention,
+    add_lora_to_attention,
     freeze_module,
     trainable_parameters,
     print_trainable_parameters,
@@ -248,11 +248,10 @@ def train(args):
     lora_modules = []
 
     if args.use_lora == 1:
-        # Deve girare su tutti i rank, non solo sul main process.
         freeze_module(model.sparse_structure_flow)
 
         lora_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
-        lora_modules = add_lora_to_cross_attention(
+        lora_modules = add_lora_to_attention(
             model.sparse_structure_flow,
             rank=args.lora_rank,
             alpha=args.lora_alpha,
@@ -265,7 +264,6 @@ def train(args):
                 "No LoRA modules were inserted. Check lora_target_modules and TRELLIS module names."
             )
 
-        # Sicurezza: dopo il freeze del flow, forza i parametri LoRA trainabili.
         for module in model.sparse_structure_flow.modules():
             if hasattr(module, "lora_A"):
                 for p in module.lora_A.parameters():
@@ -280,7 +278,6 @@ def train(args):
         if len(lora_modules) > 20:
             accelerator.print(f"  ... and {len(lora_modules) - 20} more")
 
-    # Sicurezza: questi moduli devono sempre restare trainabili.
     for p in model.cond_encoder.parameters():
         p.requires_grad = True
 
