@@ -272,7 +272,7 @@ def train(args):
                 for p in module.lora_B.parameters():
                     p.requires_grad = True
 
-        accelerator.print(f"LoRA enabled on cross-attention modules: {len(lora_modules)}")
+        accelerator.print(f"LoRA enabled on attention modules: {len(lora_modules)}")
         for name in lora_modules[:20]:
             accelerator.print(f"  LoRA: {name}")
         if len(lora_modules) > 20:
