@@ -71,6 +71,7 @@ class SparseStructureFlowModel(nn.Module):
         share_mod: bool = False,
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
+        separate_cond: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -88,6 +89,7 @@ class SparseStructureFlowModel(nn.Module):
         self.share_mod = share_mod
         self.qk_rms_norm = qk_rms_norm
         self.qk_rms_norm_cross = qk_rms_norm_cross
+        self.separate_cond = separate_cond
         self.dtype = torch.float16 if use_fp16 else torch.float32
 
         self.t_embedder = TimestepEmbedder(model_channels)
@@ -118,6 +120,7 @@ class SparseStructureFlowModel(nn.Module):
                 share_mod=share_mod,
                 qk_rms_norm=self.qk_rms_norm,
                 qk_rms_norm_cross=self.qk_rms_norm_cross,
+                separate_cond=self.separate_cond,
             )
             for _ in range(num_blocks)
         ])
@@ -173,7 +176,7 @@ class SparseStructureFlowModel(nn.Module):
         nn.init.constant_(self.out_layer.weight, 0)
         nn.init.constant_(self.out_layer.bias, 0)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond) -> torch.Tensor:
         assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
                 f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
 
@@ -187,7 +190,15 @@ class SparseStructureFlowModel(nn.Module):
             t_emb = self.adaLN_modulation(t_emb)
         t_emb = t_emb.type(self.dtype)
         h = h.type(self.dtype)
-        cond = cond.type(self.dtype)
+        
+        if self.separate_cond:
+            cond1, cond2, alpha = cond
+            cond1 = cond1.type(self.dtype)
+            cond2 = cond2.type(self.dtype)
+            alpha = alpha.type(self.dtype)
+            cond = (cond1, cond2, alpha)
+        else:
+            cond = cond.type(self.dtype)
         
         for block in self.blocks:
             h = block(h, t_emb, cond)

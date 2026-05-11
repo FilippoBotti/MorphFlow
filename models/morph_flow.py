@@ -6,9 +6,11 @@ from models import sparse_structure_flow
 from models import cond_encoder
 
 class MorphFlow(nn.Module):
-    def __init__(self, sigma_min=1e-5, model_type="text_base"):
+    def __init__(self, sigma_min=1e-5, model_type="text_base", separate_cond=False):
         super().__init__()
         
+        self.separate_cond = separate_cond
+
         if model_type == "text_base":
             model_channels = 768
             num_blocks = 12
@@ -45,7 +47,8 @@ class MorphFlow(nn.Module):
             patch_size=1,
             pe_mode="ape",
             qk_rms_norm=True,
-            use_fp16=False        
+            use_fp16=False,
+            separate_cond=separate_cond        
         )
         self.sigma_min = sigma_min
         
@@ -64,19 +67,31 @@ class MorphFlow(nn.Module):
         # condition
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
-        cond = self.cond_fusion(cond1, cond2, alpha)
+        
+        if not self.separate_cond:
+            cond = self.cond_fusion(cond1, cond2, alpha)
+        else:
+            cond = (cond1, cond2, alpha)
 
         if self.training and self.cfg_drop_prob > 0.0:
-            B = cond.shape[0]
-            drop_mask = torch.rand(B, device=cond.device) < self.cfg_drop_prob
+            B = cond1.shape[0] if self.separate_cond else cond.shape[0]
+            drop_mask = torch.rand(B, device=cond1.device) < self.cfg_drop_prob
 
-            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
 
-            cond = torch.where(
-                drop_mask.view(B, 1, 1),
-                null_cond,
-                cond,
-            )
+            if not self.separate_cond:
+                cond = torch.where(
+                    drop_mask.view(B, 1, 1),
+                    null_cond,
+                    cond,
+                )
+            else:
+                drop_mask = drop_mask.view(B, 1, 1)
+                cond = (
+                    torch.where(drop_mask, null_cond, cond1),
+                    torch.where(drop_mask, null_cond, cond2),
+                    alpha
+                )
 
         # diffusion
         t_flow = t.float() * 1000.0
@@ -98,10 +113,16 @@ class MorphFlow(nn.Module):
 
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
-        cond = self.cond_fusion(cond1, cond2, alpha)
-
-        B = cond.shape[0]
-        null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+        
+        if not self.separate_cond:
+            cond = self.cond_fusion(cond1, cond2, alpha)
+            B = cond.shape[0]
+            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
+        else:
+            cond = (cond1, cond2, alpha)
+            B = cond1.shape[0]
+            null_cond_tensor = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
+            null_cond = (null_cond_tensor, null_cond_tensor, alpha)
 
         t_flow = t.float() * 1000.0
 

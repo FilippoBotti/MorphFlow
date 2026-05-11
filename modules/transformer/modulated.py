@@ -92,10 +92,12 @@ class ModulatedTransformerCrossBlock(nn.Module):
         qk_rms_norm_cross: bool = False,
         qkv_bias: bool = True,
         share_mod: bool = False,
+        separate_cond: bool = False,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.share_mod = share_mod
+        self.separate_cond = separate_cond
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         self.norm2 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.norm3 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -119,6 +121,24 @@ class ModulatedTransformerCrossBlock(nn.Module):
             qkv_bias=qkv_bias,
             qk_rms_norm=qk_rms_norm_cross,
         )
+        if self.separate_cond:
+            self.cross_attn2 = MultiHeadAttention(
+                channels,
+                ctx_channels=ctx_channels,
+                num_heads=num_heads,
+                type="cross",
+                attn_mode="full",
+                qkv_bias=qkv_bias,
+                qk_rms_norm=qk_rms_norm_cross,
+            )
+            self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
+            self.alpha_gate = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.SiLU(),
+                nn.Linear(64, channels),
+                nn.Sigmoid()
+            )
+
         self.mlp = FeedForwardNet(
             channels,
             mlp_ratio=mlp_ratio,
@@ -129,7 +149,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 nn.Linear(channels, 6 * channels, bias=True)
             )
 
-    def _forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor):
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor, context):
         if self.share_mod:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
         else:
@@ -139,8 +159,22 @@ class ModulatedTransformerCrossBlock(nn.Module):
         h = self.self_attn(h)
         h = h * gate_msa.unsqueeze(1)
         x = x + h
-        h = self.norm2(x)
-        h = self.cross_attn(h, context)
+        
+        if self.separate_cond:
+            context1, context2, alpha = context
+            h = self.norm2(x)
+            h1 = self.cross_attn(h, context1)
+            
+            h = self.norm4(x)
+            h2 = self.cross_attn2(h, context2)
+            
+            alpha_in = alpha.view(-1, 1, 1).to(h1.dtype)
+            gate = self.alpha_gate(alpha_in)
+            h = (1.0 - gate) * h1 + gate * h2
+        else:
+            h = self.norm2(x)
+            h = self.cross_attn(h, context)
+            
         x = x + h
         h = self.norm3(x)
         h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
@@ -149,7 +183,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
         x = x + h
         return x
 
-    def forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor):
+    def forward(self, x: torch.Tensor, mod: torch.Tensor, context):
         if self.use_checkpoint:
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, use_reentrant=False)
         else:

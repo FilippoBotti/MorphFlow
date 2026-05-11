@@ -51,13 +51,13 @@ def build_parser():
     parser.add_argument("--val_examples", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
-    parser.add_argument(
-        "--exclude_val_assets_from_train",
+    parser.add_argument("--exclude_val_assets_from_train",
         type=int,
         choices=[0, 1],
         default=1,
         help="If 1, training excludes entries that use src assets found in val metadata.",
     )
+    parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0, help="If 1, use separate conditioning for src1 and src2.")
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
@@ -219,7 +219,7 @@ def train(args):
     elif val_metadata_path:
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
-    model = MorphFlow(model_type=args.trellis_model)
+    model = MorphFlow(model_type=args.trellis_model, separate_cond=args.separate_cond == 1)
     model.cfg_drop_prob = args.cfg_drop_prob
 
     from huggingface_hub import hf_hub_download
@@ -240,7 +240,16 @@ def train(args):
         )
         trellis_state_dict = load_file(ckpt_path)
 
-        model.sparse_structure_flow.load_state_dict(trellis_state_dict, strict=True)
+        model.sparse_structure_flow.load_state_dict(trellis_state_dict, strict=False)
+        
+        if args.separate_cond == 1:
+            for block in model.sparse_structure_flow.blocks:
+                if hasattr(block, 'cross_attn2'):
+                    block.cross_attn2.load_state_dict(block.cross_attn.state_dict())
+                if hasattr(block, 'norm4'):
+                    block.norm4.load_state_dict(block.norm2.state_dict())
+            accelerator.print("Duplicati i pesi pre-addestrati dalla cross_attn alla cross_attn2 e norm2 a norm4 per il condizionamento separato.")
+
         accelerator.print(f"Pesi TRELLIS ({args.trellis_model}) caricati con successo!")
     except Exception as e:
         accelerator.print(f"Errore nel caricamento dei pesi pre-addestrati: {e}")
