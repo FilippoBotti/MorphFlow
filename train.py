@@ -291,7 +291,7 @@ def train(args):
         p.requires_grad = True
 
     for p in model.cond_fusion.parameters():
-        p.requires_grad = True
+        p.requires_grad = args.separate_cond != 1
 
     if hasattr(model, "separate_cond_proj"):
         for p in model.separate_cond_proj.parameters():
@@ -304,7 +304,10 @@ def train(args):
     flow_lr = args.lr if args.flow_lr is None else args.flow_lr
     lora_lr = args.lr if args.lora_lr is None else args.lora_lr
 
-    cond_params = list(model.cond_encoder.parameters()) + list(model.cond_fusion.parameters())
+    cond_params = list(model.cond_encoder.parameters())
+
+    if args.separate_cond != 1:
+        cond_params = cond_params + list(model.cond_fusion.parameters())
 
     if hasattr(model, "separate_cond_proj"):
         cond_params = cond_params + list(model.separate_cond_proj.parameters())
