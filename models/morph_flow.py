@@ -29,6 +29,8 @@ class MorphFlow(nn.Module):
             hidden_dim=512,
             out_dim=model_channels, 
         )
+        if self.separate_cond:
+            self.separate_cond_proj = nn.Linear(128, model_channels)
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
@@ -71,6 +73,8 @@ class MorphFlow(nn.Module):
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
         else:
+            cond1 = self.separate_cond_proj(cond1)
+            cond2 = self.separate_cond_proj(cond2)
             cond = (cond1, cond2, alpha)
 
         if self.training and self.cfg_drop_prob > 0.0:
@@ -119,6 +123,8 @@ class MorphFlow(nn.Module):
             B = cond.shape[0]
             null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
         else:
+            cond1 = self.separate_cond_proj(cond1)
+            cond2 = self.separate_cond_proj(cond2)
             cond = (cond1, cond2, alpha)
             B = cond1.shape[0]
             null_cond_tensor = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
