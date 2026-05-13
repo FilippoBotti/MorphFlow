@@ -88,8 +88,10 @@ class MorphingDistillDataset(Dataset):
             "target_dir": target_dir,
             "src1_feats": os.path.join(src1_dir, "slat_feats.pt"),
             "src1_coords": os.path.join(src1_dir, "slat_coords.pt"),
+            "src1_ss_latent": os.path.join(src1_dir, "cache", "coords_zs_init.pt"),
             "src2_feats": os.path.join(src2_dir, "slat_feats.pt"),
             "src2_coords": os.path.join(src2_dir, "slat_coords.pt"),
+            "src2_ss_latent": os.path.join(src2_dir, "cache", "coords_zs_init.pt"),
             "target_feats": os.path.join(target_dir, "mid_slat_feats.pt"),
             "target_coords": os.path.join(target_dir, "mid_slat_coords.pt"),
             "target_ss_latent": os.path.join(target_dir, "mid_sparse_structure_latent.pt"),
@@ -100,8 +102,10 @@ class MorphingDistillDataset(Dataset):
         required = [
             paths["src1_feats"],
             paths["src1_coords"],
+            paths["src1_ss_latent"],
             paths["src2_feats"],
             paths["src2_coords"],
+            paths["src2_ss_latent"],
             paths["target_feats"],
             paths["target_coords"],
             paths["target_ss_latent"],
@@ -148,6 +152,9 @@ class MorphingDistillDataset(Dataset):
         src1_feats, src1_coords = self._load_slat(paths["src1_dir"], prefix="slat")
         src2_feats, src2_coords = self._load_slat(paths["src2_dir"], prefix="slat")
         target_feats, target_coords = self._load_slat(paths["target_dir"], prefix="mid_slat")
+        
+        src1_sparse_structure_latent = self._torch_load_safe(paths["src1_ss_latent"]).float()
+        src2_sparse_structure_latent = self._torch_load_safe(paths["src2_ss_latent"]).float()
         target_sparse_structure_latent = self._torch_load_safe(paths["target_ss_latent"]).float()
 
         alpha = torch.tensor(entry["alpha"], dtype=torch.float32)
@@ -155,8 +162,10 @@ class MorphingDistillDataset(Dataset):
         sample = {
             "src1_feats": src1_feats,
             "src1_coords": src1_coords,
+            "src1_ss_latent": src1_sparse_structure_latent,
             "src2_feats": src2_feats,
             "src2_coords": src2_coords,
+            "src2_ss_latent": src2_sparse_structure_latent,
             "target_feats": target_feats,
             "target_coords": target_coords,
             "target_ss_latent": target_sparse_structure_latent,
@@ -219,6 +228,12 @@ def morphing_collate_fn(batch):
         result[f"{prefix}_coords"] = torch.cat(all_coords, dim=0)
         result[f"{prefix}_lengths"] = torch.tensor(lengths, dtype=torch.long)
 
+    result["src1_ss_latent"] = torch.stack(
+        [sample["src1_ss_latent"] for sample in batch], dim=0
+    )
+    result["src2_ss_latent"] = torch.stack(
+        [sample["src2_ss_latent"] for sample in batch], dim=0
+    )
     result["target_ss_latent"] = torch.stack(
         [sample["target_ss_latent"] for sample in batch], dim=0
     )

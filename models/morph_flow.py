@@ -6,7 +6,7 @@ from models import sparse_structure_flow
 from models import cond_encoder
 
 class MorphFlow(nn.Module):
-    def __init__(self, sigma_min=1e-5, model_type="text_base", separate_cond=False):
+    def __init__(self, sigma_min=1e-5, model_type="text_base", separate_cond=False, use_checkpoint=False):
         super().__init__()
         
         self.separate_cond = separate_cond
@@ -50,6 +50,7 @@ class MorphFlow(nn.Module):
             pe_mode="ape",
             qk_rms_norm=True,
             use_fp16=False,
+            use_checkpoint=use_checkpoint,
             separate_cond=separate_cond        
         )
         self.sigma_min = sigma_min
@@ -99,7 +100,7 @@ class MorphFlow(nn.Module):
 
         # diffusion
         t_flow = t.float() * 1000.0
-        out = self.sparse_structure_flow(x_t, t_flow, cond)
+        out = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
 
         return out
     
@@ -132,8 +133,8 @@ class MorphFlow(nn.Module):
 
         t_flow = t.float() * 1000.0
 
-        v_cond = self.sparse_structure_flow(x_t, t_flow, cond)
-        v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond)
+        v_cond = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
+        v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond, alpha=alpha)
 
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 

@@ -136,8 +136,9 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 nn.Linear(1, 64),
                 nn.SiLU(),
                 nn.Linear(64, channels),
-                nn.Sigmoid()
             )
+            nn.init.zeros_(self.alpha_gate[-1].weight)
+            nn.init.zeros_(self.alpha_gate[-1].bias)
 
         self.mlp = FeedForwardNet(
             channels,
@@ -168,8 +169,13 @@ class ModulatedTransformerCrossBlock(nn.Module):
             h = self.norm4(x)
             h2 = self.cross_attn2(h, context2)
             
-            alpha_in = alpha.view(-1, 1, 1).to(h1.dtype)
-            gate = self.alpha_gate(alpha_in)
+            alpha_base = alpha.reshape(-1, 1, 1).to(device=h1.device, dtype=h1.dtype)
+
+            # Channel-wise residual around the identity gate=alpha.
+            # tanh bounds the correction, while alpha*(1-alpha) keeps exact endpoints.
+            gate_delta = torch.tanh(self.alpha_gate(alpha_base))
+            gate = alpha_base + alpha_base * (1.0 - alpha_base) * gate_delta
+
             h = (1.0 - gate) * h1 + gate * h2
         else:
             h = self.norm2(x)

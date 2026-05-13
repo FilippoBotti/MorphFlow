@@ -93,6 +93,7 @@ class SparseStructureFlowModel(nn.Module):
         self.dtype = torch.float16 if use_fp16 else torch.float32
 
         self.t_embedder = TimestepEmbedder(model_channels)
+        self.alpha_embedder = TimestepEmbedder(model_channels)
         if share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
@@ -162,6 +163,11 @@ class SparseStructureFlowModel(nn.Module):
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # Alpha embedding starts as a no-op so pretrained TRELLIS behavior is
+        # preserved at step 0, then learns how alpha should modulate the flow.
+        nn.init.normal_(self.alpha_embedder.mlp[0].weight, std=0.02)
+        nn.init.zeros_(self.alpha_embedder.mlp[2].weight)
+        nn.init.zeros_(self.alpha_embedder.mlp[2].bias)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         if self.share_mod:
@@ -172,11 +178,17 @@ class SparseStructureFlowModel(nn.Module):
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
+        # Keep alpha gates as no-ops after self.apply(_basic_init), which would
+        # otherwise overwrite their zero initialization inside each block.
+        for block in self.blocks:
+            if hasattr(block, "alpha_gate"):
+                nn.init.zeros_(block.alpha_gate[-1].weight)
+                nn.init.zeros_(block.alpha_gate[-1].bias)
         # Zero-out output layers:
         nn.init.constant_(self.out_layer.weight, 0)
         nn.init.constant_(self.out_layer.bias, 0)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond, alpha: Optional[torch.Tensor] = None,) -> torch.Tensor:
         assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
                 f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
 
@@ -185,18 +197,37 @@ class SparseStructureFlowModel(nn.Module):
 
         h = self.input_layer(h)
         h = h + self.pos_emb[None]
+
+        if alpha is None and self.separate_cond:
+            # Backward-compatible path: separate_cond already carries alpha in cond.
+            _, _, alpha = cond
+
+        if alpha is None:
+            alpha = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
+
+        alpha = alpha.reshape(x.shape[0]).to(device=x.device, dtype=torch.float32)
+
         t_emb = self.t_embedder(t)
+
+        # Alpha is scaled like the TRELLIS timestep, because TimestepEmbedder expects
+        # values with a useful sinusoidal frequency range.
+        alpha_emb = self.alpha_embedder(alpha * 1000.0)
+
+        # Final modulation variable for AdaLN blocks.
+        t_emb = t_emb + alpha_emb
+
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)
+
         t_emb = t_emb.type(self.dtype)
         h = h.type(self.dtype)
-        
+
         if self.separate_cond:
-            cond1, cond2, alpha = cond
+            cond1, cond2, alpha_cond = cond
             cond1 = cond1.type(self.dtype)
             cond2 = cond2.type(self.dtype)
-            alpha = alpha.type(self.dtype)
-            cond = (cond1, cond2, alpha)
+            alpha_cond = alpha_cond.reshape(x.shape[0]).to(device=x.device, dtype=self.dtype)
+            cond = (cond1, cond2, alpha_cond)
         else:
             cond = cond.type(self.dtype)
         

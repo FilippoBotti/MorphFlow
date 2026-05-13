@@ -58,6 +58,29 @@ def build_parser():
         help="If 1, training excludes entries that use src assets found in val metadata.",
     )
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0, help="If 1, use separate conditioning for src1 and src2.")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        choices=["auto", "no", "fp16", "bf16"],
+        default="auto",
+        help="Mixed precision mode for Accelerate. auto uses bf16 when supported, otherwise fp16 on CUDA, otherwise no.",
+    )
+
+    parser.add_argument(
+        "--allow_tf32",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Enable TF32 matmul/cudnn on NVIDIA Ampere+ for faster fp32/bf16 training.",
+    )
+
+    parser.add_argument(
+        "--use_checkpoint",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable transformer gradient checkpointing to reduce VRAM at some speed cost.",
+    )
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
@@ -161,11 +184,32 @@ def build_validation_figure(example):
     fig.tight_layout()
     return fig
 
+def resolve_mixed_precision(mode):
+    if mode != "auto":
+        return mode
+
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            return "bf16"
+        return "fp16"
+
+    return "no"
 
 def train(args):
+    mixed_precision = resolve_mixed_precision(args.mixed_precision)
+
+    if args.allow_tf32 == 1 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
+
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        kwargs_handlers=[ddp_kwargs, init_kwargs],
+    )
+
     device = accelerator.device
 
     metadata_path = os.path.join(args.root_dir, args.metadata)
@@ -219,7 +263,7 @@ def train(args):
     elif val_metadata_path:
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
-    model = MorphFlow(model_type=args.trellis_model, separate_cond=args.separate_cond == 1)
+    model = MorphFlow(model_type=args.trellis_model, separate_cond=args.separate_cond == 1, use_checkpoint=args.use_checkpoint == 1)
     model.cfg_drop_prob = args.cfg_drop_prob
 
     from huggingface_hub import hf_hub_download
@@ -446,6 +490,9 @@ def train(args):
     accelerator.print(f"Checkpoints and logs in: {out_dir}")
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
     accelerator.print(f"EMA enabled: {args.use_ema == 1}")
+    accelerator.print(f"Mixed precision: {mixed_precision}")
+    accelerator.print(f"TF32 enabled: {args.allow_tf32 == 1 and torch.cuda.is_available()}")
+    accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"Condition LR: {cond_lr}")
 
     if args.use_lora == 1:
@@ -484,14 +531,15 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            loss = model(
-                target_ss_latent,
-                src1_feats,
-                src1_coords,
-                src2_feats,
-                src2_coords,
-                alpha,
-            )
+            with accelerator.autocast():
+                loss = model(
+                    target_ss_latent,
+                    src1_feats,
+                    src1_coords,
+                    src2_feats,
+                    src2_coords,
+                    alpha,
+                )
 
             accelerator.backward(loss)
             optimizer.step()
@@ -566,14 +614,15 @@ def train(args):
                     )
                     alpha = val_batch["alpha"].to(device=device, dtype=torch.float32, non_blocking=True)
 
-                    val_loss = model(
-                        target_ss_latent,
-                        src1_feats,
-                        src1_coords,
-                        src2_feats,
-                        src2_coords,
-                        alpha,
-                    )
+                    with accelerator.autocast():
+                        val_loss = model(
+                            target_ss_latent,
+                            src1_feats,
+                            src1_coords,
+                            src2_feats,
+                            src2_coords,
+                            alpha,
+                        )
 
                     reduced_val_loss = accelerator.reduce(val_loss.detach(), reduction="mean")
                     val_loss_value = float(reduced_val_loss.item())
