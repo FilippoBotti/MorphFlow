@@ -133,6 +133,10 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 qkv_bias=qkv_bias,
                 qk_rms_norm=qk_rms_norm_cross,
             )
+
+            # Separate LayerNorm for the second cross-attention branch.
+            # It is initialized/copy-loaded from norm2 in train.py.
+            self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
             if self.separate_cond_gate == "alpha_residual":
                 self.alpha_gate = nn.Sequential(
                     nn.Linear(1, 64),
