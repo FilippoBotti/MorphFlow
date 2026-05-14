@@ -683,6 +683,9 @@ def train(args):
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     accelerator.print(f"Condition LR: {cond_lr}")
     accelerator.print(f"Flow LR: {flow_lr}")
+    for idx, group in enumerate(optimizer.param_groups):
+        group_name = group.get("name", f"group_{idx}")
+        accelerator.print(f"Optimizer LR [{idx}] {group_name}: {group['lr']}")
     accelerator.print(f"Weight decay: {args.weight_decay}")
     accelerator.print(f"Grad clip: {args.grad_clip}")
     accelerator.print(f"Endpoint loss weight: {args.endpoint_loss_weight}")
