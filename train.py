@@ -274,9 +274,6 @@ def train(args):
         separate_cond=args.separate_cond == 1,
         use_checkpoint=args.use_checkpoint == 1,
         separate_cond_gate=args.separate_cond_gate,
-        cond_resample_tokens=args.cond_resample_tokens,
-        cond_resample_depth=args.cond_resample_depth,
-        cond_resample_heads=args.cond_resample_heads,
     )
     model.cfg_drop_prob = args.cfg_drop_prob
 

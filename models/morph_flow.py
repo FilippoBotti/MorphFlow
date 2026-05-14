@@ -14,8 +14,6 @@ class MorphFlow(nn.Module):
         use_checkpoint=False,
         separate_cond_gate="alpha_residual",
         cond_resample_tokens=0,
-        cond_resample_depth=1,
-        cond_resample_heads=8,
     ):
         super().__init__()
         
