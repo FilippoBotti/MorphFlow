@@ -6,10 +6,22 @@ from models import sparse_structure_flow
 from models import cond_encoder
 
 class MorphFlow(nn.Module):
-    def __init__(self, sigma_min=1e-5, model_type="text_base", separate_cond=False, use_checkpoint=False):
+    def __init__(
+        self,
+        sigma_min=1e-5,
+        model_type="text_base",
+        separate_cond=False,
+        use_checkpoint=False,
+        separate_cond_gate="alpha_residual",
+        cond_resample_tokens=0,
+        cond_resample_depth=1,
+        cond_resample_heads=8,
+    ):
         super().__init__()
         
         self.separate_cond = separate_cond
+        self.separate_cond_gate = separate_cond_gate
+        self.cond_resample_tokens = cond_resample_tokens
 
         if model_type == "text_base":
             model_channels = 768
@@ -51,7 +63,8 @@ class MorphFlow(nn.Module):
             qk_rms_norm=True,
             use_fp16=False,
             use_checkpoint=use_checkpoint,
-            separate_cond=separate_cond        
+            separate_cond=separate_cond       
+            separate_cond_gate=separate_cond_gate, 
         )
         self.sigma_min = sigma_min
         

@@ -72,6 +72,7 @@ class SparseStructureFlowModel(nn.Module):
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
         separate_cond: bool = False,
+        separate_cond_gate: Literal["alpha_residual", "pair_channel", "token"] = "alpha_residual",
     ):
         super().__init__()
         self.resolution = resolution
@@ -90,6 +91,7 @@ class SparseStructureFlowModel(nn.Module):
         self.qk_rms_norm = qk_rms_norm
         self.qk_rms_norm_cross = qk_rms_norm_cross
         self.separate_cond = separate_cond
+        self.separate_cond_gate = separate_cond_gate
         self.dtype = torch.float16 if use_fp16 else torch.float32
 
         self.t_embedder = TimestepEmbedder(model_channels)
@@ -122,6 +124,7 @@ class SparseStructureFlowModel(nn.Module):
                 qk_rms_norm=self.qk_rms_norm,
                 qk_rms_norm_cross=self.qk_rms_norm_cross,
                 separate_cond=self.separate_cond,
+                separate_cond_gate=self.separate_cond_gate,
             )
             for _ in range(num_blocks)
         ])

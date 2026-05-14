@@ -81,6 +81,12 @@ def build_parser():
         default=0,
         help="Enable transformer gradient checkpointing to reduce VRAM at some speed cost.",
     )
+    parser.add_argument(
+        "--separate_cond_gate",
+        type=str,
+        choices=["alpha_residual", "pair_channel", "token"],
+        default="alpha_residual",
+    )
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint from which to resume")
@@ -263,7 +269,15 @@ def train(args):
     elif val_metadata_path:
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
-    model = MorphFlow(model_type=args.trellis_model, separate_cond=args.separate_cond == 1, use_checkpoint=args.use_checkpoint == 1)
+    model = MorphFlow(
+        model_type=args.trellis_model,
+        separate_cond=args.separate_cond == 1,
+        use_checkpoint=args.use_checkpoint == 1,
+        separate_cond_gate=args.separate_cond_gate,
+        cond_resample_tokens=args.cond_resample_tokens,
+        cond_resample_depth=args.cond_resample_depth,
+        cond_resample_heads=args.cond_resample_heads,
+    )
     model.cfg_drop_prob = args.cfg_drop_prob
 
     from huggingface_hub import hf_hub_download
@@ -470,12 +484,19 @@ def train(args):
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.out_dir, run_name)
+
+    ckpt_dir = os.path.join(out_dir, "checkpoints")
     tb_dir = os.path.join(out_dir, "tb")
+    logs_dir = os.path.join(out_dir, "logs")
+    outputs_dir = os.path.join(out_dir, "outputs")
 
     writer = None
     if accelerator.is_main_process:
         os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(tb_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs(outputs_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=tb_dir)
 
     accelerator.wait_for_everyone()
@@ -487,7 +508,11 @@ def train(args):
         accelerator.print(f"Excluded train assets from validation metadata: {len(excluded_assets)}")
     if val_dataset is not None:
         accelerator.print(f"Validation dataset size: {len(val_dataset)}")
-    accelerator.print(f"Checkpoints and logs in: {out_dir}")
+    accelerator.print(f"Run directory: {out_dir}")
+    accelerator.print(f"Checkpoints in: {ckpt_dir}")
+    accelerator.print(f"TensorBoard logs in: {tb_dir}")
+    accelerator.print(f"Extra logs in: {logs_dir}")
+    accelerator.print(f"Outputs in: {outputs_dir}")
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
     accelerator.print(f"EMA enabled: {args.use_ema == 1}")
     accelerator.print(f"Mixed precision: {mixed_precision}")
@@ -666,7 +691,7 @@ def train(args):
         accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
-            ckpt_path = os.path.join(out_dir, f"morphflow_epoch_{epoch:04d}_step_{global_step:07d}.pt")
+            ckpt_path = os.path.join(ckpt_dir, f"morphflow_epoch_{epoch:04d}_step_{global_step:07d}.pt")
             ckpt = {
                 "epoch": epoch,
                 "step": global_step,
@@ -691,7 +716,7 @@ def train(args):
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        final_ckpt = os.path.join(out_dir, f"morphflow_epoch_{args.train_epochs:04d}_step_{global_step:07d}.pt")
+        final_ckpt = os.path.join(ckpt_dir, f"morphflow_epoch_{args.train_epochs:04d}_step_{global_step:07d}.pt")
         ckpt = {
             "epoch": args.train_epochs,
             "step": global_step,
