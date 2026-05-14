@@ -63,7 +63,7 @@ class MorphFlow(nn.Module):
             qk_rms_norm=True,
             use_fp16=False,
             use_checkpoint=use_checkpoint,
-            separate_cond=separate_cond       
+            separate_cond=separate_cond,       
             separate_cond_gate=separate_cond_gate, 
         )
         self.sigma_min = sigma_min
