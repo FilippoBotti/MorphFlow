@@ -60,7 +60,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # Set before importing TRELLIS / torch modules.
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("SPCONV_ALGO", "native")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import numpy as np
 import torch
@@ -1006,7 +1005,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-id", default="microsoft/TRELLIS-image-large")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cuda-device", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    parser.add_argument("--cuda-device", default=0)
 
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -1137,7 +1136,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"got {args.batch_index}"
         )
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)
 
     if args.alpha_denom <= 0:
         raise ValueError("--alpha-denom must be > 0")
