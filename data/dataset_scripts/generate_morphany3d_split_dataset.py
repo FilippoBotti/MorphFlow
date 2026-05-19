@@ -86,6 +86,29 @@ def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.=-]+", "_", value)
     return value.strip("_") or "asset"
 
+def tree_to_device(obj, device):
+    if torch.is_tensor(obj):
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: tree_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [tree_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(tree_to_device(v, device) for v in obj)
+    return obj
+
+
+def tree_to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: tree_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [tree_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(tree_to_cpu(v) for v in obj)
+    return obj
+
 
 def alpha_slug(alpha: float, decimals: int = 6) -> str:
     text = f"{alpha:.{decimals}f}".rstrip("0").rstrip(".")
@@ -126,7 +149,13 @@ def stable_mod_key(text: str, modulo: int) -> int:
 def latent_dir_ready(path: Path) -> bool:
     return all(
         (path / name).is_file()
-        for name in ("slat_feats.pt", "slat_coords.pt", "ss_latent.pt", "occupancy.pt")
+        for name in (
+            "slat_feats.pt",
+            "slat_coords.pt",
+            "ss_latent.pt",
+            "structured_latent.pt",
+            "occupancy.pt",
+        )
     )
 
 
@@ -449,10 +478,16 @@ def choose_pairs_for_exact_sample_count(
 
 @torch.no_grad()
 def encode_image_condition(pipeline, image_path: Path) -> dict:
-    image = Image.open(image_path)
-    processed = pipeline.preprocess_image(image)
-    return pipeline.get_cond([processed])
+    with Image.open(image_path) as image:
+        processed = pipeline.preprocess_image(image)
 
+    cond = pipeline.get_cond([processed])
+    cond = tree_to_cpu(cond)
+
+    del processed
+    torch.cuda.empty_cache()
+
+    return cond
 
 @torch.no_grad()
 def sample_endpoint_latents(
@@ -466,6 +501,8 @@ def sample_endpoint_latents(
     Equivalent to pipeline.run(image), but returns source ss latent and SLAT
     without decoding mesh / gaussian / radiance field.
     """
+    cond = tree_to_device(cond, pipeline.device)
+
     seed_everything(seed)
 
     flow_model = pipeline.models["sparse_structure_flow_model"]
@@ -765,9 +802,12 @@ def run_one_morphany3d_step(
     slat_sampler_params: dict,
     ss_mca_flag: bool = True,
     slat_mca_flag: bool = True,
-    ss_tfsa_flag: bool = True,
     slat_tfsa_flag: bool = True,
+    ss_tfsa_flag: bool = True,
 ):
+    src_cond = tree_to_device(src_cond, pipeline.device)
+    tar_cond = tree_to_device(tar_cond, pipeline.device)
+
     seed_everything(seed)
     work_cache.mkdir(parents=True, exist_ok=True)
 
@@ -883,7 +923,7 @@ def ensure_asset_latents(
                 "kind": "source_asset",
             },
         )
-
+        del ss_latent, slat
         torch.cuda.empty_cache()
         return cond
 
@@ -1468,6 +1508,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         f"idx={idx} dir_alpha={alpha_dir:.6f}"
                     )
 
+            del ss_latent, slat
             cleanup_old_index(work_cache, idx - 1)
             torch.cuda.empty_cache()
 
