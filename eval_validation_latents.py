@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument(
         "--val_metadata",
         type=str,
-        default="metadata_val_200_tail.json",
+        default="metadata_val.json",
     )
 
     parser.add_argument(
@@ -496,6 +496,7 @@ def main():
     val_dataset = MorphingDistillDataset(
         root=args.root_dir,
         metadata_file=val_metadata_path,
+        split="val",
         verbose=False,
     )
 

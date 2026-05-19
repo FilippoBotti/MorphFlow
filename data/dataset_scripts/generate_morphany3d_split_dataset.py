@@ -1,47 +1,51 @@
-#!/usr/bin/env python3
 """
 Generate a split-disjoint, alpha-coherent MorphAny3D distillation dataset.
 
-Core guarantees
----------------
-1. Split by source object before pair generation. Train/val/test pairs are built
-   only within their own asset split, so no source object can appear in more than
-   one split.
-2. Alpha symmetry is respected. Metadata alpha always means:
+Guarantees
+----------
+1. Split by source object before pair generation.
+   Train/val/test pairs are built only inside their own asset split.
+2. No object leakage between train, val and test.
+3. For every pair, by default, generate N random on-grid alpha values.
+4. For every object, generate at most K pairings inside the same split.
+5. Alpha symmetry is respected:
 
        target = alpha * src_1 + (1 - alpha) * src_2
 
-   where src_1/src_2 are canonical sorted asset names.
-3. MorphAny3D's discrete morphing trajectory is respected. Requested alpha is
-   mapped to the official frame grid alpha_i = 1 - i / (morphing_num - 1).
-4. Per pair, the script chooses forward or reverse generation for each requested
-   alpha to minimize the number of sequential TFSA steps that must actually be run.
-5. Only useful files are saved:
+   where src_1/src_2 are canonical sorted asset names in metadata.
+6. MorphAny3D's discrete morphing grid is respected.
+7. Per pair, generation direction is optimized to minimize sequential TFSA steps.
+8. Only useful files are saved:
 
+       assets/<asset>/slat_feats.pt
+       assets/<asset>/slat_coords.pt
        assets/<asset>/ss_latent.pt
        assets/<asset>/structured_latent.pt
        assets/<asset>/occupancy.pt
+
        targets/<src_1>+<src_2>/alpha_<alpha>/ss_latent.pt
+       targets/<src_1>+<src_2>/alpha_<alpha>/slat_feats.pt
+       targets/<src_1>+<src_2>/alpha_<alpha>/slat_coords.pt
        targets/<src_1>+<src_2>/alpha_<alpha>/structured_latent.pt
        targets/<src_1>+<src_2>/alpha_<alpha>/occupancy.pt
-       metadata.json, metadata_train.json, metadata_val.json, metadata_test.json
-       splits.json
 
-Example
--------
-python generate_morphany3d_split_dataset.py \
-  --assets-dir /home/filippo/datasets/3d/flux_outputs \
-  --output-dir /home/filippo/datasets/3d/morphing_dataset_flux_v2 \
-  --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1 \
-  --pairs-per-asset 50 \
-  --alphas 0.23 0.64 0.88 \
-  --alpha-denom 100 \
-  --seed 0
+       metadata.json
+       metadata_train.json
+       metadata_val.json
+       metadata_test.json
+       split_assets.json
+       splits.json
+       pair_alphas.json
 """
 
 from __future__ import annotations
 
+import fcntl
+import uuid
+from contextlib import contextmanager
+
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -53,7 +57,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-# Set these before importing TRELLIS / torch modules.
+# Set before importing TRELLIS / torch modules.
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("SPCONV_ALGO", "native")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -90,21 +94,40 @@ def alpha_slug(alpha: float, decimals: int = 6) -> str:
 
 def atomic_torch_save(obj, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     torch.save(obj, tmp)
     os.replace(tmp, path)
 
 
 def atomic_json_save(obj, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=False)
     os.replace(tmp, path)
 
+@contextmanager
+def file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def stable_mod_key(text: str, modulo: int) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "little", signed=False)
+    return value % modulo
+
 
 def latent_dir_ready(path: Path) -> bool:
-    return all((path / name).is_file() for name in ("ss_latent.pt", "structured_latent.pt", "occupancy.pt"))
+    return all(
+        (path / name).is_file()
+        for name in ("slat_feats.pt", "slat_coords.pt", "ss_latent.pt", "occupancy.pt")
+    )
 
 
 def structured_payload(slat) -> Dict[str, torch.Tensor]:
@@ -118,9 +141,12 @@ def occupancy_from_ss_decoder(pipeline, ss_latent: torch.Tensor) -> torch.Tensor
     decoder = pipeline.models["sparse_structure_decoder"]
     with torch.no_grad():
         logits = decoder(ss_latent)
+
     if isinstance(logits, (tuple, list)):
         logits = logits[0]
+
     occ = (logits > 0).detach().cpu()
+
     if occ.ndim == 5 and occ.shape[0] == 1 and occ.shape[1] == 1:
         return occ[0, 0].contiguous()
     if occ.ndim == 5 and occ.shape[0] == 1:
@@ -128,29 +154,47 @@ def occupancy_from_ss_decoder(pipeline, ss_latent: torch.Tensor) -> torch.Tensor
     return occ.contiguous()
 
 
-def save_latent_triplet(pipeline, out_dir: Path, ss_latent: torch.Tensor, slat, extra_manifest: Optional[dict] = None) -> None:
+def save_latent_triplet(
+    pipeline,
+    out_dir: Path,
+    ss_latent: torch.Tensor,
+    slat,
+    extra_manifest: Optional[dict] = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    atomic_torch_save(slat.feats.detach().cpu(), out_dir / "slat_feats.pt")
+    atomic_torch_save(slat.coords.detach().cpu().to(torch.int32), out_dir / "slat_coords.pt")
     atomic_torch_save(ss_latent.detach().cpu(), out_dir / "ss_latent.pt")
     atomic_torch_save(structured_payload(slat), out_dir / "structured_latent.pt")
     atomic_torch_save(occupancy_from_ss_decoder(pipeline, ss_latent), out_dir / "occupancy.pt")
+
     if extra_manifest is not None:
         atomic_json_save(extra_manifest, out_dir / "manifest.json")
 
 
 def list_image_paths(assets_dir: Path) -> Dict[str, Path]:
-    paths = sorted(p for p in assets_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    paths = sorted(
+        p for p in assets_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
     if len(paths) < 2:
         raise ValueError(f"Need at least 2 images in {assets_dir}, found {len(paths)}")
+
     mapping: Dict[str, Path] = {}
     collisions: Dict[str, List[str]] = {}
+
     for path in paths:
         name = safe_name(path.name)
         if name in mapping:
             collisions.setdefault(name, [str(mapping[name])]).append(str(path))
         mapping[name] = path
+
     if collisions:
         details = "; ".join(f"{k}: {v}" for k, v in list(collisions.items())[:10])
         raise ValueError(f"Image names collide after sanitization: {details}")
+
     return mapping
 
 
@@ -162,14 +206,21 @@ def split_assets(
     seed: int,
     strategy: str = "random",
 ) -> Dict[str, List[str]]:
-    ratios = {"train": float(train_ratio), "val": float(val_ratio), "test": float(test_ratio)}
+    ratios = {
+        "train": float(train_ratio),
+        "val": float(val_ratio),
+        "test": float(test_ratio),
+    }
+
     if any(v < 0 for v in ratios.values()):
         raise ValueError(f"Split ratios must be non-negative: {ratios}")
+
     total = sum(ratios.values())
     if total <= 0:
         raise ValueError("At least one split ratio must be > 0")
 
     names = list(sorted(names))
+
     if strategy == "random":
         rng = random.Random(seed)
         rng.shuffle(names)
@@ -181,83 +232,219 @@ def split_assets(
     n = len(names)
     exact = {k: ratios[k] / total * n for k in SPLIT_ORDER}
     counts = {k: int(math.floor(exact[k])) for k in SPLIT_ORDER}
+
     remainder = n - sum(counts.values())
-    order = sorted(SPLIT_ORDER, key=lambda k: (exact[k] - counts[k], ratios[k]), reverse=True)
+    order = sorted(
+        SPLIT_ORDER,
+        key=lambda k: (exact[k] - counts[k], ratios[k]),
+        reverse=True,
+    )
+
     for key in order[:remainder]:
         counts[key] += 1
 
-    # Avoid pathological one-object splits when possible. A split with one asset cannot create pairs.
+    # A split with one object cannot create pairs.
+    # When possible, avoid one-object splits by borrowing from the largest split.
     for key in ("val", "test", "train"):
         if ratios[key] > 0 and counts[key] == 1 and n >= 4:
-            donor = max((k for k in SPLIT_ORDER if counts[k] > 2), key=lambda k: counts[k], default=None)
-            if donor:
+            donors = [k for k in SPLIT_ORDER if counts[k] > 2]
+            if donors:
+                donor = max(donors, key=lambda k: counts[k])
                 counts[donor] -= 1
                 counts[key] += 1
 
     splits: Dict[str, List[str]] = {}
     start = 0
+
     for key in SPLIT_ORDER:
         count = counts[key]
-        splits[key] = sorted(names[start : start + count])
+        splits[key] = sorted(names[start:start + count])
         start += count
 
     seen = {}
     for split, assets in splits.items():
         for asset in assets:
             if asset in seen:
-                raise RuntimeError(f"Internal split error: {asset} in both {seen[asset]} and {split}")
+                raise RuntimeError(
+                    f"Internal split error: {asset} in both {seen[asset]} and {split}"
+                )
             seen[asset] = split
+
     return splits
 
 
-def compute_degree(names: Sequence[str], pairs: Iterable[Tuple[str, str]]) -> Dict[str, int]:
-    degree = {name: 0 for name in names}
-    for a, b in pairs:
-        if a in degree:
-            degree[a] += 1
-        if b in degree:
-            degree[b] += 1
-    return degree
+def build_pairs_with_cap(
+    names: Sequence[str],
+    pairs_per_asset: int,
+    seed: int,
+) -> List[Tuple[str, str]]:
+    """
+    Build unordered pairs inside one split.
 
-
-def build_pairs_with_cap(names: Sequence[str], pairs_per_asset: int, seed: int) -> List[Tuple[str, str]]:
+    pairs_per_asset <= 0 means all unordered pairs.
+    Otherwise each object appears in at most pairs_per_asset pairs.
+    """
     names = sorted(names)
+
     if len(names) < 2:
         return []
+
     max_possible = len(names) - 1
+
     if pairs_per_asset <= 0 or pairs_per_asset >= max_possible:
         return list(combinations(names, 2))
 
     rng = random.Random(seed)
     target = min(pairs_per_asset, max_possible)
+
     degree = {name: 0 for name in names}
     used = set()
     pairs: List[Tuple[str, str]] = []
+
     shuffled = names[:]
     rng.shuffle(shuffled)
 
     made_progress = True
     while made_progress:
         made_progress = False
+
         for a in shuffled:
             if degree[a] >= target:
                 continue
-            candidates = [b for b in names if b != a and degree[b] < target and tuple(sorted((a, b))) not in used]
+
+            candidates = [
+                b for b in names
+                if b != a
+                and degree[b] < target
+                and tuple(sorted((a, b))) not in used
+            ]
+
             rng.shuffle(candidates)
+
             for b in candidates:
                 if degree[a] >= target:
                     break
                 if degree[b] >= target:
                     continue
+
                 pair = tuple(sorted((a, b)))
                 if pair in used:
                     continue
+
                 used.add(pair)
                 degree[a] += 1
                 degree[b] += 1
                 pairs.append(pair)
                 made_progress = True
+
     return sorted(pairs)
+
+
+def stable_pair_seed(seed: int, split: str, a_name: str, b_name: str) -> int:
+    text = f"{seed}|{split}|{a_name}|{b_name}".encode("utf-8")
+    digest = hashlib.sha256(text).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def random_grid_alphas_for_pair(
+    seed: int,
+    split: str,
+    a_name: str,
+    b_name: str,
+    count: int,
+    denom: int,
+    alpha_min: float,
+    alpha_max: float,
+) -> List[float]:
+    """
+    Generate deterministic random alpha values for one pair.
+
+    Values are sampled on the MorphAny3D grid:
+        alpha = k / denom
+
+    Endpoints are excluded by default because source assets are saved separately.
+    """
+    if count <= 0:
+        return []
+
+    candidates = alpha_grid_indices(denom, alpha_min, alpha_max)
+
+    if len(candidates) < count:
+        raise ValueError(
+            f"Not enough alpha grid points between {alpha_min} and {alpha_max} "
+            f"with denom={denom}: have {len(candidates)}, need {count}."
+        )
+
+    rng = random.Random(stable_pair_seed(seed, split, a_name, b_name))
+    values = sorted(rng.sample(candidates, count))
+    return [v / denom for v in values]
+
+
+def alpha_grid_indices(
+    denom: int,
+    alpha_min: float,
+    alpha_max: float,
+) -> List[int]:
+    if denom <= 1:
+        raise ValueError("--alpha-denom must be > 1")
+
+    if not (0.0 <= alpha_min < alpha_max <= 1.0):
+        raise ValueError("Require 0 <= --alpha-min < --alpha-max <= 1")
+
+    lo = max(1, int(math.ceil(alpha_min * denom - 1e-9)))
+    hi = min(denom - 1, int(math.floor(alpha_max * denom + 1e-9)))
+    return list(range(lo, hi + 1))
+
+
+def target_sample_counts_from_args(args) -> Dict[str, Optional[int]]:
+    return {
+        "train": args.target_train_samples,
+        "val": args.target_val_samples,
+        "test": args.target_test_samples,
+    }
+
+
+def has_exact_sample_targets(target_counts: Dict[str, Optional[int]]) -> bool:
+    return any(value is not None for value in target_counts.values())
+
+
+def choose_pairs_for_exact_sample_count(
+    split: str,
+    pairs: Sequence[Tuple[str, str]],
+    target_count: int,
+    alpha_capacity: int,
+    seed: int,
+) -> List[Tuple[Tuple[str, str], int]]:
+    if target_count < 0:
+        raise ValueError(f"target sample count for {split} must be >= 0")
+    if target_count == 0:
+        return []
+    if alpha_capacity <= 0:
+        raise ValueError(f"No alpha values are available for exact planning in split {split}")
+
+    total_capacity = len(pairs) * alpha_capacity
+    if total_capacity < target_count:
+        raise ValueError(
+            f"Split {split} cannot produce {target_count} samples with the current assets/pair cap: "
+            f"{len(pairs)} pairs * {alpha_capacity} alpha(s) = {total_capacity}. "
+            "Increase --pairs-per-asset, widen the alpha range, or add more assets."
+        )
+
+    shuffled = list(pairs)
+    rng = random.Random(seed)
+    rng.shuffle(shuffled)
+
+    selected: List[Tuple[Tuple[str, str], int]] = []
+    remaining = target_count
+
+    for pair in shuffled:
+        if remaining <= 0:
+            break
+        count = min(alpha_capacity, remaining)
+        selected.append((pair, count))
+        remaining -= count
+
+    return selected
 
 
 @torch.no_grad()
@@ -268,15 +455,36 @@ def encode_image_condition(pipeline, image_path: Path) -> dict:
 
 
 @torch.no_grad()
-def sample_endpoint_latents(pipeline, cond: dict, seed: int, sparse_sampler_params: dict, slat_sampler_params: dict):
-    """Equivalent to pipeline.run(image), but returns source ss latent and SLAT without mesh/GS/RF decoding."""
+def sample_endpoint_latents(
+    pipeline,
+    cond: dict,
+    seed: int,
+    sparse_sampler_params: dict,
+    slat_sampler_params: dict,
+):
+    """
+    Equivalent to pipeline.run(image), but returns source ss latent and SLAT
+    without decoding mesh / gaussian / radiance field.
+    """
     seed_everything(seed)
 
     flow_model = pipeline.models["sparse_structure_flow_model"]
     reso = flow_model.resolution
-    noise = torch.randn(1, flow_model.in_channels, reso, reso, reso, device=pipeline.device)
 
-    sampler_params = {**pipeline.sparse_structure_sampler_params, **sparse_sampler_params}
+    noise = torch.randn(
+        1,
+        flow_model.in_channels,
+        reso,
+        reso,
+        reso,
+        device=pipeline.device,
+    )
+
+    sampler_params = {
+        **pipeline.sparse_structure_sampler_params,
+        **sparse_sampler_params,
+    }
+
     ss_latent = pipeline.sparse_structure_sampler.sample(
         flow_model,
         noise,
@@ -288,6 +496,7 @@ def sample_endpoint_latents(pipeline, cond: dict, seed: int, sparse_sampler_para
     decoder = pipeline.models["sparse_structure_decoder"]
     voxels = decoder(ss_latent) > 0
     coords = torch.argwhere(voxels)[:, [0, 2, 3, 4]].int()
+
     slat = pipeline.sample_slat(cond, coords, slat_sampler_params)
     return ss_latent, slat
 
@@ -308,7 +517,7 @@ class PairRequest:
 @dataclass(frozen=True)
 class PlannedTarget:
     request: PairRequest
-    direction: str  # forward A->B, reverse B->A, endpoint_a, endpoint_b.
+    direction: str
     morphing_idx: int
     alpha_dir: float
     effective_alpha_a: float
@@ -326,9 +535,16 @@ class PlannedTarget:
         return f"{self.pair_name}/alpha_{alpha_slug(self.effective_alpha_a)}"
 
 
-def canonicalize_request(split: str, a_name: str, b_name: str, alpha_a_input: float, name_to_path: Dict[str, Path]) -> PairRequest:
+def canonicalize_request(
+    split: str,
+    a_name: str,
+    b_name: str,
+    alpha_a_input: float,
+    name_to_path: Dict[str, Path],
+) -> PairRequest:
     if not (0.0 <= alpha_a_input <= 1.0):
         raise ValueError(f"alpha must be in [0, 1], got {alpha_a_input}")
+
     if a_name == b_name:
         raise ValueError(f"Pair uses the same asset twice: {a_name}")
 
@@ -352,18 +568,27 @@ def canonicalize_request(split: str, a_name: str, b_name: str, alpha_a_input: fl
     )
 
 
-def direction_index_for_alpha(alpha_dir: float, morphing_num: int, snap: bool, tol: float) -> Tuple[int, float]:
+def direction_index_for_alpha(
+    alpha_dir: float,
+    morphing_num: int,
+    snap: bool,
+    tol: float,
+) -> Tuple[int, float]:
     denom = morphing_num - 1
     raw_idx = (1.0 - alpha_dir) * denom
     idx = int(round(raw_idx))
     idx = max(0, min(denom, idx))
+
     effective = 1.0 - idx / denom
+
     if abs(effective - alpha_dir) > tol and not snap:
         raise ValueError(
-            f"alpha={alpha_dir:.10f} is not on the MorphAny3D grid for morphing_num={morphing_num}. "
-            f"Nearest effective alpha is {effective:.10f} at idx={idx}. "
-            "Use --snap-alpha 1 or choose a finer --alpha-denom."
+            f"alpha={alpha_dir:.10f} is not on the MorphAny3D grid for "
+            f"morphing_num={morphing_num}. Nearest effective alpha is "
+            f"{effective:.10f} at idx={idx}. Use --snap-alpha 1 or choose "
+            "a finer --alpha-denom."
         )
+
     return idx, effective
 
 
@@ -373,44 +598,91 @@ def optimize_direction_plan_for_pair(
     snap: bool,
     tol: float,
 ) -> List[PlannedTarget]:
-    """Minimize TFSA trajectory length for one canonical pair."""
+    """
+    For one canonical pair A+B, choose whether each target is cheaper to generate
+    as A->B or B->A.
+
+    MorphAny3D cache is sequential, so cost is max idx per direction.
+    """
     rows = []
+
     for req in requests:
         a = req.requested_alpha_a
+
         f_idx, f_eff_dir_alpha = direction_index_for_alpha(a, morphing_num, snap, tol)
         r_idx, r_eff_dir_alpha = direction_index_for_alpha(1.0 - a, morphing_num, snap, tol)
-        rows.append((req, f_idx, f_eff_dir_alpha, f_eff_dir_alpha, r_idx, r_eff_dir_alpha, 1.0 - r_eff_dir_alpha))
+
+        rows.append(
+            (
+                req,
+                f_idx,
+                f_eff_dir_alpha,
+                f_eff_dir_alpha,
+                r_idx,
+                r_eff_dir_alpha,
+                1.0 - r_eff_dir_alpha,
+            )
+        )
 
     denom = morphing_num - 1
+
     interior = [r for r in rows if r[1] not in (0, denom) and r[4] not in (0, denom)]
     endpoints = [r for r in rows if r not in interior]
 
     planned: List[PlannedTarget] = []
+
     if interior:
         candidate_f = sorted({0} | {r[1] for r in interior})
         candidate_r = sorted({0} | {r[4] for r in interior})
+
         best: Optional[Tuple[int, int, int, int]] = None
+
         for max_f in candidate_f:
             for max_r in candidate_r:
-                feasible = all((f_idx <= max_f) or (r_idx <= max_r) for _, f_idx, _, _, r_idx, _, _ in interior)
+                feasible = all(
+                    (f_idx <= max_f) or (r_idx <= max_r)
+                    for _, f_idx, _, _, r_idx, _, _ in interior
+                )
+
                 if not feasible:
                     continue
+
                 num_dirs = int(max_f > 0) + int(max_r > 0)
                 score = max_f + max_r
                 candidate = (score, num_dirs, max_f, max_r)
+
                 if best is None or candidate < best:
                     best = candidate
+
         if best is None:
             raise RuntimeError("Unable to find a feasible direction plan")
+
         _, _, best_max_f, best_max_r = best
 
         for req, f_idx, f_eff_dir_alpha, f_eff_a, r_idx, r_eff_dir_alpha, r_eff_a in interior:
             can_f = f_idx <= best_max_f
             can_r = r_idx <= best_max_r
+
             if can_f and (not can_r or f_idx <= r_idx):
-                planned.append(PlannedTarget(req, "forward", f_idx, f_eff_dir_alpha, f_eff_a))
+                planned.append(
+                    PlannedTarget(
+                        req,
+                        "forward",
+                        f_idx,
+                        f_eff_dir_alpha,
+                        f_eff_a,
+                    )
+                )
             elif can_r:
-                planned.append(PlannedTarget(req, "reverse", r_idx, r_eff_dir_alpha, r_eff_a))
+                planned.append(
+                    PlannedTarget(
+                        req,
+                        "reverse",
+                        r_idx,
+                        r_eff_dir_alpha,
+                        r_eff_a,
+                    )
+                )
             else:
                 raise RuntimeError("Internal direction planning error")
 
@@ -420,7 +692,16 @@ def optimize_direction_plan_for_pair(
         else:
             planned.append(PlannedTarget(req, "endpoint_b", 0, 1.0, 0.0))
 
-    planned.sort(key=lambda x: (x.split, x.pair_name, x.effective_alpha_a, x.direction, x.morphing_idx))
+    planned.sort(
+        key=lambda x: (
+            x.split,
+            x.pair_name,
+            x.effective_alpha_a,
+            x.direction,
+            x.morphing_idx,
+        )
+    )
+
     return planned
 
 
@@ -431,27 +712,40 @@ def plan_all_targets(
     tol: float,
 ) -> List[PlannedTarget]:
     grouped: Dict[Tuple[str, str, str], List[PairRequest]] = {}
+
     for req in requests:
         grouped.setdefault((req.split, req.canon_a, req.canon_b), []).append(req)
+
     planned: List[PlannedTarget] = []
+
     for key in sorted(grouped):
-        # Deduplicate same alpha after canonicalization.
         dedup: Dict[str, PairRequest] = {}
         for req in grouped[key]:
             dedup[f"{req.requested_alpha_a:.10f}"] = req
-        planned.extend(optimize_direction_plan_for_pair(list(dedup.values()), morphing_num, snap, tol))
+
+        planned.extend(
+            optimize_direction_plan_for_pair(
+                list(dedup.values()),
+                morphing_num,
+                snap,
+                tol,
+            )
+        )
+
     return planned
 
 
 def cleanup_old_index(cache_dir: Path, old_idx: int) -> None:
     if old_idx <= 0 or not cache_dir.exists():
         return
+
     patterns = [
         f"ss_sa_morphing{old_idx}_*",
         f"slat_sa_morphing{old_idx}_*",
         f"feat_coords_morphing{old_idx}.pt",
         f"coords_morphing{old_idx}.pt",
     ]
+
     for pattern in patterns:
         for path in cache_dir.glob(pattern):
             path.unlink(missing_ok=True)
@@ -498,18 +792,21 @@ def run_one_morphany3d_step(
         sparse_sampler_params,
         morphing_params,
     )
+
     slat = pipeline.sample_slat_morphing(
         src_cond,
         coords,
         slat_sampler_params,
         morphing_params,
     )
+
     return ss_latent, slat
 
 
 def build_metadata_entry(planned: PlannedTarget) -> dict:
     req = planned.request
     target_rel = f"targets/{planned.target_name}"
+
     return {
         "split": planned.split,
         "src_1": req.canon_a,
@@ -521,6 +818,12 @@ def build_metadata_entry(planned: PlannedTarget) -> dict:
         "src1_dir": f"assets/{req.canon_a}",
         "src2_dir": f"assets/{req.canon_b}",
         "target_dir": target_rel,
+        "src1_slat_feats": f"assets/{req.canon_a}/slat_feats.pt",
+        "src1_slat_coords": f"assets/{req.canon_a}/slat_coords.pt",
+        "src2_slat_feats": f"assets/{req.canon_b}/slat_feats.pt",
+        "src2_slat_coords": f"assets/{req.canon_b}/slat_coords.pt",
+        "target_slat_feats": f"{target_rel}/slat_feats.pt",
+        "target_slat_coords": f"{target_rel}/slat_coords.pt",
         "src1_ss_latent": f"assets/{req.canon_a}/ss_latent.pt",
         "src2_ss_latent": f"assets/{req.canon_b}/ss_latent.pt",
         "target_ss_latent": f"{target_rel}/ss_latent.pt",
@@ -547,38 +850,55 @@ def ensure_asset_latents(
     slat_sampler_params: dict,
 ) -> dict:
     out_dir = output_dir / "assets" / asset_name
-    if latent_dir_ready(out_dir):
-        if asset_name not in cond_cache:
-            cond_cache[asset_name] = encode_image_condition(pipeline, asset_path)
-        return cond_cache[asset_name]
+    lock_path = output_dir / ".locks" / f"asset_{asset_name}.lock"
 
-    print(f"[asset] generating {asset_name}")
-    cond = encode_image_condition(pipeline, asset_path)
-    cond_cache[asset_name] = cond
-    ss_latent, slat = sample_endpoint_latents(
-        pipeline,
-        cond,
-        seed=seed,
-        sparse_sampler_params=sparse_sampler_params,
-        slat_sampler_params=slat_sampler_params,
-    )
-    save_latent_triplet(
-        pipeline,
-        out_dir,
-        ss_latent,
-        slat,
-        extra_manifest={"name": asset_name, "image": str(asset_path), "seed": seed, "kind": "source_asset"},
-    )
-    torch.cuda.empty_cache()
-    return cond
+    with file_lock(lock_path):
+        if latent_dir_ready(out_dir):
+            if asset_name not in cond_cache:
+                cond_cache[asset_name] = encode_image_condition(pipeline, asset_path)
+            return cond_cache[asset_name]
+
+        print(f"[asset] generating {asset_name}")
+
+        cond = encode_image_condition(pipeline, asset_path)
+        cond_cache[asset_name] = cond
+
+        ss_latent, slat = sample_endpoint_latents(
+            pipeline,
+            cond,
+            seed=seed,
+            sparse_sampler_params=sparse_sampler_params,
+            slat_sampler_params=slat_sampler_params,
+        )
+
+        save_latent_triplet(
+            pipeline,
+            out_dir,
+            ss_latent,
+            slat,
+            extra_manifest={
+                "name": asset_name,
+                "image": str(asset_path),
+                "seed": seed,
+                "kind": "source_asset",
+            },
+        )
+
+        torch.cuda.empty_cache()
+        return cond
 
 
-def group_by_pair_and_direction(planned: Sequence[PlannedTarget]) -> Dict[Tuple[str, str, str], List[PlannedTarget]]:
+def group_by_pair_and_direction(
+    planned: Sequence[PlannedTarget],
+) -> Dict[Tuple[str, str, str], List[PlannedTarget]]:
     grouped: Dict[Tuple[str, str, str], List[PlannedTarget]] = {}
+
     for item in planned:
         grouped.setdefault((item.split, item.pair_name, item.direction), []).append(item)
+
     for key in grouped:
         grouped[key].sort(key=lambda x: x.morphing_idx)
+
     return grouped
 
 
@@ -588,9 +908,15 @@ def parse_sampler_params(json_text: Optional[str]) -> dict:
     return json.loads(json_text)
 
 
-def write_metadata_files(output_dir: Path, planned: Sequence[PlannedTarget], splits: Dict[str, List[str]], config: dict) -> None:
+def write_metadata_files(
+    output_dir: Path,
+    planned: Sequence[PlannedTarget],
+    splits: Dict[str, List[str]],
+    config: dict,
+) -> None:
     ready_entries = []
     missing = 0
+
     for item in planned:
         out_dir = output_dir / "targets" / item.target_name
         if latent_dir_ready(out_dir):
@@ -598,27 +924,44 @@ def write_metadata_files(output_dir: Path, planned: Sequence[PlannedTarget], spl
         else:
             missing += 1
 
-    ready_entries.sort(key=lambda e: (e["split"], e["src_1"], e["src_2"], float(e["alpha"])))
+    ready_entries.sort(
+        key=lambda e: (
+            e["split"],
+            e["src_1"],
+            e["src_2"],
+            float(e["alpha"]),
+        )
+    )
+
     atomic_json_save(ready_entries, output_dir / "metadata.json")
+
     for split in SPLIT_ORDER:
         split_entries = [e for e in ready_entries if e["split"] == split]
         atomic_json_save(split_entries, output_dir / f"metadata_{split}.json")
 
     split_asset_sets = {k: sorted(v) for k, v in splits.items()}
-    # Plain split file consumed by morph_dataset_coherent.py.
+
     atomic_json_save(split_asset_sets, output_dir / "split_assets.json")
+
     split_payload = {
         "assets": split_asset_sets,
         "counts": {k: len(v) for k, v in split_asset_sets.items()},
-        "metadata_counts": {k: sum(1 for e in ready_entries if e["split"] == k) for k in SPLIT_ORDER},
+        "metadata_counts": {
+            k: sum(1 for e in ready_entries if e["split"] == k)
+            for k in SPLIT_ORDER
+        },
         "missing_planned_targets": missing,
         "config": config,
     }
+
     atomic_json_save(split_payload, output_dir / "splits.json")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate split-disjoint MorphAny3D alpha dataset.")
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate split-disjoint MorphAny3D alpha dataset."
+    )
+
     parser.add_argument("--assets-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-id", default="microsoft/TRELLIS-image-large")
@@ -629,25 +972,138 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--split-strategy", choices=["random", "sorted"], default="random")
-    parser.add_argument("--pairs-per-asset", type=int, default=50, help="<=0 means all unordered pairs inside each split.")
-    parser.add_argument("--alphas", nargs="+", type=float, default=[0.23, 0.64, 0.88])
 
-    parser.add_argument("--alpha-denom", type=int, default=100, help="Grid denominator; 100 gives alpha step 0.01 and morphing_num=101.")
-    parser.add_argument("--morphing-num", type=int, default=None, help="Overrides --alpha-denom by setting MorphAny3D grid size directly.")
+    parser.add_argument(
+        "--pairs-per-asset",
+        type=int,
+        default=50,
+        help="<=0 means all unordered pairs inside each split.",
+    )
+
+    parser.add_argument(
+        "--target-train-samples",
+        type=int,
+        default=None,
+        help="If set, plan exactly this many generated samples for the train split.",
+    )
+    parser.add_argument(
+        "--target-val-samples",
+        type=int,
+        default=None,
+        help="If set, plan exactly this many generated samples for the val split.",
+    )
+    parser.add_argument(
+        "--target-test-samples",
+        type=int,
+        default=None,
+        help="If set, plan exactly this many generated samples for the test split.",
+    )
+
+    parser.add_argument(
+        "--alphas",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Optional fixed/debug alphas. If omitted, random on-grid alphas are sampled per pair.",
+    )
+
+    parser.add_argument(
+        "--random-alphas-per-pair",
+        type=int,
+        default=3,
+        help="Number of random, distinct, on-grid non-endpoint alphas per pair when --alphas is omitted.",
+    )
+
+    parser.add_argument(
+        "--alpha-min",
+        type=float,
+        default=0.01,
+        help="Minimum random alpha for src_1, inclusive on the discrete grid.",
+    )
+
+    parser.add_argument(
+        "--alpha-max",
+        type=float,
+        default=0.99,
+        help="Maximum random alpha for src_1, inclusive on the discrete grid.",
+    )
+
+    parser.add_argument(
+        "--alpha-denom",
+        type=int,
+        default=100,
+        help="Grid denominator; 100 gives alpha step 0.01 and morphing_num=101.",
+    )
+
+    parser.add_argument(
+        "--morphing-num",
+        type=int,
+        default=None,
+        help="Overrides --alpha-denom by setting MorphAny3D grid size directly.",
+    )
+
     parser.add_argument("--snap-alpha", type=int, choices=[0, 1], default=0)
     parser.add_argument("--alpha-tol", type=float, default=1e-7)
     parser.add_argument("--tfsa-alpha", type=float, default=0.8)
     parser.add_argument("--disable-tfsa", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--sparse-sampler-params", type=str, default=None, help='JSON, e.g. \'{"steps": 25}\'')
-    parser.add_argument("--slat-sampler-params", type=str, default=None, help='JSON, e.g. \'{"steps": 25}\'')
-    parser.add_argument("--dry-run", action="store_true", help="Only build splits and print the plan; do not import TRELLIS or generate latents.")
-    args = parser.parse_args()
+
+    parser.add_argument(
+        "--sparse-sampler-params",
+        type=str,
+        default=None,
+        help='JSON, e.g. \'{"steps": 25}\'',
+    )
+
+    parser.add_argument(
+        "--slat-sampler-params",
+        type=str,
+        default=None,
+        help='JSON, e.g. \'{"steps": 25}\'',
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only build splits and print the plan; do not import TRELLIS or generate latents.",
+    )
+    parser.add_argument(
+        "--print-plan-details",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Print per-pair direction plans. Disabled by default because exact datasets are large.",
+    )
+    parser.add_argument(
+        "--num-batches",
+        type=int,
+        default=1,
+        help="Number of independent generation batches. Use with Slurm array.",
+    )
+
+    parser.add_argument(
+        "--batch-index",
+        type=int,
+        default=0,
+        help="Current batch index in [0, num_batches-1]. Use with Slurm array.",
+    )
+
+    args = parser.parse_args(argv)
+    if args.num_batches < 1:
+        raise ValueError("--num-batches must be >= 1")
+
+    if not (0 <= args.batch_index < args.num_batches):
+        raise ValueError(
+            f"--batch-index must be in [0, {args.num_batches - 1}], "
+            f"got {args.batch_index}"
+        )
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)
 
     if args.alpha_denom <= 0:
         raise ValueError("--alpha-denom must be > 0")
+
     morphing_num = int(args.morphing_num or (args.alpha_denom + 1))
+
     if morphing_num < 3:
         raise ValueError("morphing_num must be >= 3")
 
@@ -655,6 +1111,7 @@ def main() -> None:
     slat_sampler_params = parse_sampler_params(args.slat_sampler_params)
 
     name_to_path = list_image_paths(args.assets_dir)
+
     splits = split_assets(
         names=sorted(name_to_path),
         train_ratio=args.train_ratio,
@@ -665,22 +1122,117 @@ def main() -> None:
     )
 
     split_pairs: Dict[str, List[Tuple[str, str]]] = {}
+    pair_alphas: Dict[str, Dict[str, List[float]]] = {split: {} for split in SPLIT_ORDER}
     requests: List[PairRequest] = []
-    for split in SPLIT_ORDER:
-        pairs = build_pairs_with_cap(splits[split], args.pairs_per_asset, seed=args.seed + {'train': 101, 'val': 202, 'test': 303}[split])
-        split_pairs[split] = pairs
-        for a_name, b_name in pairs:
-            for alpha in args.alphas:
-                requests.append(canonicalize_request(split, a_name, b_name, float(alpha), name_to_path))
 
-    planned = plan_all_targets(
+    split_pair_seeds = {
+        "train": args.seed + 101,
+        "val": args.seed + 202,
+        "test": args.seed + 303,
+    }
+    exact_target_counts = target_sample_counts_from_args(args)
+    exact_mode = has_exact_sample_targets(exact_target_counts)
+
+    if exact_mode and args.alphas is not None:
+        fixed_alphas = list(dict.fromkeys(float(alpha) for alpha in args.alphas))
+        if len(fixed_alphas) != len(args.alphas):
+            raise ValueError("--alphas contains duplicate values; exact sample planning needs unique targets.")
+    else:
+        fixed_alphas = None
+
+    alpha_capacity = (
+        len(fixed_alphas)
+        if fixed_alphas is not None
+        else len(alpha_grid_indices(args.alpha_denom, args.alpha_min, args.alpha_max))
+    )
+
+    for split in SPLIT_ORDER:
+        pairs = build_pairs_with_cap(
+            splits[split],
+            args.pairs_per_asset,
+            seed=split_pair_seeds[split],
+        )
+
+        target_count = exact_target_counts[split]
+        if exact_mode and target_count is not None:
+            pair_counts = choose_pairs_for_exact_sample_count(
+                split=split,
+                pairs=pairs,
+                target_count=target_count,
+                alpha_capacity=alpha_capacity,
+                seed=split_pair_seeds[split] + 1009,
+            )
+        else:
+            default_alpha_count = len(fixed_alphas) if fixed_alphas is not None else args.random_alphas_per_pair
+            pair_counts = [(pair, default_alpha_count) for pair in pairs]
+
+        split_pairs[split] = [pair for pair, _count in pair_counts]
+
+        for (a_name, b_name), alpha_count in pair_counts:
+            if fixed_alphas is not None:
+                alphas_for_pair = fixed_alphas[:alpha_count]
+            else:
+                alphas_for_pair = random_grid_alphas_for_pair(
+                    seed=args.seed,
+                    split=split,
+                    a_name=a_name,
+                    b_name=b_name,
+                    count=alpha_count,
+                    denom=args.alpha_denom,
+                    alpha_min=args.alpha_min,
+                    alpha_max=args.alpha_max,
+                )
+
+            pair_alphas[split][f"{a_name}+{b_name}"] = alphas_for_pair
+
+            for alpha in alphas_for_pair:
+                requests.append(
+                    canonicalize_request(
+                        split,
+                        a_name,
+                        b_name,
+                        float(alpha),
+                        name_to_path,
+                    )
+                )
+
+    all_planned = plan_all_targets(
         requests,
         morphing_num=morphing_num,
         snap=bool(args.snap_alpha),
         tol=float(args.alpha_tol),
     )
 
+    if exact_mode:
+        planned_counts = {
+            split: sum(1 for item in all_planned if item.split == split)
+            for split in SPLIT_ORDER
+        }
+        for split, requested in exact_target_counts.items():
+            if requested is not None and planned_counts[split] != requested:
+                raise RuntimeError(
+                    f"Exact planning mismatch for {split}: requested {requested}, "
+                    f"planned {planned_counts[split]}. Check duplicate alphas or alpha snapping."
+                )
+
+    if args.num_batches > 1:
+        planned = [
+            item for item in all_planned
+            if stable_mod_key(f"{item.split}|{item.pair_name}", args.num_batches)
+            == args.batch_index
+        ]
+    else:
+        planned = all_planned
+
+    print(
+        f"Batch selection: batch_index={args.batch_index} "
+        f"num_batches={args.num_batches} "
+        f"selected_targets={len(planned)} "
+        f"total_targets={len(all_planned)}"
+    )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
     work_root = args.output_dir / ".tmp_morphany3d_cache"
     work_root.mkdir(parents=True, exist_ok=True)
 
@@ -688,19 +1240,41 @@ def main() -> None:
     print(f"assets_dir: {args.assets_dir}")
     print(f"output_dir: {args.output_dir}")
     print(f"assets total: {len(name_to_path)}")
-    print(f"morphing_num: {morphing_num}  grid_step: {1.0 / (morphing_num - 1):.8f}")
-    print(f"alphas requested: {args.alphas}")
-    for split in SPLIT_ORDER:
-        print(f"split {split:5s}: assets={len(splits[split])} pairs={len(split_pairs[split])} samples={len(split_pairs[split]) * len(args.alphas)}")
+    print(f"morphing_num: {morphing_num}")
+    print(f"grid_step: {1.0 / (morphing_num - 1):.8f}")
 
-    for (split, pair_name, direction), items in group_by_pair_and_direction(planned).items():
-        if direction.startswith("endpoint"):
-            continue
+    if args.alphas is not None:
+        print(f"fixed/debug alphas requested: {args.alphas}")
+    else:
+        if exact_mode:
+            print("random alphas: exact per-split sample planning")
+        else:
+            print(f"random alphas per pair: {args.random_alphas_per_pair}")
+        print(f"alpha_range: [{args.alpha_min}, {args.alpha_max}]")
+
+    if exact_mode:
+        print(f"target sample counts: {exact_target_counts}")
+
+    for split in SPLIT_ORDER:
+        planned_samples = sum(len(v) for v in pair_alphas[split].values())
         print(
-            f"plan {split:5s} {pair_name:40s} {direction:7s}: "
-            f"targets={len(items)} max_idx={max(x.morphing_idx for x in items)} "
-            f"alphas={[round(x.effective_alpha_a, 6) for x in items]}"
+            f"split {split:5s}: "
+            f"assets={len(splits[split])} "
+            f"pairs={len(split_pairs[split])} "
+            f"samples={planned_samples}"
         )
+
+    if args.print_plan_details == 1:
+        for (split, pair_name, direction), items in group_by_pair_and_direction(planned).items():
+            if direction.startswith("endpoint"):
+                continue
+
+            print(
+                f"plan {split:5s} {pair_name:40s} {direction:7s}: "
+                f"targets={len(items)} "
+                f"max_idx={max(x.morphing_idx for x in items)} "
+                f"alphas={[round(x.effective_alpha_a, 6) for x in items]}"
+            )
 
     config = {
         "assets_dir": str(args.assets_dir),
@@ -710,7 +1284,18 @@ def main() -> None:
         "val_ratio": args.val_ratio,
         "test_ratio": args.test_ratio,
         "pairs_per_asset": args.pairs_per_asset,
-        "alphas": [float(x) for x in args.alphas],
+        "alphas": [float(x) for x in args.alphas] if args.alphas is not None else None,
+        "random_alphas_per_pair": args.random_alphas_per_pair,
+        "alpha_min": args.alpha_min,
+        "alpha_max": args.alpha_max,
+        "alpha_generation": (
+            "fixed"
+            if args.alphas is not None
+            else "exact_random_per_split"
+            if exact_mode
+            else "random_per_pair"
+        ),
+        "target_sample_counts": exact_target_counts,
         "alpha_denom": args.alpha_denom,
         "morphing_num": morphing_num,
         "snap_alpha": bool(args.snap_alpha),
@@ -718,14 +1303,21 @@ def main() -> None:
         "tfsa_enabled": args.disable_tfsa == 0,
     }
 
+    atomic_json_save(pair_alphas, args.output_dir / "pair_alphas.json")
+
     if args.dry_run:
         dry_payload = {
             "assets": {k: sorted(v) for k, v in splits.items()},
             "counts": {k: len(v) for k, v in splits.items()},
             "planned_pairs": {k: len(v) for k, v in split_pairs.items()},
-            "planned_samples": {k: len(split_pairs[k]) * len(args.alphas) for k in SPLIT_ORDER},
+            "planned_samples": {
+                k: len([p for p in planned if p.split == k])
+                for k in SPLIT_ORDER
+            },
+            "pair_alphas": pair_alphas,
             "config": config,
         }
+
         atomic_json_save(dry_payload, args.output_dir / "splits.dry_run.json")
         print(f"Dry run written: {args.output_dir / 'splits.dry_run.json'}")
         return
@@ -736,7 +1328,12 @@ def main() -> None:
     pipeline.cuda()
 
     cond_cache: Dict[str, dict] = {}
-    required_assets = sorted({p.request.canon_a for p in planned} | {p.request.canon_b for p in planned})
+
+    required_assets = sorted(
+        {p.request.canon_a for p in planned}
+        | {p.request.canon_b for p in planned}
+    )
+
     for asset_name in required_assets:
         ensure_asset_latents(
             pipeline,
@@ -749,31 +1346,55 @@ def main() -> None:
             slat_sampler_params,
         )
 
-    # Endpoint targets are physical copies to keep the loader simple.
+    # Endpoint targets are copied only to keep the loader simple.
     for item in [p for p in planned if p.direction.startswith("endpoint")]:
         src_asset = item.request.canon_a if item.direction == "endpoint_a" else item.request.canon_b
         src_dir = args.output_dir / "assets" / src_asset
         tgt_dir = args.output_dir / "targets" / item.target_name
+
         if not latent_dir_ready(tgt_dir):
             tgt_dir.mkdir(parents=True, exist_ok=True)
-            for fname in ("ss_latent.pt", "structured_latent.pt", "occupancy.pt"):
-                shutil.copy2(src_dir / fname, tgt_dir / fname)
+
+            for fname in (
+                "slat_feats.pt",
+                "slat_coords.pt",
+                "ss_latent.pt",
+                "structured_latent.pt",
+                "occupancy.pt",
+            ):
+                src_file = src_dir / fname
+                if src_file.is_file():
+                    shutil.copy2(src_file, tgt_dir / fname)
+
             atomic_json_save(
-                {"kind": "endpoint_copy", "copied_from": f"assets/{src_asset}", "alpha": item.effective_alpha_a, "split": item.split},
+                {
+                    "kind": "endpoint_copy",
+                    "copied_from": f"assets/{src_asset}",
+                    "alpha": item.effective_alpha_a,
+                    "split": item.split,
+                },
                 tgt_dir / "manifest.json",
             )
 
-    grouped = group_by_pair_and_direction([p for p in planned if p.direction in ("forward", "reverse")])
+    grouped = group_by_pair_and_direction(
+        [p for p in planned if p.direction in ("forward", "reverse")]
+    )
+
     ss_tfsa_flag = args.disable_tfsa == 0
     slat_tfsa_flag = args.disable_tfsa == 0
 
     for (split, pair_name, direction), items in grouped.items():
-        missing_items = [p for p in items if not latent_dir_ready(args.output_dir / "targets" / p.target_name)]
+        missing_items = [
+            p for p in items
+            if not latent_dir_ready(args.output_dir / "targets" / p.target_name)
+        ]
+
         if not missing_items:
             print(f"[pair] {split} {pair_name} {direction}: skipped, all targets ready")
             continue
 
         req = items[0].request
+
         if direction == "forward":
             src_name, tar_name = req.canon_a, req.canon_b
         else:
@@ -781,6 +1402,7 @@ def main() -> None:
 
         src_cond = cond_cache[src_name]
         tar_cond = cond_cache[tar_name]
+
         work_cache = work_root / f"{split}__{pair_name}__{direction}"
         shutil.rmtree(work_cache, ignore_errors=True)
         work_cache.mkdir(parents=True, exist_ok=True)
@@ -788,11 +1410,17 @@ def main() -> None:
         items_by_idx: Dict[int, List[PlannedTarget]] = {}
         for p in missing_items:
             items_by_idx.setdefault(p.morphing_idx, []).append(p)
+
         max_idx = max(items_by_idx)
-        print(f"[pair] {split} {pair_name} {direction}: running idx 1..{max_idx}, saving {len(missing_items)} target(s)")
+
+        print(
+            f"[pair] {split} {pair_name} {direction}: "
+            f"running idx 1..{max_idx}, saving {len(missing_items)} target(s)"
+        )
 
         for idx in range(1, max_idx + 1):
             alpha_dir = 1.0 - idx / (morphing_num - 1)
+
             ss_latent, slat = run_one_morphany3d_step(
                 pipeline,
                 src_cond=src_cond,
@@ -813,6 +1441,7 @@ def main() -> None:
             if idx in items_by_idx:
                 for target in items_by_idx[idx]:
                     out_dir = args.output_dir / "targets" / target.target_name
+
                     save_latent_triplet(
                         pipeline,
                         out_dir,
@@ -833,15 +1462,22 @@ def main() -> None:
                             "tfsa_enabled": args.disable_tfsa == 0,
                         },
                     )
-                    print(f"  saved {split}/{target.target_name}  idx={idx} dir_alpha={alpha_dir:.6f}")
+
+                    print(
+                        f"  saved {split}/{target.target_name} "
+                        f"idx={idx} dir_alpha={alpha_dir:.6f}"
+                    )
 
             cleanup_old_index(work_cache, idx - 1)
             torch.cuda.empty_cache()
 
         shutil.rmtree(work_cache, ignore_errors=True)
 
-    write_metadata_files(args.output_dir, planned, splits, config)
+    # In batch/array mode, each task writes metadata by scanning all planned targets.
+    # The last successful task will leave complete metadata.json.
+    write_metadata_files(args.output_dir, all_planned, splits, config)
     shutil.rmtree(work_root, ignore_errors=True)
+
     print(f"Done. Metadata: {args.output_dir / 'metadata.json'}")
     print(f"Train metadata: {args.output_dir / 'metadata_train.json'}")
     print(f"Val metadata:   {args.output_dir / 'metadata_val.json'}")

@@ -22,8 +22,8 @@ def build_parser():
 
     # Dataset
     parser.add_argument("--root_dir", type=str, default="/home/filippo/datasets/3d/morphing_dataset_flux")
-    parser.add_argument("--metadata", type=str, default="metadata_2.json")
-    parser.add_argument("--val_metadata", type=str, default="metadata_val_200_tail.json")
+    parser.add_argument("--metadata", type=str, default="metadata_train.json")
+    parser.add_argument("--val_metadata", type=str, default="metadata_val.json")
     parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1)
 
     # Output
@@ -521,6 +521,7 @@ def train(args):
     dataset = MorphingDistillDataset(
         root=args.root_dir,
         metadata_file=metadata_path,
+        split="train",
         verbose=accelerator.is_main_process,
         exclude_assets=excluded_assets,
     )
@@ -542,6 +543,7 @@ def train(args):
         val_dataset = MorphingDistillDataset(
             root=args.root_dir,
             metadata_file=val_metadata_path,
+            split="val",
             verbose=accelerator.is_main_process,
         )
 
