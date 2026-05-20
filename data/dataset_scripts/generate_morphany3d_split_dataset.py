@@ -6,16 +6,17 @@ Guarantees
 1. Split by source object before pair generation.
    Train/val/test pairs are built only inside their own asset split.
 2. No object leakage between train, val and test.
-3. For every pair, by default, generate N random on-grid alpha values.
-4. For every object, generate at most K pairings inside the same split.
-5. Alpha symmetry is respected:
+3. For every planned pair, generate a 5-step MorphAny3D sequence.
+4. Keep exactly 3 deterministic-random targets from those 5 steps.
+5. For every object, generate at most K pairings inside the same split.
+6. Alpha symmetry is respected:
 
        target = alpha * src_1 + (1 - alpha) * src_2
 
    where src_1/src_2 are canonical sorted asset names in metadata.
-6. MorphAny3D's discrete morphing grid is respected.
-7. Per pair, generation direction is optimized to minimize sequential TFSA steps.
-8. Only useful files are saved:
+7. Alpha is the real MorphAny3D blending parameter passed to MCA/noise interpolation.
+8. MCA and TFSA are both enabled by default for plausible intermediate targets.
+9. Only useful files are saved:
 
        assets/<asset>/slat_feats.pt
        assets/<asset>/slat_coords.pt
@@ -36,6 +37,8 @@ Guarantees
        split_assets.json
        splits.json
        pair_alphas.json
+       pair_sequence_alphas.json
+       pair_selected_indices.json
 """
 
 from __future__ import annotations
@@ -68,6 +71,9 @@ from PIL import Image
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 SPLIT_ORDER = ("train", "val", "test")
+MORPH_SEQUENCE_STEPS = 5
+TARGETS_PER_PAIR = 3
+DEFAULT_ALPHA_JITTER = 0.04
 
 
 def seed_everything(seed: int) -> None:
@@ -368,10 +374,14 @@ def build_pairs_with_cap(
     return sorted(pairs)
 
 
-def stable_pair_seed(seed: int, split: str, a_name: str, b_name: str) -> int:
-    text = f"{seed}|{split}|{a_name}|{b_name}".encode("utf-8")
+def stable_seed_from_parts(*parts: object) -> int:
+    text = "|".join(str(part) for part in parts).encode("utf-8")
     digest = hashlib.sha256(text).digest()
     return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def stable_pair_seed(seed: int, split: str, a_name: str, b_name: str) -> int:
+    return stable_seed_from_parts(seed, split, a_name, b_name)
 
 
 def random_grid_alphas_for_pair(
@@ -408,6 +418,79 @@ def random_grid_alphas_for_pair(
     return [v / denom for v in values]
 
 
+def jittered_sequence_alphas_for_pair(
+    seed: int,
+    split: str,
+    a_name: str,
+    b_name: str,
+    steps: int,
+    jitter: float,
+    alpha_min: float,
+    alpha_max: float,
+) -> List[float]:
+    """
+    Build a monotonic MorphAny3D sequence from src_1 to src_2.
+
+    The ideal 5-step sequence is evenly spaced at
+    5/6, 4/6, 3/6, 2/6, 1/6. Each point receives a small
+    deterministic jitter, so alpha remains the real blending parameter
+    but samples are not perfectly aligned across pairs.
+    """
+    if steps <= 0:
+        raise ValueError("sequence steps must be positive")
+    if jitter < 0:
+        raise ValueError("--alpha-jitter must be >= 0")
+    if not (0.0 <= alpha_min < alpha_max <= 1.0):
+        raise ValueError("Require 0 <= --alpha-min < --alpha-max <= 1")
+
+    gap = 1.0 / float(steps + 1)
+    max_jitter = gap * 0.45
+    if jitter > max_jitter:
+        raise ValueError(
+            f"--alpha-jitter={jitter} is too large for {steps} sequence steps; "
+            f"use <= {max_jitter:.6f} to preserve source-to-target order."
+        )
+
+    rng = random.Random(stable_seed_from_parts(seed, split, a_name, b_name, "sequence"))
+    values: List[float] = []
+
+    for idx in range(1, steps + 1):
+        base = 1.0 - idx * gap
+        lo = max(alpha_min, base - jitter)
+        hi = min(alpha_max, base + jitter)
+
+        if lo > hi:
+            raise ValueError(
+                f"alpha range [{alpha_min}, {alpha_max}] excludes sequence point "
+                f"{base:.6f} for pair {a_name}+{b_name}"
+            )
+
+        alpha = rng.uniform(lo, hi) if jitter > 0 else base
+        values.append(float(alpha))
+
+    for left, right in zip(values, values[1:]):
+        if left <= right:
+            raise RuntimeError(
+                f"Internal alpha sequence error for {a_name}+{b_name}: {values}"
+            )
+
+    return values
+
+
+def selected_sequence_indices_for_pair(
+    seed: int,
+    split: str,
+    a_name: str,
+    b_name: str,
+    steps: int,
+    count: int,
+) -> List[int]:
+    if count > steps:
+        raise ValueError(f"Cannot keep {count} targets from a {steps}-step sequence")
+    rng = random.Random(stable_seed_from_parts(seed, split, a_name, b_name, "keep"))
+    return sorted(rng.sample(range(1, steps + 1), count))
+
+
 def alpha_grid_indices(
     denom: int,
     alpha_min: float,
@@ -424,12 +507,72 @@ def alpha_grid_indices(
     return list(range(lo, hi + 1))
 
 
+def split_counts_from_total(
+    total_count: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    unit: int,
+) -> Dict[str, int]:
+    if total_count < 0:
+        raise ValueError("--target-total-samples must be >= 0")
+    if total_count % unit != 0:
+        raise ValueError(
+            f"--target-total-samples must be divisible by {unit}, because "
+            f"the dataset keeps exactly {unit} targets per pair."
+        )
+
+    ratios = {
+        "train": float(train_ratio),
+        "val": float(val_ratio),
+        "test": float(test_ratio),
+    }
+    if any(v < 0 for v in ratios.values()):
+        raise ValueError(f"Split ratios must be non-negative: {ratios}")
+
+    ratio_total = sum(ratios.values())
+    if ratio_total <= 0:
+        raise ValueError("At least one split ratio must be > 0")
+
+    total_units = total_count // unit
+    exact = {k: ratios[k] / ratio_total * total_units for k in SPLIT_ORDER}
+    units = {k: int(math.floor(exact[k])) for k in SPLIT_ORDER}
+
+    remainder = total_units - sum(units.values())
+    order = sorted(
+        SPLIT_ORDER,
+        key=lambda k: (exact[k] - units[k], ratios[k]),
+        reverse=True,
+    )
+    for key in order[:remainder]:
+        units[key] += 1
+
+    return {k: units[k] * unit for k in SPLIT_ORDER}
+
+
 def target_sample_counts_from_args(args) -> Dict[str, Optional[int]]:
-    return {
+    explicit = {
         "train": args.target_train_samples,
         "val": args.target_val_samples,
         "test": args.target_test_samples,
     }
+
+    if args.target_total_samples is None:
+        return explicit
+
+    if any(value is not None for value in explicit.values()):
+        raise ValueError(
+            "--target-total-samples cannot be combined with "
+            "--target-train-samples/--target-val-samples/--target-test-samples"
+        )
+
+    return split_counts_from_total(
+        total_count=args.target_total_samples,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        unit=TARGETS_PER_PAIR,
+    )
 
 
 def has_exact_sample_targets(target_counts: Dict[str, Optional[int]]) -> bool:
@@ -440,39 +583,35 @@ def choose_pairs_for_exact_sample_count(
     split: str,
     pairs: Sequence[Tuple[str, str]],
     target_count: int,
-    alpha_capacity: int,
+    samples_per_pair: int,
     seed: int,
 ) -> List[Tuple[Tuple[str, str], int]]:
     if target_count < 0:
         raise ValueError(f"target sample count for {split} must be >= 0")
     if target_count == 0:
         return []
-    if alpha_capacity <= 0:
-        raise ValueError(f"No alpha values are available for exact planning in split {split}")
+    if samples_per_pair <= 0:
+        raise ValueError("samples_per_pair must be > 0")
+    if target_count % samples_per_pair != 0:
+        raise ValueError(
+            f"target sample count for {split} must be divisible by {samples_per_pair}, "
+            f"because the generator keeps exactly {samples_per_pair} targets per pair."
+        )
 
-    total_capacity = len(pairs) * alpha_capacity
+    pairs_needed = target_count // samples_per_pair
+    total_capacity = len(pairs) * samples_per_pair
     if total_capacity < target_count:
         raise ValueError(
             f"Split {split} cannot produce {target_count} samples with the current assets/pair cap: "
-            f"{len(pairs)} pairs * {alpha_capacity} alpha(s) = {total_capacity}. "
-            "Increase --pairs-per-asset, widen the alpha range, or add more assets."
+            f"{len(pairs)} pairs * {samples_per_pair} target(s) = {total_capacity}. "
+            "Increase --pairs-per-asset or add more assets."
         )
 
     shuffled = list(pairs)
     rng = random.Random(seed)
     rng.shuffle(shuffled)
 
-    selected: List[Tuple[Tuple[str, str], int]] = []
-    remaining = target_count
-
-    for pair in shuffled:
-        if remaining <= 0:
-            break
-        count = min(alpha_capacity, remaining)
-        selected.append((pair, count))
-        remaining -= count
-
-    return selected
+    return [(pair, samples_per_pair) for pair in shuffled[:pairs_needed]]
 
 
 @torch.no_grad()
@@ -542,12 +681,15 @@ class PairRequest:
     split: str
     src1_name: str
     src2_name: str
+    sequence_idx: int
     requested_alpha_src1: float
+    requested_sequence_alphas_src1: Tuple[float, ...]
     canon_a: str
     canon_b: str
     canon_a_path: Path
     canon_b_path: Path
     requested_alpha_a: float
+    sequence_alphas_a: Tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -557,6 +699,7 @@ class PlannedTarget:
     morphing_idx: int
     alpha_dir: float
     effective_alpha_a: float
+    sequence_alphas_dir: Tuple[float, ...]
 
     @property
     def split(self) -> str:
@@ -575,7 +718,9 @@ def canonicalize_request(
     split: str,
     a_name: str,
     b_name: str,
+    sequence_idx: int,
     alpha_a_input: float,
+    sequence_alphas_input: Sequence[float],
     name_to_path: Dict[str, Path],
 ) -> PairRequest:
     if not (0.0 <= alpha_a_input <= 1.0):
@@ -587,20 +732,25 @@ def canonicalize_request(
     if a_name <= b_name:
         canon_a, canon_b = a_name, b_name
         alpha_a = float(alpha_a_input)
+        sequence_alphas_a = tuple(float(alpha) for alpha in sequence_alphas_input)
     else:
         canon_a, canon_b = b_name, a_name
         alpha_a = 1.0 - float(alpha_a_input)
+        sequence_alphas_a = tuple(1.0 - float(alpha) for alpha in sequence_alphas_input)
 
     return PairRequest(
         split=split,
         src1_name=a_name,
         src2_name=b_name,
+        sequence_idx=int(sequence_idx),
         requested_alpha_src1=float(alpha_a_input),
+        requested_sequence_alphas_src1=tuple(float(alpha) for alpha in sequence_alphas_input),
         canon_a=canon_a,
         canon_b=canon_b,
         canon_a_path=name_to_path[canon_a],
         canon_b_path=name_to_path[canon_b],
         requested_alpha_a=float(alpha_a),
+        sequence_alphas_a=sequence_alphas_a,
     )
 
 
@@ -707,6 +857,7 @@ def optimize_direction_plan_for_pair(
                         f_idx,
                         f_eff_dir_alpha,
                         f_eff_a,
+                        req.sequence_alphas_a,
                     )
                 )
             elif can_r:
@@ -717,6 +868,7 @@ def optimize_direction_plan_for_pair(
                         r_idx,
                         r_eff_dir_alpha,
                         r_eff_a,
+                        tuple(1.0 - alpha for alpha in req.sequence_alphas_a),
                     )
                 )
             else:
@@ -724,9 +876,9 @@ def optimize_direction_plan_for_pair(
 
     for req, f_idx, f_eff_dir_alpha, f_eff_a, r_idx, r_eff_dir_alpha, r_eff_a in endpoints:
         if req.requested_alpha_a >= 0.5:
-            planned.append(PlannedTarget(req, "endpoint_a", 0, 1.0, 1.0))
+            planned.append(PlannedTarget(req, "endpoint_a", 0, 1.0, 1.0, req.sequence_alphas_a))
         else:
-            planned.append(PlannedTarget(req, "endpoint_b", 0, 1.0, 0.0))
+            planned.append(PlannedTarget(req, "endpoint_b", 0, 1.0, 0.0, req.sequence_alphas_a))
 
     planned.sort(
         key=lambda x: (
@@ -747,27 +899,18 @@ def plan_all_targets(
     snap: bool,
     tol: float,
 ) -> List[PlannedTarget]:
-    grouped: Dict[Tuple[str, str, str], List[PairRequest]] = {}
-
-    for req in requests:
-        grouped.setdefault((req.split, req.canon_a, req.canon_b), []).append(req)
-
-    planned: List[PlannedTarget] = []
-
-    for key in sorted(grouped):
-        dedup: Dict[str, PairRequest] = {}
-        for req in grouped[key]:
-            dedup[f"{req.requested_alpha_a:.10f}"] = req
-
-        planned.extend(
-            optimize_direction_plan_for_pair(
-                list(dedup.values()),
-                morphing_num,
-                snap,
-                tol,
-            )
+    del morphing_num, snap, tol
+    planned = [
+        PlannedTarget(
+            request=req,
+            direction="forward",
+            morphing_idx=req.sequence_idx,
+            alpha_dir=req.requested_alpha_a,
+            effective_alpha_a=req.requested_alpha_a,
+            sequence_alphas_dir=req.sequence_alphas_a,
         )
-
+        for req in requests
+    ]
     return planned
 
 
@@ -795,6 +938,7 @@ def run_one_morphany3d_step(
     work_cache: Path,
     seed: int,
     morphing_idx: int,
+    morphing_num: int,
     alpha_dir: float,
     tfsa_alpha: float,
     sparse_sampler_params: dict,
@@ -821,6 +965,7 @@ def run_one_morphany3d_step(
         "tar_cond": tar_cond["cond"],
         "alpha": float(alpha_dir),
         "morphing_idx": int(morphing_idx),
+        "morphing_num": int(morphing_num),
         "tfsa_cache_idx": int(morphing_idx - 1),
         "tfsa_alpha": float(tfsa_alpha),
     }
@@ -854,6 +999,9 @@ def build_metadata_entry(planned: PlannedTarget) -> dict:
         "alpha": float(planned.effective_alpha_a),
         "alpha_requested": float(req.requested_alpha_a),
         "alpha_definition": "alpha is the fraction of src_1; target = alpha*src_1 + (1-alpha)*src_2",
+        "alpha_sequence_index": int(planned.morphing_idx),
+        "sequence_intermediates": MORPH_SEQUENCE_STEPS,
+        "sequence_alphas": [float(alpha) for alpha in req.sequence_alphas_a],
         "src1_dir": f"assets/{req.canon_a}",
         "src2_dir": f"assets/{req.canon_b}",
         "target_dir": target_rel,
@@ -1037,52 +1185,73 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=None,
         help="If set, plan exactly this many generated samples for the test split.",
     )
+    parser.add_argument(
+        "--target-total-samples",
+        type=int,
+        default=None,
+        help=(
+            "If set, split this total target count across train/val/test ratios. "
+            "Must be divisible by 3 because each pair contributes exactly 3 targets."
+        ),
+    )
 
     parser.add_argument(
         "--alphas",
         nargs="+",
         type=float,
         default=None,
-        help="Optional fixed/debug alphas. If omitted, random on-grid alphas are sampled per pair.",
+        help=(
+            "Deprecated. Alpha is now generated as a jittered 5-step MorphAny3D "
+            "sequence and 3 steps are kept per pair."
+        ),
     )
 
     parser.add_argument(
         "--random-alphas-per-pair",
         type=int,
         default=3,
-        help="Number of random, distinct, on-grid non-endpoint alphas per pair when --alphas is omitted.",
+        help="Deprecated compatibility flag; must remain 3.",
     )
 
     parser.add_argument(
         "--alpha-min",
         type=float,
         default=0.01,
-        help="Minimum random alpha for src_1, inclusive on the discrete grid.",
+        help="Minimum allowed jittered alpha for src_1.",
     )
 
     parser.add_argument(
         "--alpha-max",
         type=float,
         default=0.99,
-        help="Maximum random alpha for src_1, inclusive on the discrete grid.",
+        help="Maximum allowed jittered alpha for src_1.",
     )
 
     parser.add_argument(
         "--alpha-denom",
         type=int,
         default=100,
-        help="Grid denominator; 100 gives alpha step 0.01 and morphing_num=101.",
+        help="Deprecated compatibility flag; alpha is no longer snapped to a grid.",
     )
 
     parser.add_argument(
         "--morphing-num",
         type=int,
         default=None,
-        help="Overrides --alpha-denom by setting MorphAny3D grid size directly.",
+        help="Deprecated compatibility flag; with 5 intermediates the value must be 7.",
     )
 
     parser.add_argument("--snap-alpha", type=int, choices=[0, 1], default=0)
     parser.add_argument("--alpha-tol", type=float, default=1e-7)
+    parser.add_argument(
+        "--alpha-jitter",
+        type=float,
+        default=DEFAULT_ALPHA_JITTER,
+        help=(
+            "Per-pair jitter around the ideal 5-step alpha sequence "
+            "(5/6, 4/6, 3/6, 2/6, 1/6)."
+        ),
+    )
     parser.add_argument("--tfsa-alpha", type=float, default=0.8)
     parser.add_argument("--disable-tfsa", type=int, choices=[0, 1], default=0)
 
@@ -1140,7 +1309,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.alpha_denom <= 0:
         raise ValueError("--alpha-denom must be > 0")
 
-    morphing_num = int(args.morphing_num or (args.alpha_denom + 1))
+    if args.alphas is not None:
+        raise ValueError(
+            "--alphas is no longer supported for dataset generation. "
+            "Alpha targets now come from a 5-step jittered MorphAny3D sequence."
+        )
+
+    if args.random_alphas_per_pair != TARGETS_PER_PAIR:
+        raise ValueError(
+            f"--random-alphas-per-pair is fixed at {TARGETS_PER_PAIR}; "
+            "the dataset keeps exactly 3 targets per pair."
+        )
+
+    if args.snap_alpha != 0:
+        raise ValueError("--snap-alpha is deprecated; alpha is now a real jittered blend value.")
+
+    morphing_num = MORPH_SEQUENCE_STEPS + 2
+    if args.morphing_num is not None and int(args.morphing_num) != morphing_num:
+        raise ValueError(
+            f"--morphing-num must be {morphing_num}, because the generator "
+            f"creates exactly {MORPH_SEQUENCE_STEPS} intermediate steps."
+        )
 
     if morphing_num < 3:
         raise ValueError("morphing_num must be >= 3")
@@ -1161,6 +1350,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     split_pairs: Dict[str, List[Tuple[str, str]]] = {}
     pair_alphas: Dict[str, Dict[str, List[float]]] = {split: {} for split in SPLIT_ORDER}
+    pair_sequence_alphas: Dict[str, Dict[str, List[float]]] = {split: {} for split in SPLIT_ORDER}
+    pair_selected_indices: Dict[str, Dict[str, List[int]]] = {split: {} for split in SPLIT_ORDER}
     requests: List[PairRequest] = []
 
     split_pair_seeds = {
@@ -1170,19 +1361,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     exact_target_counts = target_sample_counts_from_args(args)
     exact_mode = has_exact_sample_targets(exact_target_counts)
-
-    if exact_mode and args.alphas is not None:
-        fixed_alphas = list(dict.fromkeys(float(alpha) for alpha in args.alphas))
-        if len(fixed_alphas) != len(args.alphas):
-            raise ValueError("--alphas contains duplicate values; exact sample planning needs unique targets.")
-    else:
-        fixed_alphas = None
-
-    alpha_capacity = (
-        len(fixed_alphas)
-        if fixed_alphas is not None
-        else len(alpha_grid_indices(args.alpha_denom, args.alpha_min, args.alpha_max))
-    )
 
     for split in SPLIT_ORDER:
         pairs = build_pairs_with_cap(
@@ -1197,39 +1375,49 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 split=split,
                 pairs=pairs,
                 target_count=target_count,
-                alpha_capacity=alpha_capacity,
+                samples_per_pair=TARGETS_PER_PAIR,
                 seed=split_pair_seeds[split] + 1009,
             )
         else:
-            default_alpha_count = len(fixed_alphas) if fixed_alphas is not None else args.random_alphas_per_pair
-            pair_counts = [(pair, default_alpha_count) for pair in pairs]
+            pair_counts = [(pair, TARGETS_PER_PAIR) for pair in pairs]
 
         split_pairs[split] = [pair for pair, _count in pair_counts]
 
         for (a_name, b_name), alpha_count in pair_counts:
-            if fixed_alphas is not None:
-                alphas_for_pair = fixed_alphas[:alpha_count]
-            else:
-                alphas_for_pair = random_grid_alphas_for_pair(
-                    seed=args.seed,
-                    split=split,
-                    a_name=a_name,
-                    b_name=b_name,
-                    count=alpha_count,
-                    denom=args.alpha_denom,
-                    alpha_min=args.alpha_min,
-                    alpha_max=args.alpha_max,
-                )
+            sequence_alphas = jittered_sequence_alphas_for_pair(
+                seed=args.seed,
+                split=split,
+                a_name=a_name,
+                b_name=b_name,
+                steps=MORPH_SEQUENCE_STEPS,
+                jitter=args.alpha_jitter,
+                alpha_min=args.alpha_min,
+                alpha_max=args.alpha_max,
+            )
+            selected_indices = selected_sequence_indices_for_pair(
+                seed=args.seed,
+                split=split,
+                a_name=a_name,
+                b_name=b_name,
+                steps=MORPH_SEQUENCE_STEPS,
+                count=alpha_count,
+            )
+            alphas_for_pair = [sequence_alphas[idx - 1] for idx in selected_indices]
 
-            pair_alphas[split][f"{a_name}+{b_name}"] = alphas_for_pair
+            pair_key = f"{a_name}+{b_name}"
+            pair_sequence_alphas[split][pair_key] = sequence_alphas
+            pair_selected_indices[split][pair_key] = selected_indices
+            pair_alphas[split][pair_key] = alphas_for_pair
 
-            for alpha in alphas_for_pair:
+            for sequence_idx, alpha in zip(selected_indices, alphas_for_pair):
                 requests.append(
                     canonicalize_request(
                         split,
                         a_name,
                         b_name,
+                        int(sequence_idx),
                         float(alpha),
+                        sequence_alphas,
                         name_to_path,
                     )
                 )
@@ -1250,7 +1438,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if requested is not None and planned_counts[split] != requested:
                 raise RuntimeError(
                     f"Exact planning mismatch for {split}: requested {requested}, "
-                    f"planned {planned_counts[split]}. Check duplicate alphas or alpha snapping."
+                    f"planned {planned_counts[split]}. Check target counts and pair planning."
                 )
 
     if args.num_batches > 1:
@@ -1279,16 +1467,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"output_dir: {args.output_dir}")
     print(f"assets total: {len(name_to_path)}")
     print(f"morphing_num: {morphing_num}")
-    print(f"grid_step: {1.0 / (morphing_num - 1):.8f}")
-
-    if args.alphas is not None:
-        print(f"fixed/debug alphas requested: {args.alphas}")
-    else:
-        if exact_mode:
-            print("random alphas: exact per-split sample planning")
-        else:
-            print(f"random alphas per pair: {args.random_alphas_per_pair}")
-        print(f"alpha_range: [{args.alpha_min}, {args.alpha_max}]")
+    print(f"sequence_intermediates: {MORPH_SEQUENCE_STEPS}")
+    print(f"targets_per_pair: {TARGETS_PER_PAIR}")
+    print(f"alpha_jitter: {args.alpha_jitter}")
+    print(f"alpha_range: [{args.alpha_min}, {args.alpha_max}]")
 
     if exact_mode:
         print(f"target sample counts: {exact_target_counts}")
@@ -1299,7 +1481,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"split {split:5s}: "
             f"assets={len(splits[split])} "
             f"pairs={len(split_pairs[split])} "
-            f"samples={planned_samples}"
+            f"samples={planned_samples} "
+            f"sequence_steps_generated={len(split_pairs[split]) * MORPH_SEQUENCE_STEPS}"
         )
 
     if args.print_plan_details == 1:
@@ -1322,26 +1505,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "val_ratio": args.val_ratio,
         "test_ratio": args.test_ratio,
         "pairs_per_asset": args.pairs_per_asset,
-        "alphas": [float(x) for x in args.alphas] if args.alphas is not None else None,
-        "random_alphas_per_pair": args.random_alphas_per_pair,
+        "target_total_samples": args.target_total_samples,
+        "alphas": None,
+        "targets_per_pair": TARGETS_PER_PAIR,
+        "sequence_intermediates": MORPH_SEQUENCE_STEPS,
+        "alpha_jitter": args.alpha_jitter,
         "alpha_min": args.alpha_min,
         "alpha_max": args.alpha_max,
-        "alpha_generation": (
-            "fixed"
-            if args.alphas is not None
-            else "exact_random_per_split"
-            if exact_mode
-            else "random_per_pair"
-        ),
+        "alpha_generation": "jittered_5_step_sequence_keep_3",
         "target_sample_counts": exact_target_counts,
-        "alpha_denom": args.alpha_denom,
+        "alpha_denom": None,
         "morphing_num": morphing_num,
-        "snap_alpha": bool(args.snap_alpha),
+        "snap_alpha": False,
         "tfsa_alpha": args.tfsa_alpha,
         "tfsa_enabled": args.disable_tfsa == 0,
+        "mca_enabled": True,
     }
 
     atomic_json_save(pair_alphas, args.output_dir / "pair_alphas.json")
+    atomic_json_save(pair_sequence_alphas, args.output_dir / "pair_sequence_alphas.json")
+    atomic_json_save(pair_selected_indices, args.output_dir / "pair_selected_indices.json")
 
     if args.dry_run:
         dry_payload = {
@@ -1353,6 +1536,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 for k in SPLIT_ORDER
             },
             "pair_alphas": pair_alphas,
+            "pair_sequence_alphas": pair_sequence_alphas,
+            "pair_selected_indices": pair_selected_indices,
             "config": config,
         }
 
@@ -1449,15 +1634,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         for p in missing_items:
             items_by_idx.setdefault(p.morphing_idx, []).append(p)
 
-        max_idx = max(items_by_idx)
+        sequence_alphas_dir = tuple(float(alpha) for alpha in items[0].sequence_alphas_dir)
+        if len(sequence_alphas_dir) != MORPH_SEQUENCE_STEPS:
+            raise RuntimeError(
+                f"Expected {MORPH_SEQUENCE_STEPS} sequence alphas for {split}/{pair_name}, "
+                f"got {len(sequence_alphas_dir)}"
+            )
+
+        max_idx = MORPH_SEQUENCE_STEPS
 
         print(
             f"[pair] {split} {pair_name} {direction}: "
-            f"running idx 1..{max_idx}, saving {len(missing_items)} target(s)"
+            f"running full sequence idx 1..{max_idx}, saving {len(missing_items)} target(s)"
         )
 
         for idx in range(1, max_idx + 1):
-            alpha_dir = 1.0 - idx / (morphing_num - 1)
+            alpha_dir = sequence_alphas_dir[idx - 1]
 
             ss_latent, slat = run_one_morphany3d_step(
                 pipeline,
@@ -1466,6 +1658,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 work_cache=work_cache,
                 seed=args.seed,
                 morphing_idx=idx,
+                morphing_num=morphing_num,
                 alpha_dir=alpha_dir,
                 tfsa_alpha=args.tfsa_alpha,
                 sparse_sampler_params=sparse_sampler_params,
@@ -1495,9 +1688,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             "direction_alpha": alpha_dir,
                             "canonical_alpha_src_1": target.effective_alpha_a,
                             "requested_alpha_src_1": target.request.requested_alpha_a,
+                            "alpha_sequence_index": target.morphing_idx,
+                            "sequence_intermediates": MORPH_SEQUENCE_STEPS,
+                            "sequence_alphas_src_1": [
+                                float(alpha) for alpha in target.request.sequence_alphas_a
+                            ],
                             "seed": args.seed,
                             "tfsa_alpha": args.tfsa_alpha,
                             "tfsa_enabled": args.disable_tfsa == 0,
+                            "mca_enabled": True,
                         },
                     )
 

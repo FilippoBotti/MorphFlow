@@ -181,22 +181,23 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 nn.Linear(channels, 6 * channels, bias=True)
             )
 
-    def _endpoint_preserving_gate(self, alpha_base, gate_delta):
+    def _endpoint_preserving_gate(self, alpha_src1, gate_delta):
         """
-        alpha_base:
+        alpha_src1:
         [B, 1, 1] oppure [B, N, 1]
 
         gate_delta:
         [B, 1, C] oppure [B, N, C]
 
         Output:
-        gate = alpha + alpha * (1-alpha) * tanh(delta)
+        h = (1-gate) * src_1 + gate * src_2
 
         Garantisce:
-        alpha=0 -> gate=0
-        alpha=1 -> gate=1
+        alpha=1 -> gate=0 -> src_1
+        alpha=0 -> gate=1 -> src_2
         """
-        return alpha_base + alpha_base * (1.0 - alpha_base) * torch.tanh(gate_delta)
+        alpha_src2 = 1.0 - alpha_src1
+        return alpha_src2 + alpha_src1 * alpha_src2 * torch.tanh(gate_delta)
 
     def _forward(self, x: torch.Tensor, mod: torch.Tensor, context):
         if self.share_mod:
@@ -282,4 +283,3 @@ class ModulatedTransformerCrossBlock(nn.Module):
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, use_reentrant=False)
         else:
             return self._forward(x, mod, context)
-        
