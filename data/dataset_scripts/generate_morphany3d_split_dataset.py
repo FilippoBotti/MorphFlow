@@ -1297,6 +1297,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "Use node-local storage for speed."
         ),
     )
+    parser.add_argument(
+        "--tfsa-cache-mode",
+        choices=["file", "memory"],
+        default="file",
+        help=(
+            "Where MorphAny3D stores TFSA attention caches. 'file' uses the local "
+            "work cache and is safer for multi-process jobs; 'memory' avoids "
+            "torch.load/save but can use a lot of RAM."
+        ),
+    )
 
     parser.add_argument(
         "--dry-run",
@@ -1554,6 +1564,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "snap_alpha": False,
         "tfsa_alpha": args.tfsa_alpha,
         "tfsa_enabled": args.disable_tfsa == 0,
+        "tfsa_cache_mode": args.tfsa_cache_mode,
         "mca_enabled": True,
         "work_cache_dir": str(cache_base),
     }
@@ -1684,7 +1695,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"running full sequence idx 1..{max_idx}, saving {len(missing_items)} target(s)"
         )
 
-        tfsa_cache = {} if args.disable_tfsa == 0 else None
+        tfsa_cache = {} if args.disable_tfsa == 0 and args.tfsa_cache_mode == "memory" else None
 
         for idx in range(1, max_idx + 1):
             alpha_dir = sequence_alphas_dir[idx - 1]
@@ -1735,6 +1746,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             "seed": args.seed,
                             "tfsa_alpha": args.tfsa_alpha,
                             "tfsa_enabled": args.disable_tfsa == 0,
+                            "tfsa_cache_mode": args.tfsa_cache_mode,
                             "mca_enabled": True,
                         },
                         occupancy=voxels,
