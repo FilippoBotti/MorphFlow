@@ -171,6 +171,15 @@ def structured_payload(slat) -> Dict[str, torch.Tensor]:
     }
 
 
+def normalize_occupancy_tensor(occ: torch.Tensor) -> torch.Tensor:
+    occ = occ.detach().cpu()
+    if occ.ndim == 5 and occ.shape[0] == 1 and occ.shape[1] == 1:
+        return occ[0, 0].contiguous()
+    if occ.ndim == 5 and occ.shape[0] == 1:
+        return occ[0].contiguous()
+    return occ.contiguous()
+
+
 def occupancy_from_ss_decoder(pipeline, ss_latent: torch.Tensor) -> torch.Tensor:
     decoder = pipeline.models["sparse_structure_decoder"]
     with torch.no_grad():
@@ -179,13 +188,7 @@ def occupancy_from_ss_decoder(pipeline, ss_latent: torch.Tensor) -> torch.Tensor
     if isinstance(logits, (tuple, list)):
         logits = logits[0]
 
-    occ = (logits > 0).detach().cpu()
-
-    if occ.ndim == 5 and occ.shape[0] == 1 and occ.shape[1] == 1:
-        return occ[0, 0].contiguous()
-    if occ.ndim == 5 and occ.shape[0] == 1:
-        return occ[0].contiguous()
-    return occ.contiguous()
+    return normalize_occupancy_tensor(logits > 0)
 
 
 def save_latent_triplet(
@@ -194,6 +197,7 @@ def save_latent_triplet(
     ss_latent: torch.Tensor,
     slat,
     extra_manifest: Optional[dict] = None,
+    occupancy: Optional[torch.Tensor] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -201,7 +205,11 @@ def save_latent_triplet(
     atomic_torch_save(slat.coords.detach().cpu().to(torch.int32), out_dir / "slat_coords.pt")
     atomic_torch_save(ss_latent.detach().cpu(), out_dir / "ss_latent.pt")
     atomic_torch_save(structured_payload(slat), out_dir / "structured_latent.pt")
-    atomic_torch_save(occupancy_from_ss_decoder(pipeline, ss_latent), out_dir / "occupancy.pt")
+    if occupancy is None:
+        occupancy = occupancy_from_ss_decoder(pipeline, ss_latent)
+    else:
+        occupancy = normalize_occupancy_tensor(occupancy)
+    atomic_torch_save(occupancy, out_dir / "occupancy.pt")
 
     if extra_manifest is not None:
         atomic_json_save(extra_manifest, out_dir / "manifest.json")
@@ -930,6 +938,15 @@ def cleanup_old_index(cache_dir: Path, old_idx: int) -> None:
             path.unlink(missing_ok=True)
 
 
+def cleanup_old_tfsa_cache(tfsa_cache: Optional[dict], old_idx: int) -> None:
+    if old_idx <= 0 or not tfsa_cache:
+        return
+
+    for key in list(tfsa_cache):
+        if isinstance(key, tuple) and len(key) >= 2 and key[1] == old_idx:
+            del tfsa_cache[key]
+
+
 @torch.no_grad()
 def run_one_morphany3d_step(
     pipeline,
@@ -947,6 +964,7 @@ def run_one_morphany3d_step(
     slat_mca_flag: bool = True,
     slat_tfsa_flag: bool = True,
     ss_tfsa_flag: bool = True,
+    tfsa_cache: Optional[dict] = None,
 ):
     src_cond = tree_to_device(src_cond, pipeline.device)
     tar_cond = tree_to_device(tar_cond, pipeline.device)
@@ -968,9 +986,10 @@ def run_one_morphany3d_step(
         "morphing_num": int(morphing_num),
         "tfsa_cache_idx": int(morphing_idx - 1),
         "tfsa_alpha": float(tfsa_alpha),
+        "tfsa_cache": tfsa_cache,
     }
 
-    coords, _voxels, ss_latent = pipeline.sample_sparse_structure_morphing(
+    coords, voxels, ss_latent = pipeline.sample_sparse_structure_morphing(
         src_cond,
         1,
         sparse_sampler_params,
@@ -984,7 +1003,7 @@ def run_one_morphany3d_step(
         morphing_params,
     )
 
-    return ss_latent, slat
+    return ss_latent, slat, voxels
 
 
 def build_metadata_entry(planned: PlannedTarget) -> dict:
@@ -1268,6 +1287,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=None,
         help='JSON, e.g. \'{"steps": 25}\'',
     )
+    parser.add_argument(
+        "--work-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for temporary MorphAny3D TFSA caches. Defaults to "
+            "MORPHANY3D_WORK_CACHE_DIR, then TMPDIR, then output_dir/.tmp_morphany3d_cache. "
+            "Use node-local storage for speed."
+        ),
+    )
 
     parser.add_argument(
         "--dry-run",
@@ -1459,7 +1488,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    work_root = args.output_dir / ".tmp_morphany3d_cache"
+    cache_base = args.work_cache_dir
+    if cache_base is None:
+        env_cache = os.environ.get("MORPHANY3D_WORK_CACHE_DIR") or os.environ.get("TMPDIR")
+        cache_base = Path(env_cache) if env_cache else args.output_dir / ".tmp_morphany3d_cache"
+
+    work_root = cache_base / f"morphflow_batch_{args.batch_index}_pid_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     work_root.mkdir(parents=True, exist_ok=True)
 
     print("=== MorphAny3D split-disjoint dataset ===")
@@ -1471,6 +1505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"targets_per_pair: {TARGETS_PER_PAIR}")
     print(f"alpha_jitter: {args.alpha_jitter}")
     print(f"alpha_range: [{args.alpha_min}, {args.alpha_max}]")
+    print(f"work_cache_root: {work_root}")
 
     if exact_mode:
         print(f"target sample counts: {exact_target_counts}")
@@ -1520,6 +1555,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "tfsa_alpha": args.tfsa_alpha,
         "tfsa_enabled": args.disable_tfsa == 0,
         "mca_enabled": True,
+        "work_cache_dir": str(cache_base),
     }
 
     atomic_json_save(pair_alphas, args.output_dir / "pair_alphas.json")
@@ -1648,10 +1684,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"running full sequence idx 1..{max_idx}, saving {len(missing_items)} target(s)"
         )
 
+        tfsa_cache = {} if args.disable_tfsa == 0 else None
+
         for idx in range(1, max_idx + 1):
             alpha_dir = sequence_alphas_dir[idx - 1]
 
-            ss_latent, slat = run_one_morphany3d_step(
+            ss_latent, slat, voxels = run_one_morphany3d_step(
                 pipeline,
                 src_cond=src_cond,
                 tar_cond=tar_cond,
@@ -1667,6 +1705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 slat_mca_flag=True,
                 ss_tfsa_flag=ss_tfsa_flag,
                 slat_tfsa_flag=slat_tfsa_flag,
+                tfsa_cache=tfsa_cache,
             )
 
             if idx in items_by_idx:
@@ -1698,6 +1737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             "tfsa_enabled": args.disable_tfsa == 0,
                             "mca_enabled": True,
                         },
+                        occupancy=voxels,
                     )
 
                     print(
@@ -1705,11 +1745,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         f"idx={idx} dir_alpha={alpha_dir:.6f}"
                     )
 
-            del ss_latent, slat
+            del ss_latent, slat, voxels
             cleanup_old_index(work_cache, idx - 1)
-            torch.cuda.empty_cache()
+            cleanup_old_tfsa_cache(tfsa_cache, idx - 1)
 
         shutil.rmtree(work_cache, ignore_errors=True)
+        torch.cuda.empty_cache()
 
     # In batch/array mode, each task writes metadata by scanning all planned targets.
     # The last successful task will leave complete metadata.json.
