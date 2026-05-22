@@ -939,12 +939,31 @@ def cleanup_old_index(cache_dir: Path, old_idx: int) -> None:
             path.unlink(missing_ok=True)
 
 
-def cleanup_old_tfsa_cache(tfsa_cache: Optional[dict], old_idx: int) -> None:
+def cached_object_nbytes(obj) -> int:
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(cached_object_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(cached_object_nbytes(v) for v in obj)
+    return 0
+
+
+def cleanup_old_tfsa_cache(
+    tfsa_cache: Optional[dict],
+    old_idx: int,
+    tfsa_cache_bytes: Optional[list] = None,
+) -> None:
     if old_idx <= 0 or not tfsa_cache:
         return
 
     for key in list(tfsa_cache):
         if isinstance(key, tuple) and len(key) >= 2 and key[1] == old_idx:
+            if tfsa_cache_bytes is not None:
+                tfsa_cache_bytes[0] = max(
+                    0,
+                    tfsa_cache_bytes[0] - cached_object_nbytes(tfsa_cache[key]),
+                )
             del tfsa_cache[key]
 
 
@@ -1319,7 +1338,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument(
         "--tfsa-cache-mode",
         choices=["file", "memory"],
-        default="file",
+        default="memory",
         help=(
             "Where MorphAny3D stores TFSA attention caches. 'file' uses the local "
             "work cache and is safer for multi-process jobs; 'memory' avoids "
@@ -1329,7 +1348,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument(
         "--max-work-cache-gb",
         type=float,
-        default=30.0,
+        default=50.0,
         help=(
             "Maximum temporary TFSA cache size per pair. If exceeded, the pair is "
             "skipped and its temporary cache is deleted. Use <=0 to disable."
@@ -1736,6 +1755,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tfsa_cache_bytes = (
             [directory_size_bytes(work_cache)]
             if max_tfsa_cache_bytes is not None and args.tfsa_cache_mode == "file"
+            else [0]
+            if max_tfsa_cache_bytes is not None and args.tfsa_cache_mode == "memory"
             else None
         )
         pair_cache_limit_hit = False
@@ -1806,7 +1827,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
                 del ss_latent, slat, voxels
                 cleanup_old_index(work_cache, idx - 1)
-                cleanup_old_tfsa_cache(tfsa_cache, idx - 1)
+                cleanup_old_tfsa_cache(tfsa_cache, idx - 1, tfsa_cache_bytes)
         except RuntimeError as exc:
             if CACHE_LIMIT_MARKER not in str(exc):
                 raise
