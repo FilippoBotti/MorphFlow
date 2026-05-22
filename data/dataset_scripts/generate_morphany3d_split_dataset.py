@@ -74,6 +74,7 @@ SPLIT_ORDER = ("train", "val", "test")
 MORPH_SEQUENCE_STEPS = 5
 TARGETS_PER_PAIR = 3
 DEFAULT_ALPHA_JITTER = 0.04
+CACHE_LIMIT_MARKER = "MORPHANY3D_CACHE_LIMIT_EXCEEDED"
 
 
 def seed_everything(seed: int) -> None:
@@ -947,6 +948,20 @@ def cleanup_old_tfsa_cache(tfsa_cache: Optional[dict], old_idx: int) -> None:
             del tfsa_cache[key]
 
 
+def directory_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
 @torch.no_grad()
 def run_one_morphany3d_step(
     pipeline,
@@ -965,6 +980,8 @@ def run_one_morphany3d_step(
     slat_tfsa_flag: bool = True,
     ss_tfsa_flag: bool = True,
     tfsa_cache: Optional[dict] = None,
+    max_tfsa_cache_bytes: Optional[int] = None,
+    tfsa_cache_bytes: Optional[list] = None,
 ):
     src_cond = tree_to_device(src_cond, pipeline.device)
     tar_cond = tree_to_device(tar_cond, pipeline.device)
@@ -987,6 +1004,8 @@ def run_one_morphany3d_step(
         "tfsa_cache_idx": int(morphing_idx - 1),
         "tfsa_alpha": float(tfsa_alpha),
         "tfsa_cache": tfsa_cache,
+        "max_tfsa_cache_bytes": max_tfsa_cache_bytes,
+        "tfsa_cache_bytes": tfsa_cache_bytes,
     }
 
     coords, voxels, ss_latent = pipeline.sample_sparse_structure_morphing(
@@ -1307,6 +1326,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "torch.load/save but can use a lot of RAM."
         ),
     )
+    parser.add_argument(
+        "--max-work-cache-gb",
+        type=float,
+        default=30.0,
+        help=(
+            "Maximum temporary TFSA cache size per pair. If exceeded, the pair is "
+            "skipped and its temporary cache is deleted. Use <=0 to disable."
+        ),
+    )
 
     parser.add_argument(
         "--dry-run",
@@ -1347,6 +1375,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if args.alpha_denom <= 0:
         raise ValueError("--alpha-denom must be > 0")
+
+    if args.max_work_cache_gb < 0:
+        raise ValueError("--max-work-cache-gb must be >= 0, or 0 to disable the limit")
 
     if args.alphas is not None:
         raise ValueError(
@@ -1565,6 +1596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "tfsa_alpha": args.tfsa_alpha,
         "tfsa_enabled": args.disable_tfsa == 0,
         "tfsa_cache_mode": args.tfsa_cache_mode,
+        "max_work_cache_gb": args.max_work_cache_gb,
         "mca_enabled": True,
         "work_cache_dir": str(cache_base),
     }
@@ -1696,73 +1728,99 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
 
         tfsa_cache = {} if args.disable_tfsa == 0 and args.tfsa_cache_mode == "memory" else None
+        max_tfsa_cache_bytes = (
+            int(args.max_work_cache_gb * (1024 ** 3))
+            if args.max_work_cache_gb > 0
+            else None
+        )
+        tfsa_cache_bytes = (
+            [directory_size_bytes(work_cache)]
+            if max_tfsa_cache_bytes is not None and args.tfsa_cache_mode == "file"
+            else None
+        )
+        pair_cache_limit_hit = False
 
-        for idx in range(1, max_idx + 1):
-            alpha_dir = sequence_alphas_dir[idx - 1]
+        try:
+            for idx in range(1, max_idx + 1):
+                alpha_dir = sequence_alphas_dir[idx - 1]
 
-            ss_latent, slat, voxels = run_one_morphany3d_step(
-                pipeline,
-                src_cond=src_cond,
-                tar_cond=tar_cond,
-                work_cache=work_cache,
-                seed=args.seed,
-                morphing_idx=idx,
-                morphing_num=morphing_num,
-                alpha_dir=alpha_dir,
-                tfsa_alpha=args.tfsa_alpha,
-                sparse_sampler_params=sparse_sampler_params,
-                slat_sampler_params=slat_sampler_params,
-                ss_mca_flag=True,
-                slat_mca_flag=True,
-                ss_tfsa_flag=ss_tfsa_flag,
-                slat_tfsa_flag=slat_tfsa_flag,
-                tfsa_cache=tfsa_cache,
+                ss_latent, slat, voxels = run_one_morphany3d_step(
+                    pipeline,
+                    src_cond=src_cond,
+                    tar_cond=tar_cond,
+                    work_cache=work_cache,
+                    seed=args.seed,
+                    morphing_idx=idx,
+                    morphing_num=morphing_num,
+                    alpha_dir=alpha_dir,
+                    tfsa_alpha=args.tfsa_alpha,
+                    sparse_sampler_params=sparse_sampler_params,
+                    slat_sampler_params=slat_sampler_params,
+                    ss_mca_flag=True,
+                    slat_mca_flag=True,
+                    ss_tfsa_flag=ss_tfsa_flag,
+                    slat_tfsa_flag=slat_tfsa_flag,
+                    tfsa_cache=tfsa_cache,
+                    max_tfsa_cache_bytes=max_tfsa_cache_bytes,
+                    tfsa_cache_bytes=tfsa_cache_bytes,
+                )
+
+                if idx in items_by_idx:
+                    for target in items_by_idx[idx]:
+                        out_dir = args.output_dir / "targets" / target.target_name
+
+                        save_latent_triplet(
+                            pipeline,
+                            out_dir,
+                            ss_latent,
+                            slat,
+                            extra_manifest={
+                                "kind": "morph_target",
+                                "split": split,
+                                "pair": target.pair_name,
+                                "direction": direction,
+                                "morphing_idx": idx,
+                                "morphing_num": morphing_num,
+                                "direction_alpha": alpha_dir,
+                                "canonical_alpha_src_1": target.effective_alpha_a,
+                                "requested_alpha_src_1": target.request.requested_alpha_a,
+                                "alpha_sequence_index": target.morphing_idx,
+                                "sequence_intermediates": MORPH_SEQUENCE_STEPS,
+                                "sequence_alphas_src_1": [
+                                    float(alpha) for alpha in target.request.sequence_alphas_a
+                                ],
+                                "seed": args.seed,
+                                "tfsa_alpha": args.tfsa_alpha,
+                                "tfsa_enabled": args.disable_tfsa == 0,
+                                "tfsa_cache_mode": args.tfsa_cache_mode,
+                                "max_work_cache_gb": args.max_work_cache_gb,
+                                "mca_enabled": True,
+                            },
+                            occupancy=voxels,
+                        )
+
+                        print(
+                            f"  saved {split}/{target.target_name} "
+                            f"idx={idx} dir_alpha={alpha_dir:.6f}"
+                        )
+
+                del ss_latent, slat, voxels
+                cleanup_old_index(work_cache, idx - 1)
+                cleanup_old_tfsa_cache(tfsa_cache, idx - 1)
+        except RuntimeError as exc:
+            if CACHE_LIMIT_MARKER not in str(exc):
+                raise
+            pair_cache_limit_hit = True
+            print(
+                f"[pair] {split} {pair_name} {direction}: skipped because "
+                f"temporary TFSA cache exceeded {args.max_work_cache_gb:g} GB; {exc}"
             )
+        finally:
+            shutil.rmtree(work_cache, ignore_errors=True)
+            torch.cuda.empty_cache()
 
-            if idx in items_by_idx:
-                for target in items_by_idx[idx]:
-                    out_dir = args.output_dir / "targets" / target.target_name
-
-                    save_latent_triplet(
-                        pipeline,
-                        out_dir,
-                        ss_latent,
-                        slat,
-                        extra_manifest={
-                            "kind": "morph_target",
-                            "split": split,
-                            "pair": target.pair_name,
-                            "direction": direction,
-                            "morphing_idx": idx,
-                            "morphing_num": morphing_num,
-                            "direction_alpha": alpha_dir,
-                            "canonical_alpha_src_1": target.effective_alpha_a,
-                            "requested_alpha_src_1": target.request.requested_alpha_a,
-                            "alpha_sequence_index": target.morphing_idx,
-                            "sequence_intermediates": MORPH_SEQUENCE_STEPS,
-                            "sequence_alphas_src_1": [
-                                float(alpha) for alpha in target.request.sequence_alphas_a
-                            ],
-                            "seed": args.seed,
-                            "tfsa_alpha": args.tfsa_alpha,
-                            "tfsa_enabled": args.disable_tfsa == 0,
-                            "tfsa_cache_mode": args.tfsa_cache_mode,
-                            "mca_enabled": True,
-                        },
-                        occupancy=voxels,
-                    )
-
-                    print(
-                        f"  saved {split}/{target.target_name} "
-                        f"idx={idx} dir_alpha={alpha_dir:.6f}"
-                    )
-
-            del ss_latent, slat, voxels
-            cleanup_old_index(work_cache, idx - 1)
-            cleanup_old_tfsa_cache(tfsa_cache, idx - 1)
-
-        shutil.rmtree(work_cache, ignore_errors=True)
-        torch.cuda.empty_cache()
+        if pair_cache_limit_hit:
+            continue
 
     # In batch/array mode, each task writes metadata by scanning all planned targets.
     # The last successful task will leave complete metadata.json.
