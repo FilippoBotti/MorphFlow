@@ -32,12 +32,12 @@ def parse_args():
     parser.add_argument(
         "--root_dir",
         type=str,
-        default="/home/filippo/datasets/3d/morphing_dataset_flux",
+        default=os.environ.get("ROOT_DIR", "/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v2"),
     )
     parser.add_argument(
         "--val_metadata",
         type=str,
-        default="metadata_val.json",
+        default=os.environ.get("VAL_METADATA", "metadata_val.json"),
     )
 
     parser.add_argument(
@@ -49,14 +49,14 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_root",
         type=str,
-        default="./outputs/morphflow",
+        default=os.environ.get("CHECKPOINTS_ROOT", "./outputs/morphflow"),
         help="Directory searched recursively for morphflow_epoch_*.pt when --checkpoint_path is omitted.",
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./outputs/eval_validation_latents",
+        default=os.environ.get("OUTPUT_DIR", "./outputs/eval_validation_latents"),
     )
     parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--steps", type=int, default=50)
@@ -67,7 +67,7 @@ def parse_args():
         choices=["auto", "text_base", "image_large"],
         default="auto",
     )
-    parser.add_argument("--use_ema", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
 
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument(

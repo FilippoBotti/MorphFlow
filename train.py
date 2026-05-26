@@ -14,16 +14,22 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
+from models.lora import add_lora_to_attention
 from models.morph_flow import MorphFlow
+from models.morph_slat_flow import MorphSLatFlow
 
 
 def build_parser():
     parser = argparse.ArgumentParser()
 
     # Dataset
-    parser.add_argument("--root_dir", type=str, default="/home/filippo/datasets/3d/morphing_dataset_flux")
-    parser.add_argument("--metadata", type=str, default="metadata_train.json")
-    parser.add_argument("--val_metadata", type=str, default="metadata_val.json")
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default=os.environ.get("ROOT_DIR", "/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v2"),
+    )
+    parser.add_argument("--metadata", type=str, default=os.environ.get("METADATA", "metadata_train.json"))
+    parser.add_argument("--val_metadata", type=str, default=os.environ.get("VAL_METADATA", "metadata_val.json"))
     parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1)
 
     # Output
@@ -57,6 +63,13 @@ def build_parser():
 
     # Model
     parser.add_argument("--trellis_model", type=str, choices=["text_base", "image_large"], default="text_base")
+    parser.add_argument(
+        "--flow_target",
+        type=str,
+        choices=["ss", "slat"],
+        default="ss",
+        help="Train the sparse-structure flow or the structured-latent flow.",
+    )
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0)
     parser.add_argument(
         "--separate_cond_gate",
@@ -104,8 +117,8 @@ def build_parser():
     parser.add_argument("--init_strict", type=int, choices=[0, 1], default=0)
     parser.add_argument("--resume_optimizer", type=int, choices=[0, 1], default=1)
 
-    # Accepted for backward compatibility with older SLURM scripts.
-    # This simplified train.py does not implement LoRA or EMA.
+    # LoRA fine-tuning freezes the TRELLIS flow and trains LoRA adapters plus
+    # MorphFlow conditioning modules. EMA remains accepted for script compatibility.
     parser.add_argument("--use_lora", type=int, choices=[0, 1], default=0)
     parser.add_argument("--lora_lr", type=float, default=None)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -221,7 +234,8 @@ def load_assets_from_metadata(metadata_path: str) -> set:
     return assets
 
 
-def build_model(args, accelerator: Accelerator) -> MorphFlow:
+def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
+    model_cls = MorphSLatFlow if args.flow_target == "slat" else MorphFlow
     requested_kwargs = {
         "model_type": args.trellis_model,
         "separate_cond": args.separate_cond == 1,
@@ -232,7 +246,7 @@ def build_model(args, accelerator: Accelerator) -> MorphFlow:
         "cond_resample_heads": args.cond_resample_heads,
     }
 
-    signature = inspect.signature(MorphFlow.__init__)
+    signature = inspect.signature(model_cls.__init__)
     supported = set(signature.parameters.keys())
 
     model_kwargs = {
@@ -243,13 +257,13 @@ def build_model(args, accelerator: Accelerator) -> MorphFlow:
 
     ignored = sorted(set(requested_kwargs.keys()) - set(model_kwargs.keys()))
     if ignored:
-        accelerator.print(f"MorphFlow does not support these constructor args; ignoring: {ignored}")
+        accelerator.print(f"{model_cls.__name__} does not support these constructor args; ignoring: {ignored}")
 
-    accelerator.print("MorphFlow constructor kwargs:")
+    accelerator.print(f"{model_cls.__name__} constructor kwargs:")
     for key, value in model_kwargs.items():
         accelerator.print(f"  {key}: {value}")
 
-    model = MorphFlow(**model_kwargs)
+    model = model_cls(**model_kwargs)
     model.cfg_drop_prob = args.cfg_drop_prob
     return model
 
@@ -271,6 +285,7 @@ def compute_loss(
     model,
     batch,
     device,
+    flow_target: str,
     supports_extra_losses: bool,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
@@ -282,8 +297,22 @@ def compute_loss(
     src2_feats = batch["src2_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
     src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
 
-    target_ss_latent = batch["target_ss_latent"].to(device=device, dtype=torch.float32, non_blocking=True)
     alpha = batch["alpha"].to(device=device, dtype=torch.float32, non_blocking=True)
+
+    if flow_target == "slat":
+        target_feats = batch["target_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
+        target_coords = batch["target_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
+        return model(
+            target_feats,
+            target_coords,
+            src1_feats,
+            src1_coords,
+            src2_feats,
+            src2_coords,
+            alpha,
+        )
+
+    target_ss_latent = batch["target_ss_latent"].to(device=device, dtype=torch.float32, non_blocking=True)
 
     if supports_extra_losses and use_extra_losses:
         kwargs = {
@@ -317,26 +346,76 @@ def compute_loss(
 
 def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
     if args.use_lora == 1:
-        raise ValueError(
-            "This simplified train.py removed LoRA training. "
-            "Set --use_lora 0 or restore the older LoRA code."
+        for p in model.parameters():
+            p.requires_grad = False
+
+        flow = get_flow_module(model)
+        if flow is None:
+            raise RuntimeError("Cannot enable LoRA: model has no TRELLIS flow module.")
+
+        lora_targets = tuple(
+            item.strip()
+            for item in args.lora_target_modules.split(",")
+            if item.strip()
         )
+        replaced = add_lora_to_attention(
+            flow,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=lora_targets,
+        )
+        model._lora_module_names = replaced
+        accelerator.print(f"LoRA enabled on {len(replaced)} attention projections.")
+        if not replaced:
+            accelerator.print("WARNING: no LoRA modules were inserted. Check --lora_target_modules.")
+    else:
+        # Full fine-tuning by default.
+        for p in model.parameters():
+            p.requires_grad = True
 
     if args.use_ema == 1:
         accelerator.print("WARNING: --use_ema is accepted for compatibility but ignored in this simplified train.py.")
-
-    # Full fine-tuning by default.
-    for p in model.parameters():
-        p.requires_grad = True
 
     # cond_fusion is unused when separate_cond=1.
     if args.separate_cond == 1 and hasattr(model, "cond_fusion"):
         for p in model.cond_fusion.parameters():
             p.requires_grad = False
+    elif hasattr(model, "cond_fusion"):
+        for p in model.cond_fusion.parameters():
+            p.requires_grad = True
+
+    for name in ["cond_encoder", "separate_cond_proj", "cond_resampler"]:
+        module = getattr(model, name, None)
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad = True
+
+    if args.use_lora == 1:
+        flow = get_flow_module(model)
+        if flow is not None:
+            alpha_embedder = getattr(flow, "alpha_embedder", None)
+            if alpha_embedder is not None:
+                for p in alpha_embedder.parameters():
+                    p.requires_grad = True
+            for block in getattr(flow, "blocks", []):
+                alpha_gate = getattr(block, "alpha_gate", None)
+                if alpha_gate is not None:
+                    for p in alpha_gate.parameters():
+                        p.requires_grad = True
 
     # null_cond is only useful when CFG dropout is enabled.
     if hasattr(model, "null_cond") and args.cfg_drop_prob <= 0.0:
         model.null_cond.requires_grad = False
+    elif hasattr(model, "null_cond"):
+        model.null_cond.requires_grad = True
+
+
+def get_flow_module(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    flow = getattr(model, "sparse_structure_flow", None)
+    if flow is not None:
+        return flow
+    return getattr(model, "slat_flow", None)
 
 
 def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, Any]], float, float]:
@@ -366,9 +445,28 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
         cond_params.append(model.null_cond)
         cond_param_ids.add(id(model.null_cond))
 
+    lora_param_ids = set()
+    lora_params = []
+    if args.use_lora == 1:
+        for name, p in model.named_parameters():
+            if p.requires_grad and (".lora_A." in name or ".lora_B." in name):
+                lora_params.append(p)
+                lora_param_ids.add(id(p))
+
+    flow_adapter_params = []
+    if args.use_lora == 1:
+        flow = get_flow_module(model)
+        if flow is not None:
+            for name, p in flow.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if id(p) in lora_param_ids:
+                    continue
+                flow_adapter_params.append(p)
+
     flow_params = []
-    flow = getattr(model, "sparse_structure_flow", None)
-    if flow is not None:
+    flow = get_flow_module(model)
+    if flow is not None and args.use_lora != 1:
         for p in flow.parameters():
             if p.requires_grad and id(p) not in cond_param_ids:
                 flow_params.append(p)
@@ -376,6 +474,11 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
     param_groups = []
     if cond_params:
         param_groups.append({"params": cond_params, "lr": cond_lr, "name": "condition"})
+    if lora_params:
+        lora_lr = args.lr if args.lora_lr is None else args.lora_lr
+        param_groups.append({"params": lora_params, "lr": lora_lr, "name": "lora"})
+    if flow_adapter_params:
+        param_groups.append({"params": flow_adapter_params, "lr": cond_lr, "name": "flow_adapter"})
     if flow_params:
         param_groups.append({"params": flow_params, "lr": flow_lr, "name": "flow"})
 
@@ -396,16 +499,28 @@ def load_trellis_pretrained_if_needed(model, args, accelerator: Accelerator):
 
     if args.trellis_model == "text_base":
         repo_id = "microsoft/TRELLIS-text-base"
-        filename = "ckpts/ss_flow_txt_dit_B_16l8_fp16.safetensors"
+        filename = (
+            "ckpts/slat_flow_txt_dit_B_64l8p2_fp16.safetensors"
+            if args.flow_target == "slat"
+            else "ckpts/ss_flow_txt_dit_B_16l8_fp16.safetensors"
+        )
     else:
         repo_id = "microsoft/TRELLIS-image-large"
-        filename = "ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors"
+        filename = (
+            "ckpts/slat_flow_img_dit_L_64l8p2_fp16.safetensors"
+            if args.flow_target == "slat"
+            else "ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors"
+        )
 
     accelerator.print(f"Loading TRELLIS pretrained weights from {repo_id}...")
     ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
     trellis_state_dict = load_file(ckpt_path)
 
-    missing, unexpected = model.sparse_structure_flow.load_state_dict(
+    flow = get_flow_module(model)
+    if flow is None:
+        raise RuntimeError("No flow module found for TRELLIS pretrained load.")
+
+    missing, unexpected = flow.load_state_dict(
         trellis_state_dict,
         strict=False,
     )
@@ -418,7 +533,7 @@ def load_trellis_pretrained_if_needed(model, args, accelerator: Accelerator):
         copied_cross = 0
         copied_norm = 0
 
-        for block in model.sparse_structure_flow.blocks:
+        for block in flow.blocks:
             if hasattr(block, "cross_attn2"):
                 block.cross_attn2.load_state_dict(block.cross_attn.state_dict())
                 copied_cross += 1
@@ -432,7 +547,7 @@ def load_trellis_pretrained_if_needed(model, args, accelerator: Accelerator):
             f"norm2 -> norm4 for {copied_norm} blocks."
         )
 
-    accelerator.print(f"TRELLIS weights loaded successfully: {args.trellis_model}")
+    accelerator.print(f"TRELLIS weights loaded successfully: {args.trellis_model}/{args.flow_target}")
 
 
 def save_checkpoint(
@@ -446,12 +561,17 @@ def save_checkpoint(
     global_step: int,
     train_loss: Optional[float],
     val_loss: Optional[float],
+    best_val_loss: Optional[float] = None,
+    best_epoch: Optional[int] = None,
     final: bool = False,
+    best: bool = False,
 ):
     if not accelerator.is_main_process:
         return
 
-    if final:
+    if best:
+        filename = "morphflow_best.pt"
+    elif final:
         filename = f"morphflow_final_epoch_{epoch:04d}_step_{global_step:07d}.pt"
     else:
         filename = f"morphflow_epoch_{epoch:04d}_step_{global_step:07d}.pt"
@@ -465,10 +585,13 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "model_type": args.trellis_model,
+        "flow_target": args.flow_target,
         "sigma_min": accelerator.unwrap_model(model).sigma_min,
         "args": vars(args),
         "train_loss": train_loss,
         "val_loss": val_loss,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
     }
 
     accelerator.save(ckpt, ckpt_path)
@@ -563,9 +686,8 @@ def train(args):
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
 
     model = build_model(args, accelerator)
-    set_trainability(model, args, accelerator)
-
     load_trellis_pretrained_if_needed(model, args, accelerator)
+    set_trainability(model, args, accelerator)
 
     init_ckpt = None
     resume_ckpt = None
@@ -634,6 +756,8 @@ def train(args):
 
     start_epoch = 1
     global_step = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
 
     if resume_ckpt is not None:
         if args.resume_optimizer == 1:
@@ -654,6 +778,8 @@ def train(args):
 
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         global_step = int(resume_ckpt.get("step", 0))
+        best_val_loss = float(resume_ckpt.get("best_val_loss", float("inf")))
+        best_epoch = int(resume_ckpt.get("best_epoch", 0))
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.out_dir, run_name)
@@ -680,6 +806,7 @@ def train(args):
     accelerator.print(f"TF32 enabled: {args.allow_tf32 == 1 and torch.cuda.is_available()}")
     accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
+    accelerator.print(f"Flow target: {args.flow_target}")
     accelerator.print(f"Separate cond: {args.separate_cond == 1}")
     accelerator.print(f"Separate cond gate: {args.separate_cond_gate}")
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
@@ -698,6 +825,8 @@ def train(args):
         accelerator.print(f"Excluded validation assets from train: {len(excluded_assets)}")
     if val_dataset is not None:
         accelerator.print(f"Validation dataset size: {len(val_dataset)}")
+    else:
+        accelerator.print("WARNING: validation is disabled; best-checkpoint saving will be skipped.")
     accelerator.print(f"Run directory: {out_dir}")
     accelerator.print(f"Checkpoints in: {ckpt_dir}")
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
@@ -724,6 +853,7 @@ def train(args):
                     model=model,
                     batch=batch,
                     device=device,
+                    flow_target=args.flow_target,
                     supports_extra_losses=supports_extra_losses,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
@@ -749,10 +879,8 @@ def train(args):
             if writer is not None:
                 writer.add_scalar("train/loss_step", loss_value, global_step)
                 writer.add_scalar("train/loss_avg_epoch_running", avg_loss, global_step)
-                writer.add_scalar("train/cond_lr", optimizer.param_groups[0]["lr"], global_step)
-
-                if len(optimizer.param_groups) > 1:
-                    writer.add_scalar("train/flow_lr", optimizer.param_groups[1]["lr"], global_step)
+                for group in optimizer.param_groups:
+                    writer.add_scalar(f"train/{group.get('name', 'group')}_lr", group["lr"], global_step)
 
             if accelerator.is_local_main_process:
                 progress_bar.set_postfix(
@@ -793,6 +921,7 @@ def train(args):
                             model=model,
                             batch=val_batch,
                             device=device,
+                            flow_target=args.flow_target,
                             supports_extra_losses=supports_extra_losses,
                             endpoint_loss_weight=0.0,
                             symmetry_loss_weight=0.0,
@@ -812,6 +941,36 @@ def train(args):
             accelerator.print(f"Epoch {epoch} validation completed. val_loss={val_avg:.6f}")
             model.train()
 
+            if val_avg < best_val_loss:
+                previous_best = best_val_loss
+                best_val_loss = val_avg
+                best_epoch = epoch
+                accelerator.print(
+                    f"Validation improved: {previous_best:.6f} -> {best_val_loss:.6f}. "
+                    "Saving best checkpoint."
+                )
+                accelerator.wait_for_everyone()
+                save_checkpoint(
+                    accelerator=accelerator,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    ckpt_dir=ckpt_dir,
+                    epoch=epoch,
+                    global_step=global_step,
+                    train_loss=epoch_avg,
+                    val_loss=val_avg,
+                    best_val_loss=best_val_loss,
+                    best_epoch=best_epoch,
+                    best=True,
+                )
+            else:
+                accelerator.print(
+                    f"Validation did not improve. best_val_loss={best_val_loss:.6f} "
+                    f"at epoch {best_epoch}; current_val_loss={val_avg:.6f}."
+                )
+
         if writer is not None:
             writer.add_scalar("train/loss_epoch", epoch_avg, epoch)
             if val_avg is not None:
@@ -820,35 +979,7 @@ def train(args):
 
         accelerator.wait_for_everyone()
 
-        save_checkpoint(
-            accelerator=accelerator,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            args=args,
-            ckpt_dir=ckpt_dir,
-            epoch=epoch,
-            global_step=global_step,
-            train_loss=epoch_avg,
-            val_loss=val_avg,
-            final=False,
-        )
-
     accelerator.wait_for_everyone()
-
-    save_checkpoint(
-        accelerator=accelerator,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        args=args,
-        ckpt_dir=ckpt_dir,
-        epoch=args.train_epochs,
-        global_step=global_step,
-        train_loss=None,
-        val_loss=None,
-        final=True,
-    )
 
     if writer is not None:
         writer.close()

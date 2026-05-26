@@ -27,6 +27,22 @@ from torch.utils.data import DataLoader, Dataset
 
 
 VALID_SPLITS = ("train", "val", "test")
+REQUIRED_METADATA_KEYS = (
+    "split",
+    "src_1",
+    "src_2",
+    "target",
+    "alpha",
+    "src1_slat_feats",
+    "src1_slat_coords",
+    "src1_ss_latent",
+    "src2_slat_feats",
+    "src2_slat_coords",
+    "src2_ss_latent",
+    "target_slat_feats",
+    "target_slat_coords",
+    "target_ss_latent",
+)
 
 
 class MorphingDistillDataset(Dataset):
@@ -197,11 +213,20 @@ class MorphingDistillDataset(Dataset):
 
     def _filter_valid_metadata(self, metadata: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         valid: List[Dict[str, Any]] = []
+        skipped_schema = 0
         skipped_split = 0
         skipped_missing = 0
         examples: List[Tuple[str, List[Path]]] = []
+        schema_examples: List[Tuple[int, List[str]]] = []
 
-        for entry in metadata:
+        for idx, entry in enumerate(metadata):
+            missing_keys = [key for key in REQUIRED_METADATA_KEYS if key not in entry]
+            if missing_keys:
+                skipped_schema += 1
+                if len(schema_examples) < 10:
+                    schema_examples.append((idx, missing_keys))
+                continue
+
             if not self._entry_allowed_by_split(entry):
                 skipped_split += 1
                 continue
@@ -217,8 +242,14 @@ class MorphingDistillDataset(Dataset):
         if self.verbose:
             print(
                 f"[MorphingDistillDataset] split={self.split} valid={len(valid)} | "
+                f"skipped_schema={skipped_schema} | "
                 f"skipped_split={skipped_split} | skipped_missing={skipped_missing}"
             )
+            for idx, missing_keys in schema_examples:
+                print(
+                    f"[MorphingDistillDataset][schema-skip] metadata_index={idx} "
+                    f"missing_keys={missing_keys}"
+                )
             for target_name, missing in examples:
                 print(f"[MorphingDistillDataset][skip] target={target_name}")
                 for path in missing:
