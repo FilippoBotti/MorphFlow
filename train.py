@@ -59,6 +59,17 @@ def build_parser():
     )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        choices=["cosine", "plateau"],
+        default="cosine",
+        help="cosine: step every batch. plateau: warm up, then ReduceLROnPlateau on validation loss.",
+    )
+    parser.add_argument("--plateau_factor", type=float, default=0.5)
+    parser.add_argument("--plateau_patience", type=int, default=3)
+    parser.add_argument("--plateau_threshold", type=float, default=1e-4)
+    parser.add_argument("--plateau_min_lr", type=float, default=1e-6)
     parser.add_argument("--grad_clip", type=float, default=1.0, help="0 disables gradient clipping")
 
     # Model
@@ -218,18 +229,33 @@ def load_model_state(
     return result
 
 
-def load_assets_from_metadata(metadata_path: str) -> set:
+def load_metadata_entries(metadata_path: str) -> List[Dict[str, Any]]:
     with open(metadata_path, "r", encoding="utf-8") as f:
         entries = json.load(f)
 
+    if isinstance(entries, dict):
+        entries = entries.get("samples", entries.get("metadata", []))
+    if not isinstance(entries, list):
+        raise ValueError(f"Metadata must be a list or contain a samples list: {metadata_path}")
+
+    return entries
+
+
+def load_assets_from_metadata(metadata_path: str, split: Optional[str] = None) -> set:
+    entries = load_metadata_entries(metadata_path)
+
     assets = set()
     for entry in entries:
+        if split is not None:
+            entry_split = entry.get("split")
+            if entry_split is not None and entry_split != split:
+                continue
         src_1 = entry.get("src_1")
         src_2 = entry.get("src_2")
         if src_1:
-            assets.add(src_1)
+            assets.add(str(src_1))
         if src_2:
-            assets.add(src_2)
+            assets.add(str(src_2))
 
     return assets
 
@@ -488,6 +514,61 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
     return param_groups, cond_lr, flow_lr
 
 
+def resolve_warmup_steps(requested_warmup_steps: int, total_training_steps: int) -> int:
+    if requested_warmup_steps <= 0:
+        return 0
+    return min(requested_warmup_steps, max(1, total_training_steps // 10))
+
+
+def remember_base_lrs(optimizer):
+    for group in optimizer.param_groups:
+        group.setdefault("base_lr", group["lr"])
+
+
+def restore_base_lrs(optimizer):
+    for group in optimizer.param_groups:
+        group["lr"] = group.get("base_lr", group["lr"])
+
+
+def apply_plateau_warmup(optimizer, step: int, warmup_steps: int):
+    if warmup_steps <= 0 or step > warmup_steps:
+        return
+
+    scale = float(step) / float(warmup_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = group.get("base_lr", group["lr"]) * scale
+
+
+def build_lr_scheduler(optimizer, args, total_training_steps: int, warmup_steps: int):
+    remember_base_lrs(optimizer)
+
+    if args.lr_scheduler == "cosine":
+        from transformers import get_cosine_schedule_with_warmup
+
+        return get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps,
+        )
+
+    if args.lr_scheduler == "plateau":
+        if warmup_steps > 0:
+            for group in optimizer.param_groups:
+                group["lr"] = 0.0
+
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+            threshold=args.plateau_threshold,
+            threshold_mode="rel",
+            min_lr=args.plateau_min_lr,
+        )
+
+    raise ValueError(f"Unsupported lr scheduler: {args.lr_scheduler}")
+
+
 def load_trellis_pretrained_if_needed(model, args, accelerator: Accelerator):
     if args.resume_from or args.init_from:
         mode = "--resume_from" if args.resume_from else "--init_from"
@@ -641,6 +722,16 @@ def train(args):
     if val_metadata_path and os.path.exists(val_metadata_path) and args.exclude_val_assets_from_train == 1:
         excluded_assets = load_assets_from_metadata(val_metadata_path)
 
+    metadata_asset_overlap = set()
+    train_metadata_asset_count = None
+    val_metadata_asset_count = None
+    if val_metadata_path and os.path.exists(val_metadata_path):
+        train_metadata_assets = load_assets_from_metadata(metadata_path, split="train")
+        val_metadata_assets = load_assets_from_metadata(val_metadata_path, split="val")
+        metadata_asset_overlap = train_metadata_assets & val_metadata_assets
+        train_metadata_asset_count = len(train_metadata_assets)
+        val_metadata_asset_count = len(val_metadata_assets)
+
     dataset = MorphingDistillDataset(
         root=args.root_dir,
         metadata_file=metadata_path,
@@ -726,14 +817,13 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
-    from transformers import get_cosine_schedule_with_warmup
-
     total_training_steps = args.train_epochs * len(loader)
-
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=min(args.warmup_steps, max(1, total_training_steps // 10)),
-        num_training_steps=total_training_steps,
+    warmup_steps = resolve_warmup_steps(args.warmup_steps, total_training_steps)
+    scheduler = build_lr_scheduler(
+        optimizer=optimizer,
+        args=args,
+        total_training_steps=total_training_steps,
+        warmup_steps=warmup_steps,
     )
 
     trainable_tensors = [p for p in model.parameters() if p.requires_grad]
@@ -758,11 +848,14 @@ def train(args):
     global_step = 0
     best_val_loss = float("inf")
     best_epoch = 0
+    optimizer_restored = False
 
     if resume_ckpt is not None:
         if args.resume_optimizer == 1:
             try:
                 optimizer.load_state_dict(resume_ckpt["optimizer"])
+                remember_base_lrs(optimizer)
+                optimizer_restored = True
                 accelerator.print("Optimizer state restored.")
             except Exception as exc:
                 accelerator.print(f"Could not restore optimizer state: {exc}")
@@ -780,6 +873,9 @@ def train(args):
         global_step = int(resume_ckpt.get("step", 0))
         best_val_loss = float(resume_ckpt.get("best_val_loss", float("inf")))
         best_epoch = int(resume_ckpt.get("best_epoch", 0))
+
+    if args.lr_scheduler == "plateau" and not optimizer_restored and global_step >= warmup_steps:
+        restore_base_lrs(optimizer)
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.out_dir, run_name)
@@ -812,6 +908,14 @@ def train(args):
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     accelerator.print(f"Condition LR: {cond_lr}")
     accelerator.print(f"Flow LR: {flow_lr}")
+    accelerator.print(f"LR scheduler: {args.lr_scheduler}")
+    accelerator.print(f"Warmup steps: requested={args.warmup_steps} effective={warmup_steps}")
+    if args.lr_scheduler == "plateau":
+        accelerator.print(
+            f"Plateau scheduler: factor={args.plateau_factor} "
+            f"patience={args.plateau_patience} threshold={args.plateau_threshold} "
+            f"min_lr={args.plateau_min_lr}"
+        )
     for idx, group in enumerate(optimizer.param_groups):
         group_name = group.get("name", f"group_{idx}")
         accelerator.print(f"Optimizer LR [{idx}] {group_name}: {group['lr']}")
@@ -821,12 +925,21 @@ def train(args):
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
     accelerator.print(f"Extra loss support in MorphFlow.forward: {supports_extra_losses}")
     accelerator.print(f"Dataset size: {len(dataset)}")
+    if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
+        accelerator.print(f"Train metadata source assets: {train_metadata_asset_count}")
+        accelerator.print(f"Validation metadata source assets: {val_metadata_asset_count}")
+        accelerator.print(f"Train/validation source asset overlap: {len(metadata_asset_overlap)}")
+        if metadata_asset_overlap:
+            examples = sorted(metadata_asset_overlap)[:20]
+            accelerator.print(f"Overlap examples: {examples}")
     if excluded_assets:
         accelerator.print(f"Excluded validation assets from train: {len(excluded_assets)}")
     if val_dataset is not None:
         accelerator.print(f"Validation dataset size: {len(val_dataset)}")
     else:
         accelerator.print("WARNING: validation is disabled; best-checkpoint saving will be skipped.")
+        if args.lr_scheduler == "plateau":
+            accelerator.print("WARNING: --lr_scheduler plateau requires validation to reduce LR.")
     accelerator.print(f"Run directory: {out_dir}")
     accelerator.print(f"Checkpoints in: {ckpt_dir}")
     accelerator.print(f"TensorBoard logs in: {tb_dir}")
@@ -846,6 +959,9 @@ def train(args):
         )
 
         for batch_idx, batch in enumerate(progress_bar, start=1):
+            if args.lr_scheduler == "plateau":
+                apply_plateau_warmup(optimizer, global_step + 1, warmup_steps)
+
             optimizer.zero_grad(set_to_none=True)
 
             with accelerator.autocast():
@@ -866,7 +982,8 @@ def train(args):
                 accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             optimizer.step()
-            scheduler.step()
+            if args.lr_scheduler == "cosine":
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             reduced_loss = accelerator.reduce(loss.detach(), reduction="mean")
@@ -940,6 +1057,19 @@ def train(args):
             val_avg = val_running_loss / max(1, len(val_loader))
             accelerator.print(f"Epoch {epoch} validation completed. val_loss={val_avg:.6f}")
             model.train()
+
+            if args.lr_scheduler == "plateau":
+                lr_before = [group["lr"] for group in optimizer.param_groups]
+                scheduler.step(val_avg)
+                lr_after = [group["lr"] for group in optimizer.param_groups]
+                if lr_after != lr_before:
+                    accelerator.print(
+                        "Plateau scheduler reduced LR: "
+                        + ", ".join(
+                            f"{before:.6e}->{after:.6e}"
+                            for before, after in zip(lr_before, lr_after)
+                        )
+                    )
 
             if val_avg < best_val_loss:
                 previous_best = best_val_loss
