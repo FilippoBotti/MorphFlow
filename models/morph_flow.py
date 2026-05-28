@@ -77,7 +77,17 @@ class MorphFlow(nn.Module):
 
         return x_t, noise
     
-    def forward_flow(self, x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha):
+    def forward_flow(
+        self,
+        x_t,
+        t,
+        src_1_feats,
+        src_2_feats,
+        src_1_coords,
+        src_2_coords,
+        alpha,
+        apply_cfg_drop=True,
+    ):
         # condition
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
@@ -89,7 +99,7 @@ class MorphFlow(nn.Module):
             cond2 = self.separate_cond_proj(cond2)
             cond = (cond1, cond2, alpha)
 
-        if self.training and self.cfg_drop_prob > 0.0:
+        if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
             B = cond1.shape[0] if self.separate_cond else cond.shape[0]
             drop_mask = torch.rand(B, device=cond1.device) < self.cfg_drop_prob
 
@@ -149,15 +159,180 @@ class MorphFlow(nn.Module):
 
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 
-    def forward(self, x_0, src_1_feats, src_1_coords, src_2_feats, src_2_coords, alpha):
+    def _prepare_ss_latent(self, x_0):
+        if x_0.ndim == 6:
+            return x_0.squeeze(1)
+        return x_0
+
+    def flow_matching_loss(
+        self,
+        x_0,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+        alpha,
+        return_terms=False,
+        apply_cfg_drop=True,
+    ):
         B = x_0.shape[0]
-        x_0 = x_0.squeeze(1)
+        x_0 = self._prepare_ss_latent(x_0)
         t = torch.rand(B).to(x_0.device).float()
         x_t, noise = self.diffuse(x_0, t)
 
         velocity = self.get_v(x_0, noise)
 
-        pred = self.forward_flow(x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha)
-
+        pred = self.forward_flow(
+            x_t,
+            t,
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=apply_cfg_drop,
+        )
         loss = F.mse_loss(pred, velocity)
+
+        if return_terms:
+            return loss, x_t, t, pred
+        return loss
+
+    def pred_x0_from_velocity(self, x_t, t, pred_velocity):
+        sigma_t = self.sigma_min + (1.0 - self.sigma_min) * t
+        sigma_t = sigma_t.view(-1, *[1 for _ in range(x_t.ndim - 1)])
+        return (1.0 - self.sigma_min) * x_t - sigma_t * pred_velocity
+
+    def endpoint_loss(
+        self,
+        src_1_ss_latent,
+        src_2_ss_latent,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+    ):
+        src_1_ss_latent = self._prepare_ss_latent(src_1_ss_latent)
+        src_2_ss_latent = self._prepare_ss_latent(src_2_ss_latent)
+
+        B = src_1_ss_latent.shape[0]
+        endpoint_is_src2 = torch.rand(B, device=src_1_ss_latent.device) < 0.5
+        alpha = endpoint_is_src2.to(dtype=torch.float32)
+
+        view_shape = (B,) + (1,) * (src_1_ss_latent.ndim - 1)
+        target_x0 = torch.where(endpoint_is_src2.view(view_shape), src_2_ss_latent, src_1_ss_latent)
+
+        t = torch.rand(B, device=target_x0.device, dtype=torch.float32)
+        x_t, _ = self.diffuse(target_x0, t)
+        pred_velocity = self.forward_flow(
+            x_t,
+            t,
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=False,
+        )
+        pred_x0 = self.pred_x0_from_velocity(x_t, t, pred_velocity)
+        return F.mse_loss(pred_x0, target_x0)
+
+    def symmetry_loss(
+        self,
+        x_t,
+        t,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+        alpha,
+        pred_forward=None,
+    ):
+        if pred_forward is None:
+            pred_forward = self.forward_flow(
+                x_t,
+                t,
+                src_1_feats,
+                src_2_feats,
+                src_1_coords,
+                src_2_coords,
+                alpha,
+                apply_cfg_drop=False,
+            )
+
+        pred_swapped = self.forward_flow(
+            x_t,
+            t,
+            src_2_feats,
+            src_1_feats,
+            src_2_coords,
+            src_1_coords,
+            1.0 - alpha,
+            apply_cfg_drop=False,
+        )
+        return F.mse_loss(pred_forward, pred_swapped)
+
+    def forward(
+        self,
+        x_0,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+        alpha,
+        endpoint_loss_weight=0.0,
+        symmetry_loss_weight=0.0,
+        endpoint_loss_prob=0.25,
+        symmetry_loss_prob=1.0,
+        src1_ss_latent=None,
+        src2_ss_latent=None,
+    ):
+        loss, x_t, t, pred = self.flow_matching_loss(
+            x_0,
+            src_1_feats,
+            src_1_coords,
+            src_2_feats,
+            src_2_coords,
+            alpha,
+            return_terms=True,
+        )
+
+        endpoint_term = None
+        if (
+            endpoint_loss_weight > 0.0
+            and src1_ss_latent is not None
+            and src2_ss_latent is not None
+            and torch.rand((), device=loss.device).item() < endpoint_loss_prob
+        ):
+            endpoint_term = self.endpoint_loss(
+                src1_ss_latent,
+                src2_ss_latent,
+                src_1_feats,
+                src_1_coords,
+                src_2_feats,
+                src_2_coords,
+            )
+            loss = loss + endpoint_loss_weight * endpoint_term
+
+        symmetry_term = None
+        if symmetry_loss_weight > 0.0 and torch.rand((), device=loss.device).item() < symmetry_loss_prob:
+            pred_for_symmetry = None
+            if not self.training or self.cfg_drop_prob <= 0.0:
+                pred_for_symmetry = pred
+            symmetry_term = self.symmetry_loss(
+                x_t,
+                t,
+                src_1_feats,
+                src_1_coords,
+                src_2_feats,
+                src_2_coords,
+                alpha,
+                pred_forward=pred_for_symmetry,
+            )
+            loss = loss + symmetry_loss_weight * symmetry_term
+
+        self.last_loss_terms = {
+            "endpoint_active": endpoint_term is not None,
+            "symmetry_active": symmetry_term is not None,
+        }
         return loss

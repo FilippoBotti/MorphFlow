@@ -44,6 +44,12 @@ def build_parser():
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=10,
+        help="Save a regular epoch checkpoint every N epochs. Use 0 to disable.",
+    )
 
     # Learning rates
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -99,7 +105,19 @@ def build_parser():
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
     parser.add_argument("--endpoint_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--endpoint_loss_prob",
+        type=float,
+        default=0.25,
+        help="Probability of adding an alpha=0/1 endpoint flow-matching batch when endpoint loss is enabled.",
+    )
     parser.add_argument("--symmetry_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--symmetry_loss_prob",
+        type=float,
+        default=1.0,
+        help="Probability of adding src1/src2 alpha == src2/src1 1-alpha consistency when symmetry loss is enabled.",
+    )
 
     # Precision / memory
     parser.add_argument(
@@ -315,6 +333,8 @@ def compute_loss(
     supports_extra_losses: bool,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
+    endpoint_loss_prob: float,
+    symmetry_loss_prob: float,
     use_extra_losses: bool,
 ):
     src1_feats = batch["src1_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -344,6 +364,8 @@ def compute_loss(
         kwargs = {
             "endpoint_loss_weight": endpoint_loss_weight,
             "symmetry_loss_weight": symmetry_loss_weight,
+            "endpoint_loss_prob": endpoint_loss_prob,
+            "symmetry_loss_prob": symmetry_loss_prob,
         }
 
         if endpoint_loss_weight > 0.0:
@@ -701,6 +723,13 @@ def train(args):
     if args.resume_from and args.init_from:
         raise ValueError("Use either --resume_from or --init_from, not both.")
 
+    for name in ("endpoint_loss_prob", "symmetry_loss_prob"):
+        value = getattr(args, name)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"--{name} must be in [0, 1], got {value}")
+    if args.checkpoint_every < 0:
+        raise ValueError(f"--checkpoint_every must be >= 0, got {args.checkpoint_every}")
+
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
 
@@ -921,8 +950,11 @@ def train(args):
         accelerator.print(f"Optimizer LR [{idx}] {group_name}: {group['lr']}")
     accelerator.print(f"Weight decay: {args.weight_decay}")
     accelerator.print(f"Grad clip: {args.grad_clip}")
+    accelerator.print(f"Checkpoint every: {args.checkpoint_every}")
     accelerator.print(f"Endpoint loss weight: {args.endpoint_loss_weight}")
+    accelerator.print(f"Endpoint loss probability: {args.endpoint_loss_prob}")
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
+    accelerator.print(f"Symmetry loss probability: {args.symmetry_loss_prob}")
     accelerator.print(f"Extra loss support in MorphFlow.forward: {supports_extra_losses}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
@@ -973,6 +1005,8 @@ def train(args):
                     supports_extra_losses=supports_extra_losses,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
+                    endpoint_loss_prob=args.endpoint_loss_prob,
+                    symmetry_loss_prob=args.symmetry_loss_prob,
                     use_extra_losses=True,
                 )
 
@@ -1042,6 +1076,8 @@ def train(args):
                             supports_extra_losses=supports_extra_losses,
                             endpoint_loss_weight=0.0,
                             symmetry_loss_weight=0.0,
+                            endpoint_loss_prob=0.0,
+                            symmetry_loss_prob=0.0,
                             use_extra_losses=False,
                         )
 
@@ -1100,6 +1136,24 @@ def train(args):
                     f"Validation did not improve. best_val_loss={best_val_loss:.6f} "
                     f"at epoch {best_epoch}; current_val_loss={val_avg:.6f}."
                 )
+
+        if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+            accelerator.print(f"Saving periodic checkpoint at epoch {epoch}.")
+            accelerator.wait_for_everyone()
+            save_checkpoint(
+                accelerator=accelerator,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=args,
+                ckpt_dir=ckpt_dir,
+                epoch=epoch,
+                global_step=global_step,
+                train_loss=epoch_avg,
+                val_loss=val_avg,
+                best_val_loss=best_val_loss,
+                best_epoch=best_epoch,
+            )
 
         if writer is not None:
             writer.add_scalar("train/loss_epoch", epoch_avg, epoch)
