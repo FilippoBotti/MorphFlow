@@ -23,6 +23,7 @@ if os.environ.get("TRELLIS_REPO"):
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
 from models.morph_flow import MorphFlow
+from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
 
 
@@ -100,7 +101,12 @@ def detect_model_type(ckpt, requested):
 
 def build_model(ckpt, model_type, flow_target):
     args = checkpoint_args(ckpt)
-    model_cls = MorphSLatFlow if flow_target == "slat" else MorphFlow
+    if flow_target == "slat":
+        model_cls = MorphSLatFlow
+    elif args.get("ss_flow_arch", "standard") == "residual_interp":
+        model_cls = MorphResidualSSFlow
+    else:
+        model_cls = MorphFlow
 
     requested_kwargs = {
         "model_type": model_type,
@@ -110,6 +116,11 @@ def build_model(ckpt, model_type, flow_target):
         "cond_resample_tokens": int(args.get("cond_resample_tokens", 0)),
         "cond_resample_depth": int(args.get("cond_resample_depth", 1)),
         "cond_resample_heads": int(args.get("cond_resample_heads", 8)),
+        "residual_interp_gate": args.get("residual_interp_gate", "alpha"),
+        "residual_interp_gate_min": float(args.get("residual_interp_gate_min", 1e-3)),
+        "residual_endpoint_prob": float(args.get("residual_endpoint_prob", 0.0)),
+        "residual_endpoint_weight": float(args.get("residual_endpoint_weight", 1.0)),
+        "residual_endpoint_max_items": int(args.get("residual_endpoint_max_items", 1)),
     }
 
     supported = set(inspect.signature(model_cls.__init__).parameters)
@@ -196,6 +207,11 @@ def sample_ss(model, batch, target_ss, steps, device, cfg_scale, mixed_precision
                     x_t, t, src1_feats, src2_feats, src1_coords, src2_coords, alpha, guidance_scale=cfg_scale
                 )
         x_t = x_t - dt * pred.float()
+
+    if hasattr(model, "residual_to_ss"):
+        src1_ss = batch["src1_ss_latent"].to(device=device, dtype=torch.float32)
+        src2_ss = batch["src2_ss_latent"].to(device=device, dtype=torch.float32)
+        x_t = model.residual_to_ss(x_t, src1_ss, src2_ss, alpha)
     return x_t
 
 
@@ -352,6 +368,7 @@ def main():
     print(f"metadata: {metadata_path}")
     print(f"checkpoint: {checkpoint_path}")
     print(f"flow_target: {flow_target}")
+    print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"model_type: {model_type}")
     print(f"cfg_scale: {args.cfg_scale}")
     print(f"steps: {args.steps}")

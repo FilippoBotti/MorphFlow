@@ -216,11 +216,11 @@ class MorphFlow(nn.Module):
         src_2_ss_latent = self._prepare_ss_latent(src_2_ss_latent)
 
         B = src_1_ss_latent.shape[0]
-        endpoint_is_src2 = torch.rand(B, device=src_1_ss_latent.device) < 0.5
-        alpha = endpoint_is_src2.to(dtype=torch.float32)
+        endpoint_is_src1 = torch.rand(B, device=src_1_ss_latent.device) < 0.5
+        alpha = endpoint_is_src1.to(dtype=torch.float32)
 
         view_shape = (B,) + (1,) * (src_1_ss_latent.ndim - 1)
-        target_x0 = torch.where(endpoint_is_src2.view(view_shape), src_2_ss_latent, src_1_ss_latent)
+        target_x0 = torch.where(endpoint_is_src1.view(view_shape), src_1_ss_latent, src_2_ss_latent)
 
         t = torch.rand(B, device=target_x0.device, dtype=torch.float32)
         x_t, _ = self.diffuse(target_x0, t)

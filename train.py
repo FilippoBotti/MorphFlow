@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
 from models.morph_flow import MorphFlow
+from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
 
 
@@ -86,6 +87,44 @@ def build_parser():
         choices=["ss", "slat"],
         default="ss",
         help="Train the sparse-structure flow or the structured-latent flow.",
+    )
+    parser.add_argument(
+        "--ss_flow_arch",
+        type=str,
+        choices=["standard", "residual_interp"],
+        default="standard",
+        help="SS flow architecture. residual_interp trains the flow in residual space over lerp(src1_ss, src2_ss, alpha).",
+    )
+    parser.add_argument(
+        "--residual_interp_gate",
+        type=str,
+        choices=["none", "alpha"],
+        default="alpha",
+        help="For residual_interp: none uses target=base+residual; alpha uses target=base+alpha*(1-alpha)*residual.",
+    )
+    parser.add_argument(
+        "--residual_interp_gate_min",
+        type=float,
+        default=1e-3,
+        help="For residual_interp alpha gate: minimum divisor used while mapping target SS to residual space.",
+    )
+    parser.add_argument(
+        "--residual_endpoint_prob",
+        type=float,
+        default=0.0,
+        help="For residual_interp: probability of adding an auxiliary alpha=0/1 residual flow-matching batch.",
+    )
+    parser.add_argument(
+        "--residual_endpoint_weight",
+        type=float,
+        default=1.0,
+        help="For residual_interp: weight of the auxiliary alpha=0/1 residual flow-matching loss when active.",
+    )
+    parser.add_argument(
+        "--residual_endpoint_max_items",
+        type=int,
+        default=1,
+        help="For residual_interp: max batch items used by the auxiliary endpoint loss per GPU. Use 0 for full batch.",
     )
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0)
     parser.add_argument(
@@ -279,7 +318,13 @@ def load_assets_from_metadata(metadata_path: str, split: Optional[str] = None) -
 
 
 def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
-    model_cls = MorphSLatFlow if args.flow_target == "slat" else MorphFlow
+    if args.flow_target == "slat":
+        model_cls = MorphSLatFlow
+    elif args.ss_flow_arch == "residual_interp":
+        model_cls = MorphResidualSSFlow
+    else:
+        model_cls = MorphFlow
+
     requested_kwargs = {
         "model_type": args.trellis_model,
         "separate_cond": args.separate_cond == 1,
@@ -288,6 +333,11 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "cond_resample_tokens": args.cond_resample_tokens,
         "cond_resample_depth": args.cond_resample_depth,
         "cond_resample_heads": args.cond_resample_heads,
+        "residual_interp_gate": args.residual_interp_gate,
+        "residual_interp_gate_min": args.residual_interp_gate_min,
+        "residual_endpoint_prob": args.residual_endpoint_prob,
+        "residual_endpoint_weight": args.residual_endpoint_weight,
+        "residual_endpoint_max_items": args.residual_endpoint_max_items,
     }
 
     signature = inspect.signature(model_cls.__init__)
@@ -318,6 +368,20 @@ def model_forward_supports_extra_losses(model: torch.nn.Module) -> bool:
     return "endpoint_loss_weight" in params and "symmetry_loss_weight" in params
 
 
+def unwrap_model_for_attr(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "module", model)
+
+
+def model_requires_source_ss_latents(model: torch.nn.Module) -> bool:
+    return bool(getattr(unwrap_model_for_attr(model), "requires_source_ss_latents", False))
+
+
+def model_forward_supports_source_ss_latents(model: torch.nn.Module) -> bool:
+    signature = inspect.signature(unwrap_model_for_attr(model).forward)
+    params = set(signature.parameters.keys())
+    return "src1_ss_latent" in params and "src2_ss_latent" in params
+
+
 def get_optional_tensor(batch: Dict[str, Any], key: str, device, dtype=torch.float32):
     value = batch.get(key, None)
     if value is None:
@@ -331,6 +395,8 @@ def compute_loss(
     device,
     flow_target: str,
     supports_extra_losses: bool,
+    supports_source_ss_latents: bool,
+    needs_source_ss_latents: bool,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
     endpoint_loss_prob: float,
@@ -360,17 +426,22 @@ def compute_loss(
 
     target_ss_latent = batch["target_ss_latent"].to(device=device, dtype=torch.float32, non_blocking=True)
 
+    source_kwargs = {}
+    if supports_source_ss_latents and (
+        needs_source_ss_latents
+        or (supports_extra_losses and use_extra_losses and endpoint_loss_weight > 0.0)
+    ):
+        source_kwargs["src1_ss_latent"] = get_optional_tensor(batch, "src1_ss_latent", device)
+        source_kwargs["src2_ss_latent"] = get_optional_tensor(batch, "src2_ss_latent", device)
+
     if supports_extra_losses and use_extra_losses:
         kwargs = {
             "endpoint_loss_weight": endpoint_loss_weight,
             "symmetry_loss_weight": symmetry_loss_weight,
             "endpoint_loss_prob": endpoint_loss_prob,
             "symmetry_loss_prob": symmetry_loss_prob,
+            **source_kwargs,
         }
-
-        if endpoint_loss_weight > 0.0:
-            kwargs["src1_ss_latent"] = get_optional_tensor(batch, "src1_ss_latent", device)
-            kwargs["src2_ss_latent"] = get_optional_tensor(batch, "src2_ss_latent", device)
 
         return model(
             target_ss_latent,
@@ -389,6 +460,7 @@ def compute_loss(
         src2_feats,
         src2_coords,
         alpha,
+        **source_kwargs,
     )
 
 
@@ -727,8 +799,16 @@ def train(args):
         value = getattr(args, name)
         if value < 0.0 or value > 1.0:
             raise ValueError(f"--{name} must be in [0, 1], got {value}")
+    if args.residual_endpoint_prob < 0.0 or args.residual_endpoint_prob > 1.0:
+        raise ValueError(f"--residual_endpoint_prob must be in [0, 1], got {args.residual_endpoint_prob}")
+    if args.residual_endpoint_weight < 0.0:
+        raise ValueError(f"--residual_endpoint_weight must be >= 0, got {args.residual_endpoint_weight}")
+    if args.residual_endpoint_max_items < 0:
+        raise ValueError(f"--residual_endpoint_max_items must be >= 0, got {args.residual_endpoint_max_items}")
     if args.checkpoint_every < 0:
         raise ValueError(f"--checkpoint_every must be >= 0, got {args.checkpoint_every}")
+    if args.residual_interp_gate_min <= 0.0:
+        raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
 
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
@@ -833,6 +913,8 @@ def train(args):
         )
 
     supports_extra_losses = model_forward_supports_extra_losses(model)
+    supports_source_ss_latents = model_forward_supports_source_ss_latents(model)
+    requires_source_ss_latents = model_requires_source_ss_latents(model)
     if not supports_extra_losses and (args.endpoint_loss_weight > 0.0 or args.symmetry_loss_weight > 0.0):
         accelerator.print(
             "WARNING: MorphFlow.forward does not support endpoint/symmetry loss kwargs. "
@@ -932,6 +1014,14 @@ def train(args):
     accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
     accelerator.print(f"Flow target: {args.flow_target}")
+    accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
+    if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
+        accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
+        accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")
+        accelerator.print(f"Residual endpoint probability: {args.residual_endpoint_prob}")
+        accelerator.print(f"Residual endpoint weight: {args.residual_endpoint_weight}")
+        accelerator.print(f"Residual endpoint max items: {args.residual_endpoint_max_items}")
+    accelerator.print(f"Model requires source SS latents: {requires_source_ss_latents}")
     accelerator.print(f"Separate cond: {args.separate_cond == 1}")
     accelerator.print(f"Separate cond gate: {args.separate_cond_gate}")
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
@@ -1003,6 +1093,8 @@ def train(args):
                     device=device,
                     flow_target=args.flow_target,
                     supports_extra_losses=supports_extra_losses,
+                    supports_source_ss_latents=supports_source_ss_latents,
+                    needs_source_ss_latents=requires_source_ss_latents,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
                     endpoint_loss_prob=args.endpoint_loss_prob,
@@ -1074,6 +1166,8 @@ def train(args):
                             device=device,
                             flow_target=args.flow_target,
                             supports_extra_losses=supports_extra_losses,
+                            supports_source_ss_latents=supports_source_ss_latents,
+                            needs_source_ss_latents=requires_source_ss_latents,
                             endpoint_loss_weight=0.0,
                             symmetry_loss_weight=0.0,
                             endpoint_loss_prob=0.0,
