@@ -287,6 +287,14 @@ class MorphFlow(nn.Module):
         src1_ss_latent=None,
         src2_ss_latent=None,
     ):
+        endpoint_active = (
+            endpoint_loss_weight > 0.0
+            and src1_ss_latent is not None
+            and src2_ss_latent is not None
+            and torch.rand((), device=x_0.device).item() < endpoint_loss_prob
+        )
+        symmetry_active = symmetry_loss_weight > 0.0 and torch.rand((), device=x_0.device).item() < symmetry_loss_prob
+
         loss, x_t, t, pred = self.flow_matching_loss(
             x_0,
             src_1_feats,
@@ -295,15 +303,11 @@ class MorphFlow(nn.Module):
             src_2_coords,
             alpha,
             return_terms=True,
+            apply_cfg_drop=not symmetry_active,
         )
 
         endpoint_term = None
-        if (
-            endpoint_loss_weight > 0.0
-            and src1_ss_latent is not None
-            and src2_ss_latent is not None
-            and torch.rand((), device=loss.device).item() < endpoint_loss_prob
-        ):
+        if endpoint_active:
             endpoint_term = self.endpoint_loss(
                 src1_ss_latent,
                 src2_ss_latent,
@@ -315,10 +319,7 @@ class MorphFlow(nn.Module):
             loss = loss + endpoint_loss_weight * endpoint_term
 
         symmetry_term = None
-        if symmetry_loss_weight > 0.0 and torch.rand((), device=loss.device).item() < symmetry_loss_prob:
-            pred_for_symmetry = None
-            if not self.training or self.cfg_drop_prob <= 0.0:
-                pred_for_symmetry = pred
+        if symmetry_active:
             symmetry_term = self.symmetry_loss(
                 x_t,
                 t,
@@ -327,7 +328,7 @@ class MorphFlow(nn.Module):
                 src_2_feats,
                 src_2_coords,
                 alpha,
-                pred_forward=pred_for_symmetry,
+                pred_forward=pred,
             )
             loss = loss + symmetry_loss_weight * symmetry_term
 
