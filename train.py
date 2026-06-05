@@ -193,6 +193,17 @@ def build_parser():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str, default="to_q,to_kv")
+    parser.add_argument(
+        "--trainable_scope",
+        type=str,
+        choices=["full", "cond_cross_attn"],
+        default="full",
+        help=(
+            "Which non-LoRA parameters to train. full trains the whole model. "
+            "cond_cross_attn trains MorphFlow conditioning modules plus TRELLIS "
+            "cross-attention/alpha adapter parameters, freezing the rest of the flow."
+        ),
+    )
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--val_examples", type=int, default=0)
@@ -466,6 +477,8 @@ def compute_loss(
 
 def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
     if args.use_lora == 1:
+        if args.trainable_scope != "full":
+            accelerator.print("WARNING: --trainable_scope is ignored when --use_lora=1.")
         for p in model.parameters():
             p.requires_grad = False
 
@@ -489,6 +502,9 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         accelerator.print(f"LoRA enabled on {len(replaced)} attention projections.")
         if not replaced:
             accelerator.print("WARNING: no LoRA modules were inserted. Check --lora_target_modules.")
+    elif args.trainable_scope == "cond_cross_attn":
+        for p in model.parameters():
+            p.requires_grad = False
     else:
         # Full fine-tuning by default.
         for p in model.parameters():
@@ -523,6 +539,29 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
                 if alpha_gate is not None:
                     for p in alpha_gate.parameters():
                         p.requires_grad = True
+    elif args.trainable_scope == "cond_cross_attn":
+        flow = get_flow_module(model)
+        if flow is None:
+            raise RuntimeError("Cannot use --trainable_scope cond_cross_attn: model has no TRELLIS flow module.")
+
+        alpha_embedder = getattr(flow, "alpha_embedder", None)
+        if alpha_embedder is not None:
+            for p in alpha_embedder.parameters():
+                p.requires_grad = True
+
+        enabled_blocks = 0
+        for block in getattr(flow, "blocks", []):
+            block_enabled = False
+            for module_name in ("cross_attn", "cross_attn2", "norm2", "norm4", "alpha_gate"):
+                module = getattr(block, module_name, None)
+                if module is None:
+                    continue
+                for p in module.parameters():
+                    p.requires_grad = True
+                block_enabled = True
+            enabled_blocks += int(block_enabled)
+
+        accelerator.print(f"Trainable scope cond_cross_attn: enabled cross-attention adapters in {enabled_blocks} flow blocks.")
 
     # null_cond is only useful when CFG dropout is enabled.
     if hasattr(model, "null_cond") and args.cfg_drop_prob <= 0.0:
@@ -1015,6 +1054,7 @@ def train(args):
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
     accelerator.print(f"Flow target: {args.flow_target}")
     accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
+    accelerator.print(f"Trainable scope: {args.trainable_scope}")
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
         accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")

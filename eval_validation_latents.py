@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT))
     parser.add_argument("--num_samples", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--trellis_model", type=str, choices=["auto", "text_base", "image_large"], default="auto")
@@ -251,8 +251,46 @@ def ensure_batch_coords(coords):
     return torch.cat([batch, coords], dim=-1)
 
 
+def rgba_from_rgb(rgb, alpha=255):
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.max(initial=0) <= 1.0:
+        arr = arr * 255.0
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape[0] == 4:
+        return arr
+    return np.concatenate([arr[:3], np.array([alpha], dtype=np.uint8)])
+
+
+def decoded_vertex_colors(decoded, fallback_rgb=(210, 210, 210)):
+    attrs = getattr(decoded, "vertex_attrs", None)
+    if attrs is None:
+        color = rgba_from_rgb(fallback_rgb)
+        return np.repeat(color[None, :], int(decoded.vertices.shape[0]), axis=0)
+
+    attrs = attrs.detach().float().cpu()
+    if attrs.ndim != 2 or attrs.shape[0] != int(decoded.vertices.shape[0]) or attrs.shape[1] < 3:
+        color = rgba_from_rgb(fallback_rgb)
+        return np.repeat(color[None, :], int(decoded.vertices.shape[0]), axis=0)
+
+    colors = attrs[:, :3].numpy()
+    if colors.max(initial=0.0) <= 1.0 and colors.min(initial=0.0) >= 0.0:
+        colors = colors * 255.0
+    colors = np.clip(colors, 0, 255).astype(np.uint8)
+    alpha = np.full((colors.shape[0], 1), 255, dtype=np.uint8)
+    return np.concatenate([colors, alpha], axis=1)
+
+
 @torch.no_grad()
-def save_slat_glb(mesh_decoder, sparse_tensor_cls, feats, coords, path, device, mixed_precision):
+def save_slat_glb(
+    mesh_decoder,
+    sparse_tensor_cls,
+    feats,
+    coords,
+    path,
+    device,
+    mixed_precision,
+    fallback_color=(210, 210, 210),
+):
     feats = feats.to(device=device, dtype=torch.float32)
     coords = ensure_batch_coords(coords).to(device=device, dtype=torch.int32)
     st = sparse_tensor_cls(feats=feats, coords=coords)
@@ -266,6 +304,9 @@ def save_slat_glb(mesh_decoder, sparse_tensor_cls, feats, coords, path, device, 
     mesh = trimesh.Trimesh(
         vertices=decoded.vertices.detach().float().cpu().numpy(),
         faces=decoded.faces.detach().cpu().numpy(),
+        visual=trimesh.visual.ColorVisuals(
+            vertex_colors=decoded_vertex_colors(decoded, fallback_color)
+        ),
         process=False,
     )
     mesh.export(path)
@@ -298,13 +339,16 @@ def voxel_iou(pred_logits, target_logits):
 
 
 @torch.no_grad()
-def save_voxel_glb(ss_decoder, latent, path, device, mixed_precision):
+def save_voxel_glb(ss_decoder, latent, path, device, mixed_precision, color=(150, 170, 210)):
     logits = ss_logits(ss_decoder, latent, device, mixed_precision)
     voxels = (logits > 0).detach().cpu().numpy().astype(bool)
     if int(voxels.sum()) == 0:
         return {"saved": False, "occupancy_ratio": 0.0, "occupied": 0}
 
     mesh = trimesh.voxel.VoxelGrid(DenseEncoding(voxels)).marching_cubes
+    mesh.visual = trimesh.visual.ColorVisuals(
+        vertex_colors=np.repeat(rgba_from_rgb(color)[None, :], len(mesh.vertices), axis=0)
+    )
     mesh.export(path)
     return {
         "saved": True,
@@ -427,9 +471,36 @@ def main():
             "sample_dir": str(sample_dir),
         }
 
-        save_slat_glb(mesh_decoder, sparse_tensor_cls, batch["src1_feats"], batch["src1_coords"], sample_dir / "src1.glb", device, args.mixed_precision)
-        save_slat_glb(mesh_decoder, sparse_tensor_cls, batch["src2_feats"], batch["src2_coords"], sample_dir / "src2.glb", device, args.mixed_precision)
-        save_slat_glb(mesh_decoder, sparse_tensor_cls, batch["target_feats"], batch["target_coords"], sample_dir / "target.glb", device, args.mixed_precision)
+        save_slat_glb(
+            mesh_decoder,
+            sparse_tensor_cls,
+            batch["src1_feats"],
+            batch["src1_coords"],
+            sample_dir / "src1.glb",
+            device,
+            args.mixed_precision,
+            fallback_color=(80, 150, 255),
+        )
+        save_slat_glb(
+            mesh_decoder,
+            sparse_tensor_cls,
+            batch["src2_feats"],
+            batch["src2_coords"],
+            sample_dir / "src2.glb",
+            device,
+            args.mixed_precision,
+            fallback_color=(255, 150, 80),
+        )
+        save_slat_glb(
+            mesh_decoder,
+            sparse_tensor_cls,
+            batch["target_feats"],
+            batch["target_coords"],
+            sample_dir / "target.glb",
+            device,
+            args.mixed_precision,
+            fallback_color=(120, 220, 140),
+        )
 
         if flow_target == "ss":
             target_ss = batch["target_ss_latent"].to(device=device, dtype=torch.float32)
@@ -443,8 +514,22 @@ def main():
             target_logits = ss_logits(ss_decoder, target_ss, device, args.mixed_precision)
             pred_logits = ss_logits(ss_decoder, pred_ss, device, args.mixed_precision)
             row["voxel_iou"] = voxel_iou(pred_logits, target_logits)
-            row["target_voxel"] = save_voxel_glb(ss_decoder, target_ss, sample_dir / "target_voxels.glb", device, args.mixed_precision)
-            row["pred_voxel"] = save_voxel_glb(ss_decoder, pred_ss, sample_dir / "pred_voxels.glb", device, args.mixed_precision)
+            row["target_voxel"] = save_voxel_glb(
+                ss_decoder,
+                target_ss,
+                sample_dir / "target_voxels.glb",
+                device,
+                args.mixed_precision,
+                color=(120, 220, 140),
+            )
+            row["pred_voxel"] = save_voxel_glb(
+                ss_decoder,
+                pred_ss,
+                sample_dir / "pred_voxels.glb",
+                device,
+                args.mixed_precision,
+                color=(220, 120, 220),
+            )
 
             if args.save_latents == 1:
                 torch.save(
@@ -475,6 +560,7 @@ def main():
                 sample_dir / "pred_slat.glb",
                 device,
                 args.mixed_precision,
+                fallback_color=(220, 120, 220),
             )
 
             if args.save_latents == 1:
