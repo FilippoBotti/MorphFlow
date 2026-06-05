@@ -194,6 +194,13 @@ def build_parser():
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str, default="to_q,to_kv")
     parser.add_argument(
+        "--lora_attention_scope",
+        type=str,
+        choices=["all", "cross"],
+        default="all",
+        help="all preserves the legacy *_attn selection; cross only targets cross_attn/cross_attn2.",
+    )
+    parser.add_argument(
         "--trainable_scope",
         type=str,
         choices=["full", "cond_cross_attn"],
@@ -497,6 +504,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
             target_modules=lora_targets,
+            attention_scope=args.lora_attention_scope,
         )
         model._lora_module_names = replaced
         accelerator.print(f"LoRA enabled on {len(replaced)} attention projections.")
@@ -1065,8 +1073,15 @@ def train(args):
     accelerator.print(f"Separate cond: {args.separate_cond == 1}")
     accelerator.print(f"Separate cond gate: {args.separate_cond_gate}")
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
+    if args.use_lora == 1:
+        accelerator.print(f"LoRA attention scope: {args.lora_attention_scope}")
     accelerator.print(f"Condition LR: {cond_lr}")
-    accelerator.print(f"Flow LR: {flow_lr}")
+    if args.use_lora == 1:
+        lora_lr = args.lr if args.lora_lr is None else args.lora_lr
+        accelerator.print(f"LoRA LR: {lora_lr}")
+        accelerator.print("Flow LR: unused when --use_lora=1")
+    else:
+        accelerator.print(f"Flow LR: {flow_lr}")
     accelerator.print(f"LR scheduler: {args.lr_scheduler}")
     accelerator.print(f"Warmup steps: requested={args.warmup_steps} effective={warmup_steps}")
     if args.lr_scheduler == "plateau":

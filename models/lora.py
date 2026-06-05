@@ -34,14 +34,30 @@ def _set_module(root, name, module):
     setattr(parent, parts[-1], module)
 
 
-def add_lora_to_attention(model, rank=8, alpha=16, dropout=0.0, target_modules=("to_q", "to_kv")):
+def _matches_attention_scope(name, attention_scope):
+    parts = name.split(".")
+    if attention_scope == "all":
+        return "_attn." in name
+    if attention_scope == "cross":
+        return any(part in ("cross_attn", "cross_attn2") for part in parts)
+    raise ValueError(f"Unknown LoRA attention scope: {attention_scope}")
+
+
+def add_lora_to_attention(
+    model,
+    rank=8,
+    alpha=16,
+    dropout=0.0,
+    target_modules=("to_q", "to_kv"),
+    attention_scope="all",
+):
     replaced = []
 
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
 
-        if "_attn." not in name:
+        if not _matches_attention_scope(name, attention_scope):
             continue
 
         short_name = name.split(".")[-1]

@@ -155,6 +155,7 @@ def maybe_insert_lora(model, args):
         alpha=int(args.get("lora_alpha", 16)),
         dropout=float(args.get("lora_dropout", 0.0)),
         target_modules=targets,
+        attention_scope=args.get("lora_attention_scope", "all"),
     )
     print(f"Inserted LoRA modules: {len(modules)}")
 
