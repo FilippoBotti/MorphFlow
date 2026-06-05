@@ -52,6 +52,9 @@ class MorphSLatFlow(nn.Module):
         cond_resample_depth: int = 1,
         cond_resample_heads: int = 8,
         normalize_flow_latents: bool = True,
+        t_schedule: str = "logit_normal",
+        t_logit_mean: float = 0.0,
+        t_logit_std: float = 1.0,
     ):
         super().__init__()
         del cond_resample_tokens, cond_resample_depth, cond_resample_heads
@@ -60,6 +63,12 @@ class MorphSLatFlow(nn.Module):
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.normalize_flow_latents = normalize_flow_latents
+        self.t_schedule = t_schedule
+        self.t_logit_mean = t_logit_mean
+        self.t_logit_std = t_logit_std
+
+        if self.t_schedule not in ("uniform", "logit_normal"):
+            raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
 
         if model_type == "text_base":
             model_channels = 768
@@ -152,6 +161,12 @@ class MorphSLatFlow(nn.Module):
         t = t.view(-1, 1)
         x_t = (1 - t) * x_0 + (self.sigma_min + (1 - self.sigma_min) * t) * noise
         return x_t, noise
+
+    def sample_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self.t_schedule == "uniform":
+            return torch.rand(batch_size, device=device, dtype=torch.float32)
+        noise = torch.randn(batch_size, device=device, dtype=torch.float32)
+        return torch.sigmoid(noise * self.t_logit_std + self.t_logit_mean)
 
     def _build_condition(
         self,
@@ -264,7 +279,7 @@ class MorphSLatFlow(nn.Module):
         x_0 = self.normalize_slat(x_0)
 
         batch_size = x_0.shape[0]
-        t = torch.rand(batch_size, device=x_0.device, dtype=torch.float32)
+        t = self.sample_t(batch_size, x_0.device)
         x_t, noise = self.diffuse(x_0, t)
         velocity = self.get_v(x_0, noise)
 

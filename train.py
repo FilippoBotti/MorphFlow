@@ -140,6 +140,15 @@ def build_parser():
     parser.add_argument("--cond_resample_tokens", type=int, default=0)
     parser.add_argument("--cond_resample_depth", type=int, default=1)
     parser.add_argument("--cond_resample_heads", type=int, default=8)
+    parser.add_argument(
+        "--slat_t_schedule",
+        type=str,
+        choices=["uniform", "logit_normal"],
+        default="logit_normal",
+        help="SLat flow timestep sampling. TRELLIS official flow training uses logit_normal.",
+    )
+    parser.add_argument("--slat_t_logit_mean", type=float, default=0.0)
+    parser.add_argument("--slat_t_logit_std", type=float, default=1.0)
 
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
@@ -208,7 +217,28 @@ def build_parser():
         help=(
             "Which non-LoRA parameters to train. full trains the whole model. "
             "cond_cross_attn trains MorphFlow conditioning modules plus TRELLIS "
-            "cross-attention/alpha adapter parameters, freezing the rest of the flow."
+            "cross-attention parameters, freezing the rest of the flow. "
+            "Alpha adapters are controlled separately by --train_flow_alpha_*."
+        ),
+    )
+    parser.add_argument(
+        "--train_flow_alpha_embedder",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "Train the TRELLIS flow alpha timestep embedder in LoRA or cond_cross_attn modes. "
+            "Set 0 for a strict conditioning/cross-attention diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--train_flow_alpha_gate",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "Train the separate-condition alpha gates inside TRELLIS flow blocks in LoRA or "
+            "cond_cross_attn modes. Set 0 for a strict conditioning/cross-attention diagnostic."
         ),
     )
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
@@ -357,6 +387,14 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "residual_endpoint_weight": args.residual_endpoint_weight,
         "residual_endpoint_max_items": args.residual_endpoint_max_items,
     }
+    if args.flow_target == "slat":
+        requested_kwargs.update(
+            {
+                "t_schedule": args.slat_t_schedule,
+                "t_logit_mean": args.slat_t_logit_mean,
+                "t_logit_std": args.slat_t_logit_std,
+            }
+        )
 
     signature = inspect.signature(model_cls.__init__)
     supported = set(signature.parameters.keys())
@@ -539,12 +577,12 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         flow = get_flow_module(model)
         if flow is not None:
             alpha_embedder = getattr(flow, "alpha_embedder", None)
-            if alpha_embedder is not None:
+            if alpha_embedder is not None and args.train_flow_alpha_embedder == 1:
                 for p in alpha_embedder.parameters():
                     p.requires_grad = True
             for block in getattr(flow, "blocks", []):
                 alpha_gate = getattr(block, "alpha_gate", None)
-                if alpha_gate is not None:
+                if alpha_gate is not None and args.train_flow_alpha_gate == 1:
                     for p in alpha_gate.parameters():
                         p.requires_grad = True
     elif args.trainable_scope == "cond_cross_attn":
@@ -553,14 +591,17 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
             raise RuntimeError("Cannot use --trainable_scope cond_cross_attn: model has no TRELLIS flow module.")
 
         alpha_embedder = getattr(flow, "alpha_embedder", None)
-        if alpha_embedder is not None:
+        if alpha_embedder is not None and args.train_flow_alpha_embedder == 1:
             for p in alpha_embedder.parameters():
                 p.requires_grad = True
 
         enabled_blocks = 0
         for block in getattr(flow, "blocks", []):
             block_enabled = False
-            for module_name in ("cross_attn", "cross_attn2", "norm2", "norm4", "alpha_gate"):
+            module_names = ["cross_attn", "cross_attn2", "norm2", "norm4"]
+            if args.train_flow_alpha_gate == 1:
+                module_names.append("alpha_gate")
+            for module_name in module_names:
                 module = getattr(block, module_name, None)
                 if module is None:
                     continue
@@ -856,6 +897,8 @@ def train(args):
         raise ValueError(f"--checkpoint_every must be >= 0, got {args.checkpoint_every}")
     if args.residual_interp_gate_min <= 0.0:
         raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
+    if args.slat_t_logit_std <= 0.0:
+        raise ValueError(f"--slat_t_logit_std must be > 0, got {args.slat_t_logit_std}")
 
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
@@ -1063,6 +1106,18 @@ def train(args):
     accelerator.print(f"Flow target: {args.flow_target}")
     accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
     accelerator.print(f"Trainable scope: {args.trainable_scope}")
+    if args.use_lora == 1:
+        accelerator.print("Effective trainability: LoRA adapters + MorphFlow conditioning modules")
+    elif args.trainable_scope == "cond_cross_attn":
+        accelerator.print("Effective trainability: MorphFlow conditioning modules + selected TRELLIS cross-attention modules")
+    else:
+        accelerator.print("Effective trainability: full model")
+    if args.flow_target == "slat":
+        accelerator.print(f"SLat t schedule: {args.slat_t_schedule}")
+        if args.slat_t_schedule == "logit_normal":
+            accelerator.print(
+                f"SLat logit-normal t args: mean={args.slat_t_logit_mean} std={args.slat_t_logit_std}"
+            )
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
         accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")
@@ -1075,6 +1130,9 @@ def train(args):
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     if args.use_lora == 1:
         accelerator.print(f"LoRA attention scope: {args.lora_attention_scope}")
+    if args.use_lora == 1 or args.trainable_scope == "cond_cross_attn":
+        accelerator.print(f"Train flow alpha embedder: {args.train_flow_alpha_embedder == 1}")
+        accelerator.print(f"Train flow alpha gate: {args.train_flow_alpha_gate == 1}")
     accelerator.print(f"Condition LR: {cond_lr}")
     if args.use_lora == 1:
         lora_lr = args.lr if args.lora_lr is None else args.lora_lr
@@ -1092,7 +1150,8 @@ def train(args):
         )
     for idx, group in enumerate(optimizer.param_groups):
         group_name = group.get("name", f"group_{idx}")
-        accelerator.print(f"Optimizer LR [{idx}] {group_name}: {group['lr']}")
+        group_param_count = sum(p.numel() for p in group["params"])
+        accelerator.print(f"Optimizer LR [{idx}] {group_name}: {group['lr']} params={group_param_count}")
     accelerator.print(f"Weight decay: {args.weight_decay}")
     accelerator.print(f"Grad clip: {args.grad_clip}")
     accelerator.print(f"Checkpoint every: {args.checkpoint_every}")
