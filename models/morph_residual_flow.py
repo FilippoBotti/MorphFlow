@@ -36,6 +36,9 @@ class MorphResidualSSFlow(MorphFlow):
         residual_endpoint_prob=0.0,
         residual_endpoint_weight=1.0,
         residual_endpoint_max_items=1,
+        t_schedule="logit_normal",
+        t_logit_mean=0.0,
+        t_logit_std=1.0,
     ):
         super().__init__(
             sigma_min=sigma_min,
@@ -44,6 +47,9 @@ class MorphResidualSSFlow(MorphFlow):
             use_checkpoint=use_checkpoint,
             separate_cond_gate=separate_cond_gate,
             cond_resample_tokens=cond_resample_tokens,
+            t_schedule=t_schedule,
+            t_logit_mean=t_logit_mean,
+            t_logit_std=t_logit_std,
         )
         if residual_interp_gate not in ("none", "alpha"):
             raise ValueError(
@@ -164,7 +170,7 @@ class MorphResidualSSFlow(MorphFlow):
 
         B = x_0.shape[0]
         x_0 = self.ss_to_residual(x_0, src1_ss_latent, src2_ss_latent, alpha)
-        t = torch.rand(B, device=x_0.device, dtype=torch.float32)
+        t = self.sample_t(B, x_0.device)
         x_t, noise = self.diffuse(x_0, t)
 
         velocity = self.get_v(x_0, noise)
@@ -219,7 +225,7 @@ class MorphResidualSSFlow(MorphFlow):
         target_ss = torch.where(endpoint_is_src1.view(view_shape), src_1_ss_latent, src_2_ss_latent)
         target_residual = self.ss_to_residual(target_ss, src_1_ss_latent, src_2_ss_latent, alpha)
 
-        t = torch.rand(B, device=target_residual.device, dtype=torch.float32)
+        t = self.sample_t(B, target_residual.device)
         x_t, _ = self.diffuse(target_residual, t)
         pred_velocity = self.forward_flow(
             x_t,
@@ -268,7 +274,7 @@ class MorphResidualSSFlow(MorphFlow):
 
         # At alpha=0/1, target_ss == interpolation_base, so the residual target is exactly zero.
         target_residual = torch.zeros_like(src_1_ss_latent)
-        t = torch.rand(B, device=target_residual.device, dtype=torch.float32)
+        t = self.sample_t(B, target_residual.device)
         x_t, noise = self.diffuse(target_residual, t)
         velocity = self.get_v(target_residual, noise)
 

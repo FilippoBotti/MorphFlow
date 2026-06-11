@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import inspect
 import json
 import os
@@ -24,11 +25,7 @@ def build_parser():
     parser = argparse.ArgumentParser()
 
     # Dataset
-    parser.add_argument(
-        "--root_dir",
-        type=str,
-        default=os.environ.get("ROOT_DIR", "/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v2"),
-    )
+    parser.add_argument("--root_dir", type=str, default=os.environ.get("ROOT_DIR", "/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v2"))
     parser.add_argument("--metadata", type=str, default=os.environ.get("METADATA", "metadata_train.json"))
     parser.add_argument("--val_metadata", type=str, default=os.environ.get("VAL_METADATA", "metadata_val.json"))
     parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1)
@@ -45,34 +42,15 @@ def build_parser():
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
-    parser.add_argument(
-        "--checkpoint_every",
-        type=int,
-        default=10,
-        help="Save a regular epoch checkpoint every N epochs. Use 0 to disable.",
-    )
+    parser.add_argument("--checkpoint_every", type=int, default=10, help="Save a regular epoch checkpoint every N epochs. Use 0 to disable.")
 
     # Learning rates
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--cond_lr", type=float, default=None)
-    parser.add_argument(
-        "--flow_lr",
-        type=float,
-        default=None,
-        help=(
-            "LR for TRELLIS sparse_structure_flow. "
-            "If omitted, defaults to 1e-5 for image_large full fine-tuning, otherwise --lr."
-        ),
-    )
+    parser.add_argument("--flow_lr", type=float, default=None, help="LR for TRELLIS flow. If omitted, defaults to 1e-5 for image_large full fine-tuning, otherwise --lr.")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        choices=["cosine", "plateau"],
-        default="cosine",
-        help="cosine: step every batch. plateau: warm up, then ReduceLROnPlateau on validation loss.",
-    )
+    parser.add_argument("--lr_scheduler", type=str, choices=["cosine", "plateau"], default="cosine", help="cosine steps every batch; plateau warms up then uses validation loss.")
     parser.add_argument("--plateau_factor", type=float, default=0.5)
     parser.add_argument("--plateau_patience", type=int, default=3)
     parser.add_argument("--plateau_threshold", type=float, default=1e-4)
@@ -81,58 +59,15 @@ def build_parser():
 
     # Model
     parser.add_argument("--trellis_model", type=str, choices=["text_base", "image_large"], default="text_base")
-    parser.add_argument(
-        "--flow_target",
-        type=str,
-        choices=["ss", "slat"],
-        default="ss",
-        help="Train the sparse-structure flow or the structured-latent flow.",
-    )
-    parser.add_argument(
-        "--ss_flow_arch",
-        type=str,
-        choices=["standard", "residual_interp"],
-        default="standard",
-        help="SS flow architecture. residual_interp trains the flow in residual space over lerp(src1_ss, src2_ss, alpha).",
-    )
-    parser.add_argument(
-        "--residual_interp_gate",
-        type=str,
-        choices=["none", "alpha"],
-        default="alpha",
-        help="For residual_interp: none uses target=base+residual; alpha uses target=base+alpha*(1-alpha)*residual.",
-    )
-    parser.add_argument(
-        "--residual_interp_gate_min",
-        type=float,
-        default=1e-3,
-        help="For residual_interp alpha gate: minimum divisor used while mapping target SS to residual space.",
-    )
-    parser.add_argument(
-        "--residual_endpoint_prob",
-        type=float,
-        default=0.0,
-        help="For residual_interp: probability of adding an auxiliary alpha=0/1 residual flow-matching batch.",
-    )
-    parser.add_argument(
-        "--residual_endpoint_weight",
-        type=float,
-        default=1.0,
-        help="For residual_interp: weight of the auxiliary alpha=0/1 residual flow-matching loss when active.",
-    )
-    parser.add_argument(
-        "--residual_endpoint_max_items",
-        type=int,
-        default=1,
-        help="For residual_interp: max batch items used by the auxiliary endpoint loss per GPU. Use 0 for full batch.",
-    )
+    parser.add_argument("--flow_target", type=str, choices=["ss", "slat"], default="ss", help="Train sparse-structure flow or structured-latent flow.")
+    parser.add_argument("--ss_flow_arch", type=str, choices=["standard", "residual_interp"], default="standard", help="SS flow architecture.")
+    parser.add_argument("--residual_interp_gate", type=str, choices=["none", "alpha"], default="alpha", help="For residual_interp: residual gating mode.")
+    parser.add_argument("--residual_interp_gate_min", type=float, default=1e-3, help="Minimum divisor used while mapping target SS to residual space.")
+    parser.add_argument("--residual_endpoint_prob", type=float, default=0.0, help="Probability of auxiliary alpha=0/1 residual flow-matching batch.")
+    parser.add_argument("--residual_endpoint_weight", type=float, default=1.0, help="Weight of auxiliary alpha=0/1 residual flow-matching loss.")
+    parser.add_argument("--residual_endpoint_max_items", type=int, default=1, help="Max endpoint-loss batch items per GPU. Use 0 for full batch.")
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0)
-    parser.add_argument(
-        "--separate_cond_gate",
-        type=str,
-        choices=["alpha_residual", "pair_channel", "token"],
-        default="alpha_residual",
-    )
+    parser.add_argument("--separate_cond_gate", type=str, choices=["alpha_residual", "pair_channel", "token"], default="alpha_residual")
     parser.add_argument("--cfg_drop_prob", type=float, default=0.0)
 
     # Optional future architecture args.
@@ -140,56 +75,25 @@ def build_parser():
     parser.add_argument("--cond_resample_tokens", type=int, default=0)
     parser.add_argument("--cond_resample_depth", type=int, default=1)
     parser.add_argument("--cond_resample_heads", type=int, default=8)
-    parser.add_argument(
-        "--slat_t_schedule",
-        type=str,
-        choices=["uniform", "logit_normal"],
-        default="logit_normal",
-        help="SLat flow timestep sampling. TRELLIS official flow training uses logit_normal.",
-    )
-    parser.add_argument("--slat_t_logit_mean", type=float, default=0.0)
-    parser.add_argument("--slat_t_logit_std", type=float, default=1.0)
+    parser.add_argument("--t_schedule", type=str, choices=["uniform", "logit_normal"], default="logit_normal", help="Flow timestep sampling. TRELLIS official flow training uses logit_normal.")
+    parser.add_argument("--t_logit_mean", type=float, default=0.0)
+    parser.add_argument("--t_logit_std", type=float, default=1.0)
 
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
     parser.add_argument("--endpoint_loss_weight", type=float, default=0.0)
-    parser.add_argument(
-        "--endpoint_loss_prob",
-        type=float,
-        default=0.25,
-        help="Probability of adding an alpha=0/1 endpoint flow-matching batch when endpoint loss is enabled.",
-    )
+    parser.add_argument("--endpoint_loss_prob", type=float, default=0.25, help="Probability of adding an alpha=0/1 endpoint flow-matching batch when endpoint loss is enabled.")
     parser.add_argument("--symmetry_loss_weight", type=float, default=0.0)
-    parser.add_argument(
-        "--symmetry_loss_prob",
-        type=float,
-        default=1.0,
-        help="Probability of adding src1/src2 alpha == src2/src1 1-alpha consistency when symmetry loss is enabled.",
-    )
+    parser.add_argument("--symmetry_loss_prob", type=float, default=1.0, help="Probability of adding src1/src2 alpha == src2/src1 1-alpha consistency when symmetry loss is enabled.")
 
     # Precision / memory
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        choices=["auto", "no", "fp16", "bf16"],
-        default="auto",
-    )
+    parser.add_argument("--mixed_precision", type=str, choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--allow_tf32", type=int, choices=[0, 1], default=1)
     parser.add_argument("--use_checkpoint", type=int, choices=[0, 1], default=0)
 
     # Checkpoint loading modes
-    parser.add_argument(
-        "--resume_from",
-        type=str,
-        default=None,
-        help="True resume: same architecture, restores model + optimizer + scheduler + epoch/step.",
-    )
-    parser.add_argument(
-        "--init_from",
-        type=str,
-        default=None,
-        help="Model-only initialization. Use when changing architecture, e.g. alpha_residual -> token.",
-    )
+    parser.add_argument("--resume_from", type=str, default=None, help="True resume: same architecture, restores model + optimizer + scheduler + epoch/step.")
+    parser.add_argument("--init_from", type=str, default=None, help="Model-only initialization. Use when changing architecture, e.g. alpha_residual -> token.")
     parser.add_argument("--resume_strict", type=int, choices=[0, 1], default=1)
     parser.add_argument("--init_strict", type=int, choices=[0, 1], default=0)
     parser.add_argument("--resume_optimizer", type=int, choices=[0, 1], default=1)
@@ -202,45 +106,11 @@ def build_parser():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str, default="to_q,to_kv")
-    parser.add_argument(
-        "--lora_attention_scope",
-        type=str,
-        choices=["all", "cross"],
-        default="all",
-        help="all preserves the legacy *_attn selection; cross only targets cross_attn/cross_attn2.",
-    )
-    parser.add_argument(
-        "--trainable_scope",
-        type=str,
-        choices=["full", "cond_cross_attn"],
-        default="full",
-        help=(
-            "Which non-LoRA parameters to train. full trains the whole model. "
-            "cond_cross_attn trains MorphFlow conditioning modules plus TRELLIS "
-            "cross-attention parameters, freezing the rest of the flow. "
-            "Alpha adapters are controlled separately by --train_flow_alpha_*."
-        ),
-    )
-    parser.add_argument(
-        "--train_flow_alpha_embedder",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help=(
-            "Train the TRELLIS flow alpha timestep embedder in LoRA or cond_cross_attn modes. "
-            "Set 0 for a strict conditioning/cross-attention diagnostic."
-        ),
-    )
-    parser.add_argument(
-        "--train_flow_alpha_gate",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help=(
-            "Train the separate-condition alpha gates inside TRELLIS flow blocks in LoRA or "
-            "cond_cross_attn modes. Set 0 for a strict conditioning/cross-attention diagnostic."
-        ),
-    )
+    parser.add_argument("--lora_attention_scope", type=str, choices=["all", "cross"], default="all", help="all preserves the legacy *_attn selection; cross only targets cross_attn/cross_attn2.")
+    parser.add_argument("--trainable_scope", type=str, choices=["full", "cond_cross_attn"], default="full", help="full trains the whole model. cond_cross_attn trains conditioning modules plus TRELLIS cross-attention parameters.")
+    parser.add_argument("--freeze_modules", type=str, default="", help="Comma-separated modules/patterns to freeze after trainability setup. Aliases: condition, flow, flow_cross_attn, flow_self_attn, flow_mlp, flow_norm, alpha, alpha_embedder, alpha_gate, lora, null_cond.")
+    parser.add_argument("--train_flow_alpha_embedder", type=int, choices=[0, 1], default=0, help="Train the TRELLIS flow alpha timestep embedder in LoRA or cond_cross_attn modes.")
+    parser.add_argument("--train_flow_alpha_gate", type=int, choices=[0, 1], default=0, help="Train separate-condition alpha gates inside TRELLIS flow blocks in LoRA or cond_cross_attn modes.")
     parser.add_argument("--use_ema", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--val_examples", type=int, default=0)
@@ -386,15 +256,10 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "residual_endpoint_prob": args.residual_endpoint_prob,
         "residual_endpoint_weight": args.residual_endpoint_weight,
         "residual_endpoint_max_items": args.residual_endpoint_max_items,
+        "t_schedule": args.t_schedule,
+        "t_logit_mean": args.t_logit_mean,
+        "t_logit_std": args.t_logit_std,
     }
-    if args.flow_target == "slat":
-        requested_kwargs.update(
-            {
-                "t_schedule": args.slat_t_schedule,
-                "t_logit_mean": args.slat_t_logit_mean,
-                "t_logit_std": args.slat_t_logit_std,
-            }
-        )
 
     signature = inspect.signature(model_cls.__init__)
     supported = set(signature.parameters.keys())
@@ -520,6 +385,90 @@ def compute_loss(
     )
 
 
+FREEZE_MODULE_ALIASES = {
+    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
+    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
+    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
+    "cond_encoder": ["cond_encoder*"],
+    "cond_fusion": ["cond_fusion*"],
+    "separate_cond_proj": ["separate_cond_proj*"],
+    "cond_resampler": ["cond_resampler*"],
+    "null_cond": ["null_cond"],
+    "flow": ["sparse_structure_flow*", "slat_flow*"],
+    "cross_attn": ["*.cross_attn*", "*.cross_attn2*"],
+    "self_attn": ["*.self_attn*"],
+    "mlp": ["*.mlp*"],
+    "norm": ["*.norm*"],
+    "flow_cross_attn": ["sparse_structure_flow*.cross_attn*", "sparse_structure_flow*.cross_attn2*", "slat_flow*.cross_attn*", "slat_flow*.cross_attn2*"],
+    "flow_self_attn": ["sparse_structure_flow*.self_attn*", "slat_flow*.self_attn*"],
+    "flow_mlp": ["sparse_structure_flow*.mlp*", "slat_flow*.mlp*"],
+    "flow_norm": ["sparse_structure_flow*.norm*", "slat_flow*.norm*"],
+    "alpha": ["*.alpha_embedder*", "*.alpha_gate*"],
+    "alpha_embedder": ["*.alpha_embedder*"],
+    "alpha_gate": ["*.alpha_gate*"],
+    "lora": ["*.lora_A*", "*.lora_B*"],
+}
+
+
+def parse_freeze_modules(raw: str) -> List[str]:
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if len(items) == 1 and items[0].lower() in {"none", "false", "0", "no"}:
+        return []
+    return items
+
+
+def freeze_patterns_for_item(item: str) -> List[str]:
+    return FREEZE_MODULE_ALIASES.get(item.lower(), [item])
+
+
+def matches_freeze_pattern(name: str, pattern: str) -> bool:
+    if any(char in pattern for char in "*?[]"):
+        return fnmatch.fnmatchcase(name, pattern)
+    return (
+        name == pattern
+        or name.startswith(pattern + ".")
+        or fnmatch.fnmatchcase(name, "*." + pattern)
+        or fnmatch.fnmatchcase(name, "*." + pattern + ".*")
+    )
+
+
+def apply_freeze_modules(model: torch.nn.Module, args, accelerator: Accelerator):
+    items = parse_freeze_modules(args.freeze_modules)
+    if not items:
+        return
+
+    named_params = list(model.named_parameters())
+    patterns = []
+    unmatched_items = []
+    for item in items:
+        item_patterns = freeze_patterns_for_item(item)
+        patterns.extend(item_patterns)
+        if not any(any(matches_freeze_pattern(name, pattern) for pattern in item_patterns) for name, _ in named_params):
+            unmatched_items.append(item)
+
+    matched_tensors = 0
+    matched_params = 0
+    newly_frozen_tensors = 0
+    newly_frozen_params = 0
+    for name, param in named_params:
+        if not any(matches_freeze_pattern(name, pattern) for pattern in patterns):
+            continue
+        matched_tensors += 1
+        matched_params += param.numel()
+        if param.requires_grad:
+            newly_frozen_tensors += 1
+            newly_frozen_params += param.numel()
+        param.requires_grad = False
+
+    accelerator.print(
+        "Freeze modules: "
+        f"items={items} | matched_tensors={matched_tensors} matched_params={matched_params} | "
+        f"newly_frozen_tensors={newly_frozen_tensors} newly_frozen_params={newly_frozen_params}"
+    )
+    if unmatched_items:
+        accelerator.print(f"WARNING: --freeze_modules entries did not match any parameter: {unmatched_items}")
+
+
 def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
     if args.use_lora == 1:
         if args.trainable_scope != "full":
@@ -617,6 +566,8 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         model.null_cond.requires_grad = False
     elif hasattr(model, "null_cond"):
         model.null_cond.requires_grad = True
+
+    apply_freeze_modules(model, args, accelerator)
 
 
 def get_flow_module(model: torch.nn.Module) -> Optional[torch.nn.Module]:
@@ -897,8 +848,8 @@ def train(args):
         raise ValueError(f"--checkpoint_every must be >= 0, got {args.checkpoint_every}")
     if args.residual_interp_gate_min <= 0.0:
         raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
-    if args.slat_t_logit_std <= 0.0:
-        raise ValueError(f"--slat_t_logit_std must be > 0, got {args.slat_t_logit_std}")
+    if args.t_logit_std <= 0.0:
+        raise ValueError(f"--t_logit_std must be > 0, got {args.t_logit_std}")
 
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
@@ -1106,18 +1057,16 @@ def train(args):
     accelerator.print(f"Flow target: {args.flow_target}")
     accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
     accelerator.print(f"Trainable scope: {args.trainable_scope}")
+    accelerator.print(f"Freeze modules: {args.freeze_modules or '<none>'}")
     if args.use_lora == 1:
         accelerator.print("Effective trainability: LoRA adapters + MorphFlow conditioning modules")
     elif args.trainable_scope == "cond_cross_attn":
         accelerator.print("Effective trainability: MorphFlow conditioning modules + selected TRELLIS cross-attention modules")
     else:
         accelerator.print("Effective trainability: full model")
-    if args.flow_target == "slat":
-        accelerator.print(f"SLat t schedule: {args.slat_t_schedule}")
-        if args.slat_t_schedule == "logit_normal":
-            accelerator.print(
-                f"SLat logit-normal t args: mean={args.slat_t_logit_mean} std={args.slat_t_logit_std}"
-            )
+    accelerator.print(f"Flow t schedule: {args.t_schedule}")
+    if args.t_schedule == "logit_normal":
+        accelerator.print(f"Flow logit-normal t args: mean={args.t_logit_mean} std={args.t_logit_std}")
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
         accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")

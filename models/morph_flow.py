@@ -14,12 +14,23 @@ class MorphFlow(nn.Module):
         use_checkpoint=False,
         separate_cond_gate="alpha_residual",
         cond_resample_tokens=0,
+        t_schedule="logit_normal",
+        t_logit_mean=0.0,
+        t_logit_std=1.0,
     ):
         super().__init__()
         
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.cond_resample_tokens = cond_resample_tokens
+        self.t_schedule = t_schedule
+        self.t_logit_mean = t_logit_mean
+        self.t_logit_std = t_logit_std
+
+        if self.t_schedule not in ("uniform", "logit_normal"):
+            raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
+        if self.t_logit_std <= 0.0:
+            raise ValueError(f"t_logit_std must be > 0, got {self.t_logit_std}")
 
         if model_type == "text_base":
             model_channels = 768
@@ -76,6 +87,12 @@ class MorphFlow(nn.Module):
         x_t = (1 - t) * x_0 + (self.sigma_min + (1 - self.sigma_min) * t) * noise
 
         return x_t, noise
+
+    def sample_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self.t_schedule == "uniform":
+            return torch.rand(batch_size, device=device, dtype=torch.float32)
+        noise = torch.randn(batch_size, device=device, dtype=torch.float32)
+        return torch.sigmoid(noise * self.t_logit_std + self.t_logit_mean)
     
     def forward_flow(
         self,
@@ -177,7 +194,7 @@ class MorphFlow(nn.Module):
     ):
         B = x_0.shape[0]
         x_0 = self._prepare_ss_latent(x_0)
-        t = torch.rand(B).to(x_0.device).float()
+        t = self.sample_t(B, x_0.device)
         x_t, noise = self.diffuse(x_0, t)
 
         velocity = self.get_v(x_0, noise)
@@ -222,7 +239,7 @@ class MorphFlow(nn.Module):
         view_shape = (B,) + (1,) * (src_1_ss_latent.ndim - 1)
         target_x0 = torch.where(endpoint_is_src1.view(view_shape), src_1_ss_latent, src_2_ss_latent)
 
-        t = torch.rand(B, device=target_x0.device, dtype=torch.float32)
+        t = self.sample_t(B, target_x0.device)
         x_t, _ = self.diffuse(target_x0, t)
         pred_velocity = self.forward_flow(
             x_t,

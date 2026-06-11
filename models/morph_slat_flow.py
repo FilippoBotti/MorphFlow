@@ -69,6 +69,8 @@ class MorphSLatFlow(nn.Module):
 
         if self.t_schedule not in ("uniform", "logit_normal"):
             raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
+        if self.t_logit_std <= 0.0:
+            raise ValueError(f"t_logit_std must be > 0, got {self.t_logit_std}")
 
         if model_type == "text_base":
             model_channels = 768

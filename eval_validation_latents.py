@@ -38,11 +38,19 @@ def parse_args():
     parser.add_argument("--root_dir", type=str, default=str(DEFAULT_DATASET))
     parser.add_argument("--metadata", type=str, default="metadata_test.json")
     parser.add_argument("--checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT))
+    parser.add_argument(
+        "--slat_checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional second-flow SLat checkpoint. When set, --checkpoint_path must be an SS checkpoint.",
+    )
     parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT))
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--slat_steps", type=int, default=None)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--slat_cfg_scale", type=float, default=None)
     parser.add_argument("--trellis_model", type=str, choices=["auto", "text_base", "image_large"], default="auto")
     parser.add_argument("--mixed_precision", type=str, choices=["no", "fp16", "bf16"], default="bf16")
     parser.add_argument("--allow_tf32", type=int, choices=[0, 1], default=1)
@@ -121,6 +129,9 @@ def build_model(ckpt, model_type, flow_target):
         "residual_endpoint_prob": float(args.get("residual_endpoint_prob", 0.0)),
         "residual_endpoint_weight": float(args.get("residual_endpoint_weight", 1.0)),
         "residual_endpoint_max_items": int(args.get("residual_endpoint_max_items", 1)),
+        "t_schedule": args.get("t_schedule", args.get("slat_t_schedule", "logit_normal")),
+        "t_logit_mean": float(args.get("t_logit_mean", args.get("slat_t_logit_mean", 0.0))),
+        "t_logit_std": float(args.get("t_logit_std", args.get("slat_t_logit_std", 1.0))),
     }
 
     supported = set(inspect.signature(model_cls.__init__).parameters)
@@ -245,6 +256,47 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
     return model.denormalize_slat(x_t), x_t, x0
 
 
+@torch.no_grad()
+def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_precision):
+    coords = ensure_batch_coords(coords).to(device=device, dtype=torch.int32)
+    if coords.numel() == 0:
+        return None
+    coords = coords.clone()
+    coords[:, 0] = 0
+
+    in_channels = int(getattr(model.slat_flow, "in_channels", 8))
+    noise_feats = torch.randn(coords.shape[0], in_channels, device=device, dtype=torch.float32)
+    x_t = model.make_slat(noise_feats, coords)
+
+    src1_feats = batch["src1_feats"].to(device=device, dtype=torch.float32)
+    src2_feats = batch["src2_feats"].to(device=device, dtype=torch.float32)
+    src1_coords = batch["src1_coords"].to(device=device, dtype=torch.int32)
+    src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32)
+    alpha = batch["alpha"].reshape(1).to(device=device, dtype=torch.float32)
+    t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+
+    for i in range(steps):
+        t = torch.full((1,), float(t_seq[i].item()), device=device)
+        dt = t_seq[i] - t_seq[i + 1]
+        with autocast_context(device, mixed_precision):
+            if cfg_scale == 1.0:
+                pred = model.forward_flow(x_t, t, src1_feats, src2_feats, src1_coords, src2_coords, alpha)
+            else:
+                pred = model.forward_flow_cfg(
+                    x_t,
+                    t,
+                    src1_feats,
+                    src2_feats,
+                    src1_coords,
+                    src2_coords,
+                    alpha,
+                    guidance_scale=cfg_scale,
+                )
+        x_t = x_t - dt * pred.float()
+
+    return model.denormalize_slat(x_t)
+
+
 def ensure_batch_coords(coords):
     if coords.shape[-1] == 4:
         return coords
@@ -315,7 +367,7 @@ def save_slat_glb(
 
 
 @torch.no_grad()
-def ss_logits(ss_decoder, latent, device, mixed_precision):
+def ss_logits_raw(ss_decoder, latent, device, mixed_precision):
     latent = latent.to(device=device, dtype=torch.float32)
     if latent.ndim == 6:
         latent = latent.squeeze(1)
@@ -323,12 +375,35 @@ def ss_logits(ss_decoder, latent, device, mixed_precision):
         logits = ss_decoder(latent)
     if isinstance(logits, (list, tuple)):
         logits = logits[0]
-    logits = logits.float()
+    return logits.float()
+
+
+@torch.no_grad()
+def ss_logits(ss_decoder, latent, device, mixed_precision):
+    logits = ss_logits_raw(ss_decoder, latent, device, mixed_precision)
     if logits.ndim == 5:
         logits = logits[0]
     if logits.ndim == 4:
         logits = logits[0]
     return logits
+
+
+@torch.no_grad()
+def ss_coords_from_latent(ss_decoder, latent, device, mixed_precision, threshold=0.0):
+    logits = ss_logits_raw(ss_decoder, latent, device, mixed_precision)
+    coords = torch.argwhere(logits > threshold)
+    if coords.numel() == 0:
+        return torch.empty((0, 4), device=device, dtype=torch.int32)
+    if coords.shape[1] == 5:
+        coords = coords[:, [0, 2, 3, 4]]
+    elif coords.shape[1] == 4:
+        coords = coords[:, [0, 1, 2, 3]]
+    elif coords.shape[1] == 3:
+        batch = torch.zeros((coords.shape[0], 1), device=coords.device, dtype=coords.dtype)
+        coords = torch.cat([batch, coords], dim=1)
+    else:
+        raise ValueError(f"Unexpected SS decoder output rank for coords: logits shape={tuple(logits.shape)}")
+    return coords.int()
 
 
 def voxel_iou(pred_logits, target_logits):
@@ -385,6 +460,11 @@ def main():
     if not metadata_path.is_absolute():
         metadata_path = root / metadata_path
     checkpoint_path = Path(args.checkpoint_path).expanduser().resolve()
+    slat_checkpoint_path = (
+        Path(args.slat_checkpoint_path).expanduser().resolve()
+        if args.slat_checkpoint_path
+        else None
+    )
 
     if not root.is_dir():
         raise FileNotFoundError(f"Dataset root not found: {root}")
@@ -392,6 +472,8 @@ def main():
         raise FileNotFoundError(f"Metadata not found: {metadata_path}")
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if slat_checkpoint_path is not None and not slat_checkpoint_path.is_file():
+        raise FileNotFoundError(f"SLat checkpoint not found: {slat_checkpoint_path}")
 
     if args.allow_tf32 == 1 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -407,22 +489,51 @@ def main():
     ckpt = load_checkpoint(str(checkpoint_path))
     flow_target = detect_flow_target(ckpt)
     model_type = detect_model_type(ckpt, args.trellis_model)
+    slat_ckpt = load_checkpoint(str(slat_checkpoint_path)) if slat_checkpoint_path is not None else None
+    slat_model_type = detect_model_type(slat_ckpt, args.trellis_model) if slat_ckpt is not None else None
+    pipeline_mode = slat_ckpt is not None
+
+    if pipeline_mode:
+        if flow_target != "ss":
+            raise ValueError(
+                f"--slat_checkpoint_path requires --checkpoint_path to be an SS checkpoint, got {flow_target!r}."
+            )
+        slat_flow_target = detect_flow_target(slat_ckpt)
+        if slat_flow_target != "slat":
+            raise ValueError(f"--slat_checkpoint_path must point to a SLat checkpoint, got {slat_flow_target!r}.")
+    else:
+        slat_flow_target = None
 
     print("===== EVAL =====")
     print(f"dataset: {root}")
     print(f"metadata: {metadata_path}")
     print(f"checkpoint: {checkpoint_path}")
+    if pipeline_mode:
+        print(f"slat_checkpoint: {slat_checkpoint_path}")
     print(f"flow_target: {flow_target}")
+    if pipeline_mode:
+        print("pipeline: ss checkpoint -> SS decoder coords -> slat checkpoint -> mesh decoder")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"model_type: {model_type}")
+    if pipeline_mode:
+        print(f"slat_model_type: {slat_model_type}")
     print(f"cfg_scale: {args.cfg_scale}")
+    if pipeline_mode:
+        print(f"slat_cfg_scale: {args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale}")
     print(f"steps: {args.steps}")
+    if pipeline_mode:
+        print(f"slat_steps: {args.slat_steps if args.slat_steps is not None else args.steps}")
     print(f"output: {output_dir}")
     print("alpha: metadata alpha is passed unchanged as MorphFlow(src1, src2, alpha)")
     print("================")
 
     model = build_model(ckpt, model_type, flow_target).to(device).eval()
-    ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders(flow_target, device)
+    slat_model = (
+        build_model(slat_ckpt, slat_model_type, "slat").to(device).eval()
+        if pipeline_mode
+        else None
+    )
+    ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders("ss" if pipeline_mode else flow_target, device)
 
     dataset = MorphingDistillDataset(
         root=str(root),
@@ -531,17 +642,54 @@ def main():
                 args.mixed_precision,
                 color=(220, 120, 220),
             )
+            pred_coords = ss_coords_from_latent(ss_decoder, pred_ss, device, args.mixed_precision)
+            row["pred_ss_points"] = int(pred_coords.shape[0])
+
+            pred_final_slat = None
+            if slat_model is not None:
+                slat_steps = args.slat_steps if args.slat_steps is not None else args.steps
+                slat_cfg_scale = args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale
+                pred_final_slat = sample_slat_on_coords(
+                    slat_model,
+                    batch,
+                    pred_coords,
+                    slat_steps,
+                    device,
+                    slat_cfg_scale,
+                    args.mixed_precision,
+                )
+                if pred_final_slat is None:
+                    row["pred_final_saved"] = False
+                    row["pred_final_reason"] = "empty_ss_coords"
+                else:
+                    row["pred_final_saved"] = save_slat_glb(
+                        mesh_decoder,
+                        sparse_tensor_cls,
+                        pred_final_slat.feats,
+                        pred_final_slat.coords,
+                        sample_dir / "pred_final.glb",
+                        device,
+                        args.mixed_precision,
+                        fallback_color=(220, 120, 220),
+                    )
+                    row["pred_final_points"] = int(pred_final_slat.feats.shape[0])
 
             if args.save_latents == 1:
-                torch.save(
-                    {
-                        "flow_target": flow_target,
-                        "pred_ss_latent": pred_ss.detach().cpu(),
-                        "target_ss_latent": target_ss.detach().cpu(),
-                        "alpha": alpha,
-                    },
-                    sample_dir / "latents.pt",
-                )
+                payload = {
+                    "flow_target": flow_target,
+                    "pred_ss_latent": pred_ss.detach().cpu(),
+                    "target_ss_latent": target_ss.detach().cpu(),
+                    "pred_ss_coords": pred_coords.detach().cpu(),
+                    "alpha": alpha,
+                }
+                if pred_final_slat is not None:
+                    payload.update(
+                        {
+                            "pred_final_slat_feats": pred_final_slat.feats.detach().cpu(),
+                            "pred_final_slat_coords": pred_final_slat.coords.detach().cpu(),
+                        }
+                    )
+                torch.save(payload, sample_dir / "latents.pt")
 
         else:
             pred_slat, pred_slat_norm, target_slat_norm = sample_slat(
@@ -588,16 +736,30 @@ def main():
         "dataset": str(root),
         "metadata": str(metadata_path),
         "checkpoint": str(checkpoint_path),
+        "slat_checkpoint": str(slat_checkpoint_path) if slat_checkpoint_path is not None else None,
+        "pipeline_mode": pipeline_mode,
         "flow_target": flow_target,
         "model_type": model_type,
+        "slat_model_type": slat_model_type,
         "cfg_scale": args.cfg_scale,
+        "slat_cfg_scale": args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale,
         "steps": args.steps,
+        "slat_steps": args.slat_steps if args.slat_steps is not None else args.steps,
         "seed": args.seed,
         "selected": selected,
         "metrics": metrics,
     }
 
-    for key in ("latent_mse", "latent_l1", "voxel_iou", "slat_feat_mse", "slat_feat_l1", "slat_norm_feat_mse"):
+    for key in (
+        "latent_mse",
+        "latent_l1",
+        "voxel_iou",
+        "pred_ss_points",
+        "pred_final_points",
+        "slat_feat_mse",
+        "slat_feat_l1",
+        "slat_norm_feat_mse",
+    ):
         values = [float(row[key]) for row in metrics if key in row]
         if values:
             summary[f"mean_{key}"] = float(np.mean(values))
