@@ -52,10 +52,40 @@ def parse_args():
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--slat_cfg_scale", type=float, default=None)
     parser.add_argument("--trellis_model", type=str, choices=["auto", "text_base", "image_large"], default="auto")
-    parser.add_argument("--mixed_precision", type=str, choices=["no", "fp16", "bf16"], default="bf16")
+    parser.add_argument("--mixed_precision", type=str, choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--allow_tf32", type=int, choices=[0, 1], default=1)
     parser.add_argument("--save_latents", type=int, choices=[0, 1], default=1)
     return parser.parse_args()
+
+
+def resolve_mixed_precision(mode: str, device: torch.device) -> str:
+    mode = mode.lower()
+    if mode == "auto":
+        if device.type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                mode = "bf16"
+            else:
+                mode = "fp16"
+        else:
+            mode = "no"
+
+    if mode == "bf16" and device.type == "cuda":
+        if not torch.cuda.is_bf16_supported():
+            print("WARNING: BF16 is not supported on this GPU; falling back to fp16.")
+            mode = "fp16"
+        else:
+            prop = torch.cuda.get_device_properties(device)
+            if prop.major < 8:
+                print(
+                    f"WARNING: BF16 with xformers is only supported on A100+ GPUs; "
+                    f"device compute capability is {prop.major}.{prop.minor}. Falling back to fp16."
+                )
+                mode = "fp16"
+
+    if mode == "fp16" and device.type != "cuda":
+        mode = "no"
+
+    return mode
 
 
 def safe_slug(value, max_len=80):
@@ -532,6 +562,9 @@ def main():
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.mixed_precision = resolve_mixed_precision(args.mixed_precision, device)
+    print(f"Resolved mixed_precision: {args.mixed_precision}")
+
     output_dir = Path(args.output_dir).expanduser().resolve() / datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
