@@ -348,8 +348,10 @@ def save_slat_glb(
     coords = ensure_batch_coords(coords).to(device=device, dtype=torch.int32)
     st = sparse_tensor_cls(feats=feats, coords=coords)
 
-    with autocast_context(device, mixed_precision):
-        decoded = mesh_decoder(st)[0]
+    # TRELLIS mesh extraction allocates several float32 work buffers internally
+    # and expects attrs to match them. Keep this export path in fp32 even when
+    # the flow sampling itself uses bf16/fp16 autocast.
+    decoded = mesh_decoder(st)[0]
 
     if not getattr(decoded, "success", False):
         return False
@@ -483,6 +485,8 @@ def load_decoders(flow_target, device):
     mesh_decoder = trellis_from_pretrained(
         "microsoft/TRELLIS-image-large/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16"
     ).to(device).eval()
+    if hasattr(mesh_decoder, "convert_to_fp32"):
+        mesh_decoder.convert_to_fp32()
 
     ss_decoder = None
     if flow_target == "ss":
