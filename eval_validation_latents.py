@@ -435,6 +435,7 @@ def save_voxel_glb(ss_decoder, latent, path, device, mixed_precision, color=(150
 
 def patch_trellis_mesh_dtype():
     """Keep TRELLIS mesh extraction buffers in the same dtype as decoder attrs."""
+    import trellis.representations.mesh.cube2mesh as cube2mesh
     import trellis.representations.mesh.utils_cube as utils_cube
 
     def cubes_to_verts(num_verts, cubes, value, reduce="mean"):
@@ -454,7 +455,22 @@ def patch_trellis_mesh_dtype():
             include_self=False,
         )
 
+    def get_dense_attrs(coords, feats, res, sdf_init=True):
+        channels = feats.shape[-1]
+        dense_attrs = torch.zeros(
+            [res] * 3 + [channels],
+            device=feats.device,
+            dtype=feats.dtype,
+        )
+        if sdf_init:
+            dense_attrs[..., 0] = 1
+        dense_attrs[coords[:, 0], coords[:, 1], coords[:, 2], :] = feats
+        return dense_attrs.reshape(-1, channels)
+
     utils_cube.cubes_to_verts = cubes_to_verts
+    utils_cube.get_dense_attrs = get_dense_attrs
+    cube2mesh.cubes_to_verts = cubes_to_verts
+    cube2mesh.get_dense_attrs = get_dense_attrs
 
 
 def load_decoders(flow_target, device):
