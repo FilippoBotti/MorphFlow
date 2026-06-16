@@ -487,6 +487,9 @@ def load_decoders(flow_target, device):
     ).to(device).eval()
     if hasattr(mesh_decoder, "convert_to_fp32"):
         mesh_decoder.convert_to_fp32()
+    mesh_decoder.float()
+    if hasattr(mesh_decoder, "dtype"):
+        mesh_decoder.dtype = torch.float32
 
     ss_decoder = None
     if flow_target == "ss":
