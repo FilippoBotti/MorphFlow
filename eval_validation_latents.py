@@ -433,9 +433,35 @@ def save_voxel_glb(ss_decoder, latent, path, device, mixed_precision, color=(150
     }
 
 
+def patch_trellis_mesh_dtype():
+    """Keep TRELLIS mesh extraction buffers in the same dtype as decoder attrs."""
+    import trellis.representations.mesh.utils_cube as utils_cube
+
+    def cubes_to_verts(num_verts, cubes, value, reduce="mean"):
+        channels = value.shape[2]
+        reduced = torch.zeros(
+            num_verts,
+            channels,
+            device=cubes.device,
+            dtype=value.dtype,
+        )
+        return torch.scatter_reduce(
+            reduced,
+            0,
+            cubes.unsqueeze(-1).expand(-1, -1, channels).flatten(0, 1),
+            value.flatten(0, 1),
+            reduce=reduce,
+            include_self=False,
+        )
+
+    utils_cube.cubes_to_verts = cubes_to_verts
+
+
 def load_decoders(flow_target, device):
     from trellis.models import from_pretrained as trellis_from_pretrained
     from trellis.modules.sparse.basic import SparseTensor
+
+    patch_trellis_mesh_dtype()
 
     print("Loading TRELLIS SLAT mesh decoder...")
     mesh_decoder = trellis_from_pretrained(
