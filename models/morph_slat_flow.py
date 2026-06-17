@@ -267,6 +267,17 @@ class MorphSLatFlow(nn.Module):
         v_uncond = self.slat_flow(x_t, t_flow, null_cond, alpha=alpha)
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 
+    @staticmethod
+    def batch_mean_mse(pred: sp.SparseTensor, target: sp.SparseTensor) -> torch.Tensor:
+        if pred.shape[0] <= 1:
+            return F.mse_loss(pred.feats, target.feats)
+        return torch.stack(
+            [
+                F.mse_loss(pred.feats[pred.layout[i]], target.feats[target.layout[i]])
+                for i in range(pred.shape[0])
+            ]
+        ).mean()
+
     def forward(
         self,
         target_feats: torch.Tensor,
@@ -295,4 +306,4 @@ class MorphSLatFlow(nn.Module):
             alpha,
         )
 
-        return F.mse_loss(pred.feats, velocity.feats)
+        return self.batch_mean_mse(pred, velocity)
