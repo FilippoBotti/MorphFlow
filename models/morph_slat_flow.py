@@ -85,6 +85,8 @@ class MorphSLatFlow(nn.Module):
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
+        self.model_channels = model_channels
+
         self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
@@ -130,6 +132,7 @@ class MorphSLatFlow(nn.Module):
             torch.tensor(TRELLIS_SLAT_STD, dtype=torch.float32).view(1, -1),
             persistent=False,
         )
+        self.last_forward_metrics = {}
 
     def make_slat(self, feats: torch.Tensor, coords: torch.Tensor) -> sp.SparseTensor:
         return sp.SparseTensor(feats=feats, coords=coords)
@@ -278,6 +281,34 @@ class MorphSLatFlow(nn.Module):
             ]
         ).mean()
 
+    def _update_forward_metrics(
+        self,
+        pred: sp.SparseTensor,
+        target: sp.SparseTensor,
+        loss: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            pred_feats = pred.feats.detach().float()
+            target_feats = target.feats.detach().float()
+            zero_pred = pred.replace(torch.zeros_like(pred.feats))
+            mse_zero = self.batch_mean_mse(zero_pred, target).detach().float()
+            loss_detached = loss.detach().float()
+            self.last_forward_metrics = {
+                "mse": loss_detached,
+                "mse_zero": mse_zero,
+                "relative_improvement": 1.0 - loss_detached / mse_zero.clamp_min(1e-12),
+                "pred_mean": pred_feats.mean(),
+                "pred_std": pred_feats.std(unbiased=False),
+                "target_mean": target_feats.mean(),
+                "target_std": target_feats.std(unbiased=False),
+                "pred_target_cosine": F.cosine_similarity(
+                    pred_feats.flatten(),
+                    target_feats.flatten(),
+                    dim=0,
+                    eps=1e-8,
+                ),
+            }
+
     def forward(
         self,
         target_feats: torch.Tensor,
@@ -306,4 +337,6 @@ class MorphSLatFlow(nn.Module):
             alpha,
         )
 
-        return self.batch_mean_mse(pred, velocity)
+        loss = self.batch_mean_mse(pred, velocity)
+        self._update_forward_metrics(pred, velocity, loss)
+        return loss

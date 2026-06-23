@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from PIL import Image
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -61,6 +62,9 @@ class MorphingDistillDataset(Dataset):
         verbose: bool = True,
         exclude_assets: Optional[Iterable[str]] = None,
         include_assets: Optional[Iterable[str]] = None,
+        load_source_images: bool = False,
+        source_images_root: Optional[str] = None,
+        source_image_filename: Optional[str] = None,
     ):
         self.root = Path(root)
         self.assets_root = self.root / "assets"
@@ -73,6 +77,9 @@ class MorphingDistillDataset(Dataset):
         self.verbose = bool(verbose)
         self.exclude_assets = set(exclude_assets or [])
         self.include_assets = set(include_assets or [])
+        self.load_source_images = bool(load_source_images)
+        self.source_images_root = Path(source_images_root) if source_images_root else None
+        self.source_image_filename = source_image_filename or None
 
         if split is not None and split not in VALID_SPLITS:
             raise ValueError(f"split must be one of {VALID_SPLITS}, got {split!r}")
@@ -174,6 +181,99 @@ class MorphingDistillDataset(Dataset):
         except TypeError:
             return torch.load(path, map_location="cpu")
 
+    def _source_image_candidates(self, asset_name: str, entry: Dict[str, Any], prefix: str) -> List[Path]:
+        keys = (f"{prefix}_image", f"{prefix}_image_path", f"{prefix}_source_image")
+        candidates: List[Path] = []
+        for key in keys:
+            if entry.get(key):
+                candidates.append(self._root_join(entry.get(key), self.root / str(entry[key])))
+
+        manifest = self.assets_root / asset_name / "manifest.json"
+        if manifest.is_file():
+            try:
+                with manifest.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("image"):
+                    image_path = Path(str(data["image"]))
+                    if image_path.is_absolute():
+                        candidates.append(image_path)
+                    elif self.source_images_root is not None:
+                        candidates.append(self.source_images_root / image_path)
+                    candidates.append(self.root / image_path)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if self.source_images_root is None:
+            return candidates
+
+        root = self.source_images_root
+        if self.source_image_filename:
+            candidates.append(root / asset_name / self.source_image_filename)
+
+        common_names = (
+            "image.png",
+            "input.png",
+            "source.png",
+            "generated.png",
+            "output.png",
+            "0.png",
+            "000.png",
+            "image.jpg",
+            "input.jpg",
+            "source.jpg",
+            "generated.jpg",
+            "output.jpg",
+            "image.jpeg",
+            "input.jpeg",
+            "source.jpeg",
+            "generated.jpeg",
+            "output.jpeg",
+            "image.webp",
+            "input.webp",
+        )
+        candidates.extend(root / asset_name / name for name in common_names)
+        candidates.extend(
+            root / f"{asset_name}{suffix}"
+            for suffix in (
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                "_image.png",
+                "_input.png",
+                "_source.png",
+                "_generated.png",
+            )
+        )
+        return candidates
+
+    def _find_source_image_path(self, asset_name: str, entry: Dict[str, Any], prefix: str) -> Optional[Path]:
+        for path in self._source_image_candidates(asset_name, entry, prefix):
+            if path.is_file():
+                return path
+        return None
+
+    def _load_source_image(self, asset_name: str, entry: Dict[str, Any], prefix: str) -> torch.Tensor:
+        path = self._find_source_image_path(asset_name, entry, prefix)
+        if path is None:
+            searched = self._source_image_candidates(asset_name, entry, prefix)[:16]
+            searched_text = "\n".join(f"  {p}" for p in searched)
+            raise FileNotFoundError(f"Source image not found for {prefix}={asset_name}. Searched:\n{searched_text}")
+
+        with Image.open(path) as image:
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            image = image.resize((518, 518), resample)
+            if image.mode == "RGBA":
+                rgba = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
+                rgba = rgba.view(image.height, image.width, 4).float() / 255.0
+                rgb = rgba[..., :3] * rgba[..., 3:4]
+                return rgb.permute(2, 0, 1).contiguous()
+
+            image = image.convert("RGB")
+            rgb = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
+            rgb = rgb.view(image.height, image.width, 3).float() / 255.0
+            return rgb.permute(2, 0, 1).contiguous()
+
     def _entry_allowed_by_split(self, entry: Dict[str, Any]) -> bool:
         src1 = str(entry.get("src_1"))
         src2 = str(entry.get("src_2"))
@@ -209,7 +309,12 @@ class MorphingDistillDataset(Dataset):
         ]
         if self.load_occupancy:
             required_keys.extend(["src1_occupancy", "src2_occupancy", "target_occupancy"])
-        return [paths[key] for key in required_keys if not paths[key].is_file()]
+        missing = [paths[key] for key in required_keys if not paths[key].is_file()]
+        if self.load_source_images:
+            for prefix, asset_name in (("src1", str(entry["src_1"])), ("src2", str(entry["src_2"]))):
+                if self._find_source_image_path(asset_name, entry, prefix) is None:
+                    missing.extend(self._source_image_candidates(asset_name, entry, prefix)[:1])
+        return missing
 
     def _filter_valid_metadata(self, metadata: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         valid: List[Dict[str, Any]] = []
@@ -293,6 +398,10 @@ class MorphingDistillDataset(Dataset):
             sample["src2_occupancy"] = self._load_tensor(paths, "src2_occupancy")
             sample["target_occupancy"] = self._load_tensor(paths, "target_occupancy")
 
+        if self.load_source_images:
+            sample["src1_image"] = self._load_source_image(sample["src1_name"], entry, "src1")
+            sample["src2_image"] = self._load_source_image(sample["src2_name"], entry, "src2")
+
         return sample
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -351,6 +460,14 @@ def morphing_collate_fn(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if stacked is not None:
             result[key] = stacked
 
+    for key in ("src1_image", "src2_image"):
+        stacked = _stack_optional(batch, key)
+        if stacked is not None:
+            if isinstance(stacked, list):
+                shapes = [tuple(value.shape) for value in stacked]
+                raise RuntimeError(f"Cannot stack variable-shape {key}: {shapes}")
+            result[key] = stacked
+
     result["split"] = [sample.get("split") for sample in batch]
     result["src1_name"] = [sample["src1_name"] for sample in batch]
     result["src2_name"] = [sample["src2_name"] for sample in batch]
@@ -373,6 +490,9 @@ def build_dataloader(
     skip_missing: bool = True,
     exclude_assets: Optional[Iterable[str]] = None,
     include_assets: Optional[Iterable[str]] = None,
+    load_source_images: bool = False,
+    source_images_root: Optional[str] = None,
+    source_image_filename: Optional[str] = None,
 ):
     dataset = MorphingDistillDataset(
         root=root,
@@ -385,6 +505,9 @@ def build_dataloader(
         skip_missing=skip_missing,
         exclude_assets=exclude_assets,
         include_assets=include_assets,
+        load_source_images=load_source_images,
+        source_images_root=source_images_root,
+        source_image_filename=source_image_filename,
     )
 
     loader = DataLoader(

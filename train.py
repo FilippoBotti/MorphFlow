@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
+from models.morph_dino_slat_flow import MorphDinoSLatFlow
 from models.morph_flow import MorphFlow
 from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
@@ -60,6 +61,7 @@ def build_parser():
     # Model
     parser.add_argument("--trellis_model", type=str, choices=["text_base", "image_large"], default="text_base")
     parser.add_argument("--flow_target", type=str, choices=["ss", "slat"], default="ss", help="Train sparse-structure flow or structured-latent flow.")
+    parser.add_argument("--slat_condition_source", type=str, choices=["slat", "dino"], default="slat", help="Condition the second flow with source SLat geometry tokens or source-image DINO tokens.")
     parser.add_argument("--ss_flow_arch", type=str, choices=["standard", "residual_interp"], default="standard", help="SS flow architecture.")
     parser.add_argument("--residual_interp_gate", type=str, choices=["none", "alpha"], default="alpha", help="For residual_interp: residual gating mode.")
     parser.add_argument("--residual_interp_gate_min", type=float, default=1e-3, help="Minimum divisor used while mapping target SS to residual space.")
@@ -78,6 +80,11 @@ def build_parser():
     parser.add_argument("--t_schedule", type=str, choices=["uniform", "logit_normal"], default="logit_normal", help="Flow timestep sampling. TRELLIS official flow training uses logit_normal.")
     parser.add_argument("--t_logit_mean", type=float, default=0.0)
     parser.add_argument("--t_logit_std", type=float, default=1.0)
+    parser.add_argument("--source_images_root", type=str, default=None, help="Root containing the source images used to generate dataset assets.")
+    parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory. Empty also searches root/<asset>.png/jpg/webp.")
+    parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg", help="Frozen DINOv2 torch.hub model used when --slat_condition_source=dino.")
+    parser.add_argument("--dino_dim", type=int, default=1024, help="Feature dimension emitted by the selected DINO model.")
+    parser.add_argument("--dino_layer_norm", type=int, choices=[0, 1], default=1)
 
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
@@ -145,6 +152,22 @@ def resolve_existing_path(path: Optional[str]) -> Optional[str]:
 
     for candidate in candidates:
         if os.path.isfile(candidate):
+            return candidate
+
+    return path
+
+
+def resolve_existing_dir(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return path
+
+    candidates = [path]
+    prefix = "/hpc/scratch/marco.barezzi/"
+    if path.startswith(prefix):
+        candidates.append("/scratch/" + path[len(prefix):])
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
             return candidate
 
     return path
@@ -236,7 +259,9 @@ def load_assets_from_metadata(metadata_path: str, split: Optional[str] = None) -
 
 
 def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
-    if args.flow_target == "slat":
+    if args.flow_target == "slat" and args.slat_condition_source == "dino":
+        model_cls = MorphDinoSLatFlow
+    elif args.flow_target == "slat":
         model_cls = MorphSLatFlow
     elif args.ss_flow_arch == "residual_interp":
         model_cls = MorphResidualSSFlow
@@ -259,6 +284,9 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "t_schedule": args.t_schedule,
         "t_logit_mean": args.t_logit_mean,
         "t_logit_std": args.t_logit_std,
+        "dino_model": args.dino_model,
+        "dino_dim": args.dino_dim,
+        "dino_layer_norm": args.dino_layer_norm == 1,
     }
 
     signature = inspect.signature(model_cls.__init__)
@@ -303,11 +331,52 @@ def model_forward_supports_source_ss_latents(model: torch.nn.Module) -> bool:
     return "src1_ss_latent" in params and "src2_ss_latent" in params
 
 
+def model_forward_supports_source_images(model: torch.nn.Module) -> bool:
+    signature = inspect.signature(unwrap_model_for_attr(model).forward)
+    params = set(signature.parameters.keys())
+    return "src1_image" in params and "src2_image" in params
+
+
 def get_optional_tensor(batch: Dict[str, Any], key: str, device, dtype=torch.float32):
     value = batch.get(key, None)
     if value is None:
         return None
     return value.to(device=device, dtype=dtype, non_blocking=True)
+
+
+def collect_reduced_forward_metrics(
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    metrics = getattr(accelerator.unwrap_model(model), "last_forward_metrics", None)
+    if not metrics:
+        return {}
+
+    reduced = {}
+    for name, value in metrics.items():
+        if not torch.is_tensor(value):
+            value = torch.tensor(float(value), device=accelerator.device)
+        value = value.detach().to(device=accelerator.device, dtype=torch.float32)
+        reduced[name] = float(accelerator.reduce(value, reduction="mean").item())
+    return reduced
+
+
+def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
+    if not metrics:
+        return ""
+    keys = (
+        ("relative_improvement", "slat_rel"),
+        ("pred_target_cosine", "slat_cos"),
+        ("pred_std", "pred_std"),
+        ("target_std", "target_std"),
+        ("mse_zero", "mse_zero"),
+    )
+    parts = [
+        f"{label}={metrics[key]:.6f}"
+        for key, label in keys
+        if key in metrics
+    ]
+    return " " + " ".join(parts) if parts else ""
 
 
 def compute_loss(
@@ -317,6 +386,7 @@ def compute_loss(
     flow_target: str,
     supports_extra_losses: bool,
     supports_source_ss_latents: bool,
+    supports_source_images: bool,
     needs_source_ss_latents: bool,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
@@ -335,6 +405,18 @@ def compute_loss(
     if flow_target == "slat":
         target_feats = batch["target_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
         target_coords = batch["target_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
+        source_image_kwargs = {}
+        if supports_source_images:
+            source_image_kwargs["src1_image"] = batch["src1_image"].to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            source_image_kwargs["src2_image"] = batch["src2_image"].to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
         return model(
             target_feats,
             target_coords,
@@ -343,6 +425,7 @@ def compute_loss(
             src2_feats,
             src2_coords,
             alpha,
+            **source_image_kwargs,
         )
 
     target_ss_latent = batch["target_ss_latent"].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -386,13 +469,14 @@ def compute_loss(
 
 
 FREEZE_MODULE_ALIASES = {
-    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
-    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
-    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "null_cond"],
+    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
     "cond_encoder": ["cond_encoder*"],
     "cond_fusion": ["cond_fusion*"],
     "separate_cond_proj": ["separate_cond_proj*"],
     "cond_resampler": ["cond_resampler*"],
+    "dino": ["dino_norm*", "dino_proj*", "dino_out_norm*"],
     "null_cond": ["null_cond"],
     "flow": ["sparse_structure_flow*", "slat_flow*"],
     "cross_attn": ["*.cross_attn*", "*.cross_attn2*"],
@@ -508,19 +592,31 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
     if args.use_ema == 1:
         accelerator.print("WARNING: --use_ema is accepted for compatibility but ignored in this simplified train.py.")
 
-    # cond_fusion is unused when separate_cond=1.
-    if args.separate_cond == 1 and hasattr(model, "cond_fusion"):
-        for p in model.cond_fusion.parameters():
-            p.requires_grad = False
-    elif hasattr(model, "cond_fusion"):
-        for p in model.cond_fusion.parameters():
-            p.requires_grad = True
-
-    for name in ["cond_encoder", "separate_cond_proj", "cond_resampler"]:
-        module = getattr(model, name, None)
-        if module is not None:
-            for p in module.parameters():
+    if args.slat_condition_source == "dino":
+        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_resampler"]:
+            module = getattr(model, name, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = False
+        for name in ["dino_norm", "dino_proj", "dino_out_norm"]:
+            module = getattr(model, name, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = True
+    else:
+        # cond_fusion is unused when separate_cond=1.
+        if args.separate_cond == 1 and hasattr(model, "cond_fusion"):
+            for p in model.cond_fusion.parameters():
+                p.requires_grad = False
+        elif hasattr(model, "cond_fusion"):
+            for p in model.cond_fusion.parameters():
                 p.requires_grad = True
+
+        for name in ["cond_encoder", "separate_cond_proj", "cond_resampler"]:
+            module = getattr(model, name, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = True
 
     if args.use_lora == 1:
         flow = get_flow_module(model)
@@ -562,7 +658,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         accelerator.print(f"Trainable scope cond_cross_attn: enabled cross-attention adapters in {enabled_blocks} flow blocks.")
 
     # null_cond is only useful when CFG dropout is enabled.
-    if hasattr(model, "null_cond") and args.cfg_drop_prob <= 0.0:
+    if hasattr(model, "null_cond") and (args.cfg_drop_prob <= 0.0 or args.slat_condition_source == "dino"):
         model.null_cond.requires_grad = False
     elif hasattr(model, "null_cond"):
         model.null_cond.requires_grad = True
@@ -587,7 +683,15 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
         flow_lr = 1e-5 if args.trellis_model == "image_large" else args.lr
 
     cond_modules = []
-    for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_resampler"]:
+    for name in [
+        "cond_encoder",
+        "cond_fusion",
+        "separate_cond_proj",
+        "cond_resampler",
+        "dino_norm",
+        "dino_proj",
+        "dino_out_norm",
+    ]:
         module = getattr(model, name, None)
         if module is not None:
             cond_modules.append(module)
@@ -815,6 +919,7 @@ def save_checkpoint(
 def train(args):
     args.resume_from = resolve_existing_path(args.resume_from)
     args.init_from = resolve_existing_path(args.init_from)
+    args.source_images_root = resolve_existing_dir(args.source_images_root)
 
     mixed_precision = resolve_mixed_precision(args.mixed_precision)
 
@@ -850,6 +955,10 @@ def train(args):
         raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
     if args.t_logit_std <= 0.0:
         raise ValueError(f"--t_logit_std must be > 0, got {args.t_logit_std}")
+    if args.slat_condition_source == "dino" and args.flow_target != "slat":
+        raise ValueError("--slat_condition_source dino is only valid with --flow_target slat.")
+    if args.slat_condition_source == "dino" and not args.source_images_root:
+        raise ValueError("--slat_condition_source dino requires --source_images_root.")
 
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
@@ -888,6 +997,9 @@ def train(args):
         split="train",
         verbose=accelerator.is_main_process,
         exclude_assets=excluded_assets,
+        load_source_images=args.flow_target == "slat" and args.slat_condition_source == "dino",
+        source_images_root=args.source_images_root,
+        source_image_filename=args.source_image_filename,
     )
 
     loader = DataLoader(
@@ -909,6 +1021,9 @@ def train(args):
             metadata_file=val_metadata_path,
             split="val",
             verbose=accelerator.is_main_process,
+            load_source_images=args.flow_target == "slat" and args.slat_condition_source == "dino",
+            source_images_root=args.source_images_root,
+            source_image_filename=args.source_image_filename,
         )
 
         if args.val_max_items > 0 and len(val_dataset) > args.val_max_items:
@@ -955,6 +1070,7 @@ def train(args):
 
     supports_extra_losses = model_forward_supports_extra_losses(model)
     supports_source_ss_latents = model_forward_supports_source_ss_latents(model)
+    supports_source_images = model_forward_supports_source_images(model)
     requires_source_ss_latents = model_requires_source_ss_latents(model)
     if not supports_extra_losses and (args.endpoint_loss_weight > 0.0 or args.symmetry_loss_weight > 0.0):
         accelerator.print(
@@ -995,6 +1111,16 @@ def train(args):
         model, optimizer, loader, scheduler = accelerator.prepare(
             model, optimizer, loader, scheduler
         )
+
+    if args.flow_target == "slat" and args.slat_condition_source == "dino":
+        dino_owner = accelerator.unwrap_model(model)
+        if accelerator.is_main_process:
+            accelerator.print(f"Loading frozen DINO encoder: {args.dino_model}")
+            dino_owner._get_dino_model(device)
+        accelerator.wait_for_everyone()
+        if not accelerator.is_main_process:
+            dino_owner._get_dino_model(device)
+        accelerator.wait_for_everyone()
 
     start_epoch = 1
     global_step = 0
@@ -1055,6 +1181,13 @@ def train(args):
     accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
     accelerator.print(f"Flow target: {args.flow_target}")
+    if args.flow_target == "slat":
+        accelerator.print(f"SLat condition source: {args.slat_condition_source}")
+        if args.slat_condition_source == "dino":
+            accelerator.print(f"Source images root: {args.source_images_root}")
+            accelerator.print(f"Source image filename: {args.source_image_filename or '<auto>'}")
+            accelerator.print(f"DINO model: {args.dino_model}")
+            accelerator.print(f"DINO dim: {args.dino_dim}")
     accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
     accelerator.print(f"Trainable scope: {args.trainable_scope}")
     accelerator.print(f"Freeze modules: {args.freeze_modules or '<none>'}")
@@ -1109,6 +1242,7 @@ def train(args):
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
     accelerator.print(f"Symmetry loss probability: {args.symmetry_loss_prob}")
     accelerator.print(f"Extra loss support in MorphFlow.forward: {supports_extra_losses}")
+    accelerator.print(f"Source-image support in model.forward: {supports_source_images}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
         accelerator.print(f"Train metadata source assets: {train_metadata_asset_count}")
@@ -1157,6 +1291,7 @@ def train(args):
                     flow_target=args.flow_target,
                     supports_extra_losses=supports_extra_losses,
                     supports_source_ss_latents=supports_source_ss_latents,
+                    supports_source_images=supports_source_images,
                     needs_source_ss_latents=requires_source_ss_latents,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
@@ -1177,6 +1312,7 @@ def train(args):
 
             reduced_loss = accelerator.reduce(loss.detach(), reduction="mean")
             loss_value = float(reduced_loss.item())
+            forward_metrics = collect_reduced_forward_metrics(accelerator, model)
 
             running_loss += loss_value
             global_step += 1
@@ -1187,30 +1323,40 @@ def train(args):
                 writer.add_scalar("train/loss_avg_epoch_running", avg_loss, global_step)
                 for group in optimizer.param_groups:
                     writer.add_scalar(f"train/{group.get('name', 'group')}_lr", group["lr"], global_step)
+                for metric_name, metric_value in forward_metrics.items():
+                    writer.add_scalar(f"train/slat_{metric_name}", metric_value, global_step)
 
             if accelerator.is_local_main_process:
-                progress_bar.set_postfix(
-                    loss=f"{loss_value:.6f}",
-                    avg=f"{avg_loss:.6f}",
-                    step=global_step,
-                )
+                postfix = {
+                    "loss": f"{loss_value:.6f}",
+                    "avg": f"{avg_loss:.6f}",
+                    "step": global_step,
+                }
+                if forward_metrics:
+                    postfix["slat_rel"] = f"{forward_metrics.get('relative_improvement', 0.0):.4f}"
+                    postfix["slat_cos"] = f"{forward_metrics.get('pred_target_cosine', 0.0):.4f}"
+                progress_bar.set_postfix(**postfix)
 
             if batch_idx % args.log_every == 0:
+                slat_metric_summary = format_slat_metric_summary(forward_metrics)
                 accelerator.print(
                     f"[Epoch {epoch}/{args.train_epochs}] "
                     f"[Batch {batch_idx}/{len(loader)}] "
                     f"[Step {global_step}] "
                     f"loss={loss_value:.6f} avg_loss={avg_loss:.6f}"
+                    f"{slat_metric_summary}"
                 )
 
         epoch_avg = running_loss / max(1, len(loader))
         accelerator.print(f"Epoch {epoch} completed. avg_loss={epoch_avg:.6f}")
 
         val_avg = None
+        val_forward_metric_avgs: Dict[str, float] = {}
 
         if val_loader is not None and (epoch % max(1, args.val_every) == 0):
             model.eval()
             val_running_loss = 0.0
+            val_forward_metric_sums: Dict[str, float] = {}
 
             val_bar = tqdm(
                 val_loader,
@@ -1230,6 +1376,7 @@ def train(args):
                             flow_target=args.flow_target,
                             supports_extra_losses=supports_extra_losses,
                             supports_source_ss_latents=supports_source_ss_latents,
+                            supports_source_images=supports_source_images,
                             needs_source_ss_latents=requires_source_ss_latents,
                             endpoint_loss_weight=0.0,
                             symmetry_loss_weight=0.0,
@@ -1240,15 +1387,28 @@ def train(args):
 
                     reduced_val_loss = accelerator.reduce(val_loss.detach(), reduction="mean")
                     val_loss_value = float(reduced_val_loss.item())
+                    val_forward_metrics = collect_reduced_forward_metrics(accelerator, model)
 
                     val_running_loss += val_loss_value
+                    for metric_name, metric_value in val_forward_metrics.items():
+                        val_forward_metric_sums[metric_name] = (
+                            val_forward_metric_sums.get(metric_name, 0.0) + metric_value
+                        )
                     avg_val = val_running_loss / val_batch_idx
 
                     if accelerator.is_local_main_process:
                         val_bar.set_postfix(loss=f"{val_loss_value:.6f}", avg=f"{avg_val:.6f}")
 
             val_avg = val_running_loss / max(1, len(val_loader))
-            accelerator.print(f"Epoch {epoch} validation completed. val_loss={val_avg:.6f}")
+            val_forward_metric_avgs = {
+                metric_name: metric_sum / max(1, len(val_loader))
+                for metric_name, metric_sum in val_forward_metric_sums.items()
+            }
+            val_slat_metric_summary = format_slat_metric_summary(val_forward_metric_avgs)
+            accelerator.print(
+                f"Epoch {epoch} validation completed. val_loss={val_avg:.6f}"
+                f"{val_slat_metric_summary}"
+            )
             model.train()
 
             if args.lr_scheduler == "plateau":
@@ -1316,6 +1476,8 @@ def train(args):
             writer.add_scalar("train/loss_epoch", epoch_avg, epoch)
             if val_avg is not None:
                 writer.add_scalar("val/loss_epoch", val_avg, epoch)
+                for metric_name, metric_value in val_forward_metric_avgs.items():
+                    writer.add_scalar(f"val/slat_{metric_name}", metric_value, epoch)
             writer.flush()
 
         accelerator.wait_for_everyone()
