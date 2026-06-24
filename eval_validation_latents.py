@@ -22,6 +22,7 @@ if os.environ.get("TRELLIS_REPO"):
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
+from models.morph_dino_slat_flow import MorphDinoSLatFlow
 from models.morph_flow import MorphFlow
 from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
@@ -55,6 +56,8 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--allow_tf32", type=int, choices=[0, 1], default=1)
     parser.add_argument("--save_latents", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--source_images_root", type=str, default=None, help="Root containing source images for DINO-conditioned SLat checkpoints.")
+    parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory.")
     return parser.parse_args()
 
 
@@ -126,6 +129,14 @@ def detect_flow_target(ckpt):
     return args.get("flow_target", "ss")
 
 
+def detect_slat_condition_source(ckpt):
+    return checkpoint_args(ckpt).get("slat_condition_source", "slat")
+
+
+def checkpoint_requires_source_images(ckpt, flow_target):
+    return flow_target == "slat" and detect_slat_condition_source(ckpt) == "dino"
+
+
 def detect_model_type(ckpt, requested):
     if requested != "auto":
         return requested
@@ -139,7 +150,9 @@ def detect_model_type(ckpt, requested):
 
 def build_model(ckpt, model_type, flow_target):
     args = checkpoint_args(ckpt)
-    if flow_target == "slat":
+    if flow_target == "slat" and args.get("slat_condition_source", "slat") == "dino":
+        model_cls = MorphDinoSLatFlow
+    elif flow_target == "slat":
         model_cls = MorphSLatFlow
     elif args.get("ss_flow_arch", "standard") == "residual_interp":
         model_cls = MorphResidualSSFlow
@@ -162,6 +175,9 @@ def build_model(ckpt, model_type, flow_target):
         "t_schedule": args.get("t_schedule", args.get("slat_t_schedule", "logit_normal")),
         "t_logit_mean": float(args.get("t_logit_mean", args.get("slat_t_logit_mean", 0.0))),
         "t_logit_std": float(args.get("t_logit_std", args.get("slat_t_logit_std", 1.0))),
+        "dino_model": args.get("dino_model", "dinov2_vitl14_reg"),
+        "dino_dim": int(args.get("dino_dim", 1024)),
+        "dino_layer_norm": bool(int(args.get("dino_layer_norm", 1))),
     }
 
     supported = set(inspect.signature(model_cls.__init__).parameters)
@@ -175,6 +191,27 @@ def build_model(ckpt, model_type, flow_target):
     maybe_insert_lora(model, args)
     model.load_state_dict(unwrap_state_dict(ckpt), strict=True)
     return model
+
+
+def model_supports_source_images(model):
+    params = set(inspect.signature(model.forward_flow).parameters)
+    return "src1_image" in params and "src2_image" in params
+
+
+def source_image_kwargs(model, batch, device):
+    if not model_supports_source_images(model):
+        return {}
+    if "src1_image" not in batch or "src2_image" not in batch:
+        raise KeyError("This checkpoint requires src1_image/src2_image. Pass --source_images_root.")
+    return {
+        "src1_image": batch["src1_image"].to(device=device, dtype=torch.float32),
+        "src2_image": batch["src2_image"].to(device=device, dtype=torch.float32),
+    }
+
+
+def preload_dino_if_needed(model, device):
+    if hasattr(model, "_get_dino_model"):
+        model._get_dino_model(device)
 
 
 def get_flow_module(model):
@@ -270,16 +307,34 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
     src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32)
     alpha = batch["alpha"].reshape(x0.shape[0]).to(device=device, dtype=torch.float32)
     t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    image_kwargs = source_image_kwargs(model, batch, device)
 
     for i in range(steps):
         t = torch.full((x0.shape[0],), float(t_seq[i].item()), device=device)
         dt = t_seq[i] - t_seq[i + 1]
         with autocast_context(device, mixed_precision):
             if cfg_scale == 1.0:
-                pred = model.forward_flow(x_t, t, src1_feats, src2_feats, src1_coords, src2_coords, alpha)
+                pred = model.forward_flow(
+                    x_t,
+                    t,
+                    src1_feats,
+                    src2_feats,
+                    src1_coords,
+                    src2_coords,
+                    alpha,
+                    **image_kwargs,
+                )
             else:
                 pred = model.forward_flow_cfg(
-                    x_t, t, src1_feats, src2_feats, src1_coords, src2_coords, alpha, guidance_scale=cfg_scale
+                    x_t,
+                    t,
+                    src1_feats,
+                    src2_feats,
+                    src1_coords,
+                    src2_coords,
+                    alpha,
+                    guidance_scale=cfg_scale,
+                    **image_kwargs,
                 )
         x_t = x_t - dt * pred.float()
 
@@ -304,13 +359,23 @@ def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_
     src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32)
     alpha = batch["alpha"].reshape(1).to(device=device, dtype=torch.float32)
     t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    image_kwargs = source_image_kwargs(model, batch, device)
 
     for i in range(steps):
         t = torch.full((1,), float(t_seq[i].item()), device=device)
         dt = t_seq[i] - t_seq[i + 1]
         with autocast_context(device, mixed_precision):
             if cfg_scale == 1.0:
-                pred = model.forward_flow(x_t, t, src1_feats, src2_feats, src1_coords, src2_coords, alpha)
+                pred = model.forward_flow(
+                    x_t,
+                    t,
+                    src1_feats,
+                    src2_feats,
+                    src1_coords,
+                    src2_coords,
+                    alpha,
+                    **image_kwargs,
+                )
             else:
                 pred = model.forward_flow_cfg(
                     x_t,
@@ -321,6 +386,7 @@ def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_
                     src2_coords,
                     alpha,
                     guidance_scale=cfg_scale,
+                    **image_kwargs,
                 )
         x_t = x_t - dt * pred.float()
 
@@ -574,6 +640,14 @@ def main():
     slat_ckpt = load_checkpoint(str(slat_checkpoint_path)) if slat_checkpoint_path is not None else None
     slat_model_type = detect_model_type(slat_ckpt, args.trellis_model) if slat_ckpt is not None else None
     pipeline_mode = slat_ckpt is not None
+    needs_source_images = checkpoint_requires_source_images(ckpt, flow_target) or (
+        pipeline_mode and checkpoint_requires_source_images(slat_ckpt, "slat")
+    )
+    source_images_root = args.source_images_root
+    if needs_source_images and not source_images_root:
+        source_images_root = checkpoint_args(slat_ckpt if pipeline_mode else ckpt).get("source_images_root")
+    if needs_source_images and not source_images_root:
+        raise ValueError("A DINO-conditioned SLat checkpoint requires --source_images_root.")
 
     if pipeline_mode:
         if flow_target != "ss":
@@ -593,8 +667,15 @@ def main():
     if pipeline_mode:
         print(f"slat_checkpoint: {slat_checkpoint_path}")
     print(f"flow_target: {flow_target}")
+    if checkpoint_requires_source_images(ckpt, flow_target):
+        print(f"slat_condition_source: {detect_slat_condition_source(ckpt)}")
     if pipeline_mode:
         print("pipeline: ss checkpoint -> SS decoder coords -> slat checkpoint -> mesh decoder")
+        if checkpoint_requires_source_images(slat_ckpt, "slat"):
+            print(f"slat_condition_source: {detect_slat_condition_source(slat_ckpt)}")
+    if needs_source_images:
+        print(f"source_images_root: {source_images_root}")
+        print(f"source_image_filename: {args.source_image_filename or '<auto>'}")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"model_type: {model_type}")
     if pipeline_mode:
@@ -615,6 +696,9 @@ def main():
         if pipeline_mode
         else None
     )
+    preload_dino_if_needed(model, device)
+    if slat_model is not None:
+        preload_dino_if_needed(slat_model, device)
     ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders("ss" if pipeline_mode else flow_target, device)
 
     dataset = MorphingDistillDataset(
@@ -622,6 +706,9 @@ def main():
         metadata_file=str(metadata_path),
         split="test",
         verbose=False,
+        load_source_images=needs_source_images,
+        source_images_root=source_images_root,
+        source_image_filename=args.source_image_filename,
     )
     indices = select_fixed_pair_indices(dataset, args.num_samples, args.seed)
 
@@ -823,6 +910,9 @@ def main():
         "flow_target": flow_target,
         "model_type": model_type,
         "slat_model_type": slat_model_type,
+        "slat_condition_source": detect_slat_condition_source(ckpt) if flow_target == "slat" else None,
+        "slat_checkpoint_condition_source": detect_slat_condition_source(slat_ckpt) if slat_ckpt is not None else None,
+        "source_images_root": str(source_images_root) if source_images_root else None,
         "cfg_scale": args.cfg_scale,
         "slat_cfg_scale": args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale,
         "steps": args.steps,
