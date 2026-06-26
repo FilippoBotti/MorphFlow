@@ -84,6 +84,7 @@ def build_parser():
     parser.add_argument("--normalize_cond_latents", type=int, choices=[0, 1], default=0, help="Normalize source SLat features before the MorphFlow condition encoder.")
     parser.add_argument("--cond_input_norm", type=str, choices=["none", "trellis"], default=None, help="Explicit source-SLat normalization before the condition encoder. Overrides --normalize_cond_latents when set.")
     parser.add_argument("--cond_token_norm", type=str, choices=["none", "layernorm", "adaln_alpha"], default="none", help="Optional normalization/modulation on condition tokens after the condition encoder.")
+    parser.add_argument("--cond_proj_norm", type=str, choices=["none", "layernorm"], default="none", help="Optional normalization on SLat condition tokens after separate_cond_proj, matching the DINO path's dino_out_norm.")
     parser.add_argument("--source_images_root", type=str, default=None, help="Root containing the source images used to generate dataset assets.")
     parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory. Empty also searches root/<asset>.png/jpg/webp.")
     parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg", help="Frozen DINOv2 torch.hub model used when --slat_condition_source=dino.")
@@ -289,6 +290,7 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "cond_encoder_type": args.cond_encoder_type,
         "normalize_cond_latents": use_condition_input_norm(args),
         "cond_token_norm": args.cond_token_norm,
+        "cond_proj_norm": args.cond_proj_norm,
         "residual_interp_gate": args.residual_interp_gate,
         "residual_interp_gate_min": args.residual_interp_gate_min,
         "residual_endpoint_prob": args.residual_endpoint_prob,
@@ -482,12 +484,13 @@ def compute_loss(
 
 
 FREEZE_MODULE_ALIASES = {
-    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
-    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
-    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
     "cond_encoder": ["cond_encoder*"],
     "cond_fusion": ["cond_fusion*"],
-    "separate_cond_proj": ["separate_cond_proj*"],
+    "separate_cond_proj": ["separate_cond_proj*", "cond_proj_layer_norm*"],
+    "cond_proj_norm": ["cond_proj_layer_norm*"],
     "cond_resampler": ["cond_resampler*"],
     "cond_token_norm": ["cond_token_layer_norm*", "cond_alpha_mod*"],
     "dino": ["dino_norm*", "dino_proj*", "dino_out_norm*"],
@@ -607,7 +610,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         accelerator.print("WARNING: --use_ema is accepted for compatibility but ignored in this simplified train.py.")
 
     if args.slat_condition_source == "dino":
-        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
+        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
             module = getattr(model, name, None)
             if module is not None:
                 for p in module.parameters():
@@ -626,7 +629,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
             for p in model.cond_fusion.parameters():
                 p.requires_grad = True
 
-        for name in ["cond_encoder", "separate_cond_proj", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
+        for name in ["cond_encoder", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
             module = getattr(model, name, None)
             if module is not None:
                 for p in module.parameters():
@@ -701,6 +704,7 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
         "cond_encoder",
         "cond_fusion",
         "separate_cond_proj",
+        "cond_proj_layer_norm",
         "cond_resampler",
         "cond_token_layer_norm",
         "cond_alpha_mod",
@@ -1220,6 +1224,7 @@ def train(args):
     accelerator.print(f"Condition input norm: {args.cond_input_norm or ('trellis' if args.normalize_cond_latents == 1 else 'none')}")
     accelerator.print(f"Normalize condition SLat latents: {use_condition_input_norm(args)}")
     accelerator.print(f"Condition token norm: {args.cond_token_norm}")
+    accelerator.print(f"Condition projected-token norm: {args.cond_proj_norm}")
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
         accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")

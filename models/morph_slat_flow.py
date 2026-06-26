@@ -55,6 +55,7 @@ class MorphSLatFlow(nn.Module):
         normalize_flow_latents: bool = True,
         normalize_cond_latents: bool = False,
         cond_token_norm: str = "none",
+        cond_proj_norm: str = "none",
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
@@ -69,6 +70,7 @@ class MorphSLatFlow(nn.Module):
         self.normalize_flow_latents = normalize_flow_latents
         self.normalize_cond_latents = bool(normalize_cond_latents)
         self.cond_token_norm = cond_token_norm
+        self.cond_proj_norm = cond_proj_norm
         self.t_schedule = t_schedule
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
@@ -77,6 +79,11 @@ class MorphSLatFlow(nn.Module):
             raise ValueError(
                 "cond_token_norm must be one of {'none', 'layernorm', 'adaln_alpha'}, "
                 f"got {self.cond_token_norm!r}"
+            )
+        if self.cond_proj_norm not in ("none", "layernorm"):
+            raise ValueError(
+                "cond_proj_norm must be one of {'none', 'layernorm'}, "
+                f"got {self.cond_proj_norm!r}"
             )
         if self.t_schedule not in ("uniform", "logit_normal"):
             raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
@@ -117,6 +124,8 @@ class MorphSLatFlow(nn.Module):
             nn.init.zeros_(self.cond_alpha_mod[-1].bias)
         if self.separate_cond:
             self.separate_cond_proj = nn.Linear(128, model_channels)
+            if self.cond_proj_norm == "layernorm":
+                self.cond_proj_layer_norm = nn.LayerNorm(model_channels)
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
@@ -199,6 +208,15 @@ class MorphSLatFlow(nn.Module):
 
         return cond1, cond2
 
+    def normalize_projected_condition_tokens(
+        self,
+        cond1: torch.Tensor,
+        cond2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.cond_proj_norm == "none":
+            return cond1, cond2
+        return self.cond_proj_layer_norm(cond1), self.cond_proj_layer_norm(cond2)
+
     def get_v(self, x_0: sp.SparseTensor, noise: sp.SparseTensor) -> sp.SparseTensor:
         return (1 - self.sigma_min) * noise - x_0
 
@@ -240,6 +258,7 @@ class MorphSLatFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
 
         if self.training and self.cfg_drop_prob > 0.0:
@@ -314,6 +333,7 @@ class MorphSLatFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
             batch_size = cond1.shape[0]
             null_tensor = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond1.dtype)

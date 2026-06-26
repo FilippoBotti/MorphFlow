@@ -41,6 +41,7 @@ class MorphFlow(nn.Module):
         cond_encoder_type="block",
         normalize_cond_latents=False,
         cond_token_norm="none",
+        cond_proj_norm="none",
         t_schedule="logit_normal",
         t_logit_mean=0.0,
         t_logit_std=1.0,
@@ -53,6 +54,7 @@ class MorphFlow(nn.Module):
         self.cond_encoder_type = cond_encoder_type
         self.normalize_cond_latents = bool(normalize_cond_latents)
         self.cond_token_norm = cond_token_norm
+        self.cond_proj_norm = cond_proj_norm
         self.t_schedule = t_schedule
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
@@ -61,6 +63,11 @@ class MorphFlow(nn.Module):
             raise ValueError(
                 "cond_token_norm must be one of {'none', 'layernorm', 'adaln_alpha'}, "
                 f"got {self.cond_token_norm!r}"
+            )
+        if self.cond_proj_norm not in ("none", "layernorm"):
+            raise ValueError(
+                "cond_proj_norm must be one of {'none', 'layernorm'}, "
+                f"got {self.cond_proj_norm!r}"
             )
         if self.t_schedule not in ("uniform", "logit_normal"):
             raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
@@ -97,6 +104,8 @@ class MorphFlow(nn.Module):
             nn.init.zeros_(self.cond_alpha_mod[-1].bias)
         if self.separate_cond:
             self.separate_cond_proj = nn.Linear(128, model_channels)
+            if self.cond_proj_norm == "layernorm":
+                self.cond_proj_layer_norm = nn.LayerNorm(model_channels)
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
@@ -154,7 +163,12 @@ class MorphFlow(nn.Module):
             cond2 = cond2 * (1.0 + scale) + shift
 
         return cond1, cond2
-        
+
+    def normalize_projected_condition_tokens(self, cond1, cond2):
+        if self.cond_proj_norm == "none":
+            return cond1, cond2
+        return self.cond_proj_layer_norm(cond1), self.cond_proj_layer_norm(cond2)
+
     def get_v(self, x_0, noise):
         return (1 - self.sigma_min) * noise - x_0
     
@@ -195,6 +209,7 @@ class MorphFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
 
         if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
@@ -248,6 +263,7 @@ class MorphFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
             B = cond1.shape[0]
             null_cond_tensor = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)

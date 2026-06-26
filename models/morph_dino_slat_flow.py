@@ -36,6 +36,7 @@ class MorphDinoSLatFlow(MorphSLatFlow):
         normalize_flow_latents: bool = True,
         normalize_cond_latents: bool = False,
         cond_token_norm: str = "none",
+        cond_proj_norm: str = "none",
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
@@ -57,6 +58,7 @@ class MorphDinoSLatFlow(MorphSLatFlow):
             normalize_flow_latents=normalize_flow_latents,
             normalize_cond_latents=normalize_cond_latents,
             cond_token_norm=cond_token_norm,
+            cond_proj_norm=cond_proj_norm,
             t_schedule=t_schedule,
             t_logit_mean=t_logit_mean,
             t_logit_std=t_logit_std,
@@ -75,6 +77,9 @@ class MorphDinoSLatFlow(MorphSLatFlow):
                 param.requires_grad = False
         if hasattr(self, "separate_cond_proj"):
             for param in self.separate_cond_proj.parameters():
+                param.requires_grad = False
+        if hasattr(self, "cond_proj_layer_norm"):
+            for param in self.cond_proj_layer_norm.parameters():
                 param.requires_grad = False
         self.null_cond.requires_grad = False
 
