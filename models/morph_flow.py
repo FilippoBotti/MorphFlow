@@ -5,6 +5,30 @@ import torch.nn.functional as F
 from models import sparse_structure_flow
 from models import cond_encoder
 
+
+TRELLIS_SLAT_MEAN = (
+    -2.1687545776367188,
+    -0.004347046371549368,
+    -0.13352349400520325,
+    -0.08418072760105133,
+    -0.5271206498146057,
+    0.7238689064979553,
+    -1.1414450407028198,
+    1.2039363384246826,
+)
+
+TRELLIS_SLAT_STD = (
+    2.377650737762451,
+    2.386378288269043,
+    2.124418020248413,
+    2.1748552322387695,
+    2.663944721221924,
+    2.371192216873169,
+    2.6217446327209473,
+    2.684523105621338,
+)
+
+
 class MorphFlow(nn.Module):
     def __init__(
         self,
@@ -14,6 +38,8 @@ class MorphFlow(nn.Module):
         use_checkpoint=False,
         separate_cond_gate="alpha_residual",
         cond_resample_tokens=0,
+        normalize_cond_latents=False,
+        cond_token_norm="none",
         t_schedule="logit_normal",
         t_logit_mean=0.0,
         t_logit_std=1.0,
@@ -23,10 +49,17 @@ class MorphFlow(nn.Module):
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.cond_resample_tokens = cond_resample_tokens
+        self.normalize_cond_latents = bool(normalize_cond_latents)
+        self.cond_token_norm = cond_token_norm
         self.t_schedule = t_schedule
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
 
+        if self.cond_token_norm not in ("none", "layernorm", "adaln_alpha"):
+            raise ValueError(
+                "cond_token_norm must be one of {'none', 'layernorm', 'adaln_alpha'}, "
+                f"got {self.cond_token_norm!r}"
+            )
         if self.t_schedule not in ("uniform", "logit_normal"):
             raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
         if self.t_logit_std <= 0.0:
@@ -50,6 +83,16 @@ class MorphFlow(nn.Module):
             hidden_dim=512,
             out_dim=model_channels, 
         )
+        if self.cond_token_norm in ("layernorm", "adaln_alpha"):
+            self.cond_token_layer_norm = nn.LayerNorm(128)
+        if self.cond_token_norm == "adaln_alpha":
+            self.cond_alpha_mod = nn.Sequential(
+                nn.Linear(1, 128),
+                nn.SiLU(),
+                nn.Linear(128, 256),
+            )
+            nn.init.zeros_(self.cond_alpha_mod[-1].weight)
+            nn.init.zeros_(self.cond_alpha_mod[-1].bias)
         if self.separate_cond:
             self.separate_cond_proj = nn.Linear(128, model_channels)
 
@@ -76,6 +119,39 @@ class MorphFlow(nn.Module):
             separate_cond_gate=separate_cond_gate, 
         )
         self.sigma_min = sigma_min
+
+        self.register_buffer(
+            "cond_slat_mean",
+            torch.tensor(TRELLIS_SLAT_MEAN, dtype=torch.float32).view(1, -1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cond_slat_std",
+            torch.tensor(TRELLIS_SLAT_STD, dtype=torch.float32).view(1, -1),
+            persistent=False,
+        )
+
+    def normalize_condition_feats(self, feats):
+        if not self.normalize_cond_latents:
+            return feats
+        mean = self.cond_slat_mean.to(device=feats.device, dtype=feats.dtype)
+        std = self.cond_slat_std.to(device=feats.device, dtype=feats.dtype)
+        return (feats - mean) / std
+
+    def normalize_condition_tokens(self, cond1, cond2, alpha):
+        if self.cond_token_norm == "none":
+            return cond1, cond2
+
+        cond1 = self.cond_token_layer_norm(cond1)
+        cond2 = self.cond_token_layer_norm(cond2)
+
+        if self.cond_token_norm == "adaln_alpha":
+            alpha = alpha.to(device=cond1.device, dtype=cond1.dtype).view(-1, 1)
+            scale, shift = self.cond_alpha_mod(alpha).view(alpha.shape[0], 1, 2, 128).unbind(dim=2)
+            cond1 = cond1 * (1.0 + scale) + shift
+            cond2 = cond2 * (1.0 + scale) + shift
+
+        return cond1, cond2
         
     def get_v(self, x_0, noise):
         return (1 - self.sigma_min) * noise - x_0
@@ -106,8 +182,11 @@ class MorphFlow(nn.Module):
         apply_cfg_drop=True,
     ):
         # condition
+        src_1_feats = self.normalize_condition_feats(src_1_feats)
+        src_2_feats = self.normalize_condition_feats(src_2_feats)
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
         
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
@@ -154,8 +233,11 @@ class MorphFlow(nn.Module):
                 alpha,
             )
 
+        src_1_feats = self.normalize_condition_feats(src_1_feats)
+        src_2_feats = self.normalize_condition_feats(src_2_feats)
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
         
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)

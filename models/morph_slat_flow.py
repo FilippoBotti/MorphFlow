@@ -52,6 +52,8 @@ class MorphSLatFlow(nn.Module):
         cond_resample_depth: int = 1,
         cond_resample_heads: int = 8,
         normalize_flow_latents: bool = True,
+        normalize_cond_latents: bool = False,
+        cond_token_norm: str = "none",
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
@@ -63,10 +65,17 @@ class MorphSLatFlow(nn.Module):
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.normalize_flow_latents = normalize_flow_latents
+        self.normalize_cond_latents = bool(normalize_cond_latents)
+        self.cond_token_norm = cond_token_norm
         self.t_schedule = t_schedule
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
 
+        if self.cond_token_norm not in ("none", "layernorm", "adaln_alpha"):
+            raise ValueError(
+                "cond_token_norm must be one of {'none', 'layernorm', 'adaln_alpha'}, "
+                f"got {self.cond_token_norm!r}"
+            )
         if self.t_schedule not in ("uniform", "logit_normal"):
             raise ValueError(f"Unknown t_schedule: {self.t_schedule}")
         if self.t_logit_std <= 0.0:
@@ -94,6 +103,16 @@ class MorphSLatFlow(nn.Module):
             hidden_dim=512,
             out_dim=model_channels,
         )
+        if self.cond_token_norm in ("layernorm", "adaln_alpha"):
+            self.cond_token_layer_norm = nn.LayerNorm(128)
+        if self.cond_token_norm == "adaln_alpha":
+            self.cond_alpha_mod = nn.Sequential(
+                nn.Linear(1, 128),
+                nn.SiLU(),
+                nn.Linear(128, 256),
+            )
+            nn.init.zeros_(self.cond_alpha_mod[-1].weight)
+            nn.init.zeros_(self.cond_alpha_mod[-1].bias)
         if self.separate_cond:
             self.separate_cond_proj = nn.Linear(128, model_channels)
 
@@ -151,6 +170,33 @@ class MorphSLatFlow(nn.Module):
         std = self.slat_std.to(device=slat.device, dtype=slat.dtype)
         return slat.replace(slat.feats * std + mean)
 
+    def normalize_condition_feats(self, feats: torch.Tensor) -> torch.Tensor:
+        if not self.normalize_cond_latents:
+            return feats
+        mean = self.slat_mean.to(device=feats.device, dtype=feats.dtype)
+        std = self.slat_std.to(device=feats.device, dtype=feats.dtype)
+        return (feats - mean) / std
+
+    def normalize_condition_tokens(
+        self,
+        cond1: torch.Tensor,
+        cond2: torch.Tensor,
+        alpha: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.cond_token_norm == "none":
+            return cond1, cond2
+
+        cond1 = self.cond_token_layer_norm(cond1)
+        cond2 = self.cond_token_layer_norm(cond2)
+
+        if self.cond_token_norm == "adaln_alpha":
+            alpha = alpha.to(device=cond1.device, dtype=cond1.dtype).view(-1, 1)
+            scale, shift = self.cond_alpha_mod(alpha).view(alpha.shape[0], 1, 2, 128).unbind(dim=2)
+            cond1 = cond1 * (1.0 + scale) + shift
+            cond2 = cond2 * (1.0 + scale) + shift
+
+        return cond1, cond2
+
     def get_v(self, x_0: sp.SparseTensor, noise: sp.SparseTensor) -> sp.SparseTensor:
         return (1 - self.sigma_min) * noise - x_0
 
@@ -181,8 +227,11 @@ class MorphSLatFlow(nn.Module):
         src_2_coords: torch.Tensor,
         alpha: torch.Tensor,
     ):
+        src_1_feats = self.normalize_condition_feats(src_1_feats)
+        src_2_feats = self.normalize_condition_feats(src_2_feats)
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
 
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
@@ -250,8 +299,11 @@ class MorphSLatFlow(nn.Module):
                 alpha,
             )
 
+        src_1_feats = self.normalize_condition_feats(src_1_feats)
+        src_2_feats = self.normalize_condition_feats(src_2_feats)
         cond1 = self.cond_encoder(src_1_feats, src_1_coords)
         cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
 
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)

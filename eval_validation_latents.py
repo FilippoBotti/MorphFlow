@@ -167,6 +167,8 @@ def build_model(ckpt, model_type, flow_target):
         "cond_resample_tokens": int(args.get("cond_resample_tokens", 0)),
         "cond_resample_depth": int(args.get("cond_resample_depth", 1)),
         "cond_resample_heads": int(args.get("cond_resample_heads", 8)),
+        "normalize_cond_latents": bool(int(args.get("normalize_cond_latents", 0))),
+        "cond_token_norm": args.get("cond_token_norm", "none"),
         "residual_interp_gate": args.get("residual_interp_gate", "alpha"),
         "residual_interp_gate_min": float(args.get("residual_interp_gate_min", 1e-3)),
         "residual_endpoint_prob": float(args.get("residual_endpoint_prob", 0.0)),
