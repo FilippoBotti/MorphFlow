@@ -51,6 +51,7 @@ class MorphSLatFlow(nn.Module):
         cond_resample_tokens: int = 0,
         cond_resample_depth: int = 1,
         cond_resample_heads: int = 8,
+        cond_encoder_type: str = "block",
         normalize_flow_latents: bool = True,
         normalize_cond_latents: bool = False,
         cond_token_norm: str = "none",
@@ -64,6 +65,7 @@ class MorphSLatFlow(nn.Module):
         self.sigma_min = sigma_min
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
+        self.cond_encoder_type = cond_encoder_type
         self.normalize_flow_latents = normalize_flow_latents
         self.normalize_cond_latents = bool(normalize_cond_latents)
         self.cond_token_norm = cond_token_norm
@@ -96,7 +98,7 @@ class MorphSLatFlow(nn.Module):
 
         self.model_channels = model_channels
 
-        self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
+        self.cond_encoder = cond_encoder.build_condition_encoder(self.cond_encoder_type)
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
             alpha_dim=64,

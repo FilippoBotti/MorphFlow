@@ -77,10 +77,12 @@ def build_parser():
     parser.add_argument("--cond_resample_tokens", type=int, default=0)
     parser.add_argument("--cond_resample_depth", type=int, default=1)
     parser.add_argument("--cond_resample_heads", type=int, default=8)
+    parser.add_argument("--cond_encoder_type", type=str, choices=["block", "conv3d", "sparse_conv3d"], default="block", help="Condition encoder for source SLat features.")
     parser.add_argument("--t_schedule", type=str, choices=["uniform", "logit_normal"], default="logit_normal", help="Flow timestep sampling. TRELLIS official flow training uses logit_normal.")
     parser.add_argument("--t_logit_mean", type=float, default=0.0)
     parser.add_argument("--t_logit_std", type=float, default=1.0)
     parser.add_argument("--normalize_cond_latents", type=int, choices=[0, 1], default=0, help="Normalize source SLat features before the MorphFlow condition encoder.")
+    parser.add_argument("--cond_input_norm", type=str, choices=["none", "trellis"], default=None, help="Explicit source-SLat normalization before the condition encoder. Overrides --normalize_cond_latents when set.")
     parser.add_argument("--cond_token_norm", type=str, choices=["none", "layernorm", "adaln_alpha"], default="none", help="Optional normalization/modulation on condition tokens after the condition encoder.")
     parser.add_argument("--source_images_root", type=str, default=None, help="Root containing the source images used to generate dataset assets.")
     parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory. Empty also searches root/<asset>.png/jpg/webp.")
@@ -137,6 +139,12 @@ def resolve_mixed_precision(mode: str) -> str:
         return "fp16"
 
     return "no"
+
+
+def use_condition_input_norm(args) -> bool:
+    if args.cond_input_norm is not None:
+        return args.cond_input_norm == "trellis"
+    return args.normalize_cond_latents == 1
 
 
 def resolve_existing_path(path: Optional[str]) -> Optional[str]:
@@ -278,7 +286,8 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "cond_resample_tokens": args.cond_resample_tokens,
         "cond_resample_depth": args.cond_resample_depth,
         "cond_resample_heads": args.cond_resample_heads,
-        "normalize_cond_latents": args.normalize_cond_latents == 1,
+        "cond_encoder_type": args.cond_encoder_type,
+        "normalize_cond_latents": use_condition_input_norm(args),
         "cond_token_norm": args.cond_token_norm,
         "residual_interp_gate": args.residual_interp_gate,
         "residual_interp_gate_min": args.residual_interp_gate_min,
@@ -1207,7 +1216,9 @@ def train(args):
     accelerator.print(f"Flow t schedule: {args.t_schedule}")
     if args.t_schedule == "logit_normal":
         accelerator.print(f"Flow logit-normal t args: mean={args.t_logit_mean} std={args.t_logit_std}")
-    accelerator.print(f"Normalize condition SLat latents: {args.normalize_cond_latents == 1}")
+    accelerator.print(f"Condition encoder: {args.cond_encoder_type}")
+    accelerator.print(f"Condition input norm: {args.cond_input_norm or ('trellis' if args.normalize_cond_latents == 1 else 'none')}")
+    accelerator.print(f"Normalize condition SLat latents: {use_condition_input_norm(args)}")
     accelerator.print(f"Condition token norm: {args.cond_token_norm}")
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")

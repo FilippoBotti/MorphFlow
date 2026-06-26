@@ -150,6 +150,11 @@ def detect_model_type(ckpt, requested):
 
 def build_model(ckpt, model_type, flow_target):
     args = checkpoint_args(ckpt)
+    cond_input_norm = args.get("cond_input_norm")
+    normalize_cond_latents = bool(int(args.get("normalize_cond_latents", 0)))
+    if cond_input_norm is not None:
+        normalize_cond_latents = cond_input_norm == "trellis"
+
     if flow_target == "slat" and args.get("slat_condition_source", "slat") == "dino":
         model_cls = MorphDinoSLatFlow
     elif flow_target == "slat":
@@ -167,7 +172,8 @@ def build_model(ckpt, model_type, flow_target):
         "cond_resample_tokens": int(args.get("cond_resample_tokens", 0)),
         "cond_resample_depth": int(args.get("cond_resample_depth", 1)),
         "cond_resample_heads": int(args.get("cond_resample_heads", 8)),
-        "normalize_cond_latents": bool(int(args.get("normalize_cond_latents", 0))),
+        "cond_encoder_type": args.get("cond_encoder_type", "block"),
+        "normalize_cond_latents": normalize_cond_latents,
         "cond_token_norm": args.get("cond_token_norm", "none"),
         "residual_interp_gate": args.get("residual_interp_gate", "alpha"),
         "residual_interp_gate_min": float(args.get("residual_interp_gate_min", 1e-3)),
@@ -679,9 +685,13 @@ def main():
         print(f"source_images_root: {source_images_root}")
         print(f"source_image_filename: {args.source_image_filename or '<auto>'}")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
+    print(f"cond_encoder_type: {checkpoint_args(ckpt).get('cond_encoder_type', 'block')}")
+    print(f"cond_input_norm: {checkpoint_args(ckpt).get('cond_input_norm', 'legacy')}")
     print(f"model_type: {model_type}")
     if pipeline_mode:
         print(f"slat_model_type: {slat_model_type}")
+        print(f"slat_cond_encoder_type: {checkpoint_args(slat_ckpt).get('cond_encoder_type', 'block')}")
+        print(f"slat_cond_input_norm: {checkpoint_args(slat_ckpt).get('cond_input_norm', 'legacy')}")
     print(f"cfg_scale: {args.cfg_scale}")
     if pipeline_mode:
         print(f"slat_cfg_scale: {args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale}")

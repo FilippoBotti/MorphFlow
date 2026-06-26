@@ -38,6 +38,7 @@ class MorphFlow(nn.Module):
         use_checkpoint=False,
         separate_cond_gate="alpha_residual",
         cond_resample_tokens=0,
+        cond_encoder_type="block",
         normalize_cond_latents=False,
         cond_token_norm="none",
         t_schedule="logit_normal",
@@ -49,6 +50,7 @@ class MorphFlow(nn.Module):
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.cond_resample_tokens = cond_resample_tokens
+        self.cond_encoder_type = cond_encoder_type
         self.normalize_cond_latents = bool(normalize_cond_latents)
         self.cond_token_norm = cond_token_norm
         self.t_schedule = t_schedule
@@ -76,7 +78,7 @@ class MorphFlow(nn.Module):
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
-        self.cond_encoder = cond_encoder.BlockPoolConditionEncoder()
+        self.cond_encoder = cond_encoder.build_condition_encoder(self.cond_encoder_type)
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
             alpha_dim=64,
