@@ -56,13 +56,17 @@ class MorphSLatFlow(nn.Module):
         normalize_cond_latents: bool = False,
         cond_token_norm: str = "none",
         cond_proj_norm: str = "none",
+        cond_style_tokens: int = 0,
+        cond_use_occupancy: bool = False,
+        cond_hybrid_pool_stats: bool = False,
+        cond_residual_blocks_64: int = 0,
+        cond_residual_blocks_32: int = 0,
+        cond_residual_blocks_16: int = 0,
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
     ):
         super().__init__()
-        del cond_resample_tokens, cond_resample_depth, cond_resample_heads
-
         self.sigma_min = sigma_min
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
@@ -71,6 +75,15 @@ class MorphSLatFlow(nn.Module):
         self.normalize_cond_latents = bool(normalize_cond_latents)
         self.cond_token_norm = cond_token_norm
         self.cond_proj_norm = cond_proj_norm
+        self.cond_style_tokens = int(cond_style_tokens)
+        self.cond_use_occupancy = bool(cond_use_occupancy)
+        self.cond_hybrid_pool_stats = bool(cond_hybrid_pool_stats)
+        self.cond_residual_blocks_64 = int(cond_residual_blocks_64)
+        self.cond_residual_blocks_32 = int(cond_residual_blocks_32)
+        self.cond_residual_blocks_16 = int(cond_residual_blocks_16)
+        self.cond_resample_tokens = int(cond_resample_tokens)
+        self.cond_resample_depth = int(cond_resample_depth)
+        self.cond_resample_heads = int(cond_resample_heads)
         self.t_schedule = t_schedule
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
@@ -105,7 +118,24 @@ class MorphSLatFlow(nn.Module):
 
         self.model_channels = model_channels
 
-        self.cond_encoder = cond_encoder.build_condition_encoder(self.cond_encoder_type)
+        self.cond_encoder = cond_encoder.build_condition_encoder(
+            self.cond_encoder_type,
+            style_tokens=self.cond_style_tokens,
+            use_occupancy=self.cond_use_occupancy,
+            hybrid_pool_stats=self.cond_hybrid_pool_stats,
+            residual_blocks_64=self.cond_residual_blocks_64,
+            residual_blocks_32=self.cond_residual_blocks_32,
+            residual_blocks_16=self.cond_residual_blocks_16,
+        )
+        self.cond_sequence_tokens = int(getattr(self.cond_encoder, "num_output_tokens", self.cond_encoder.num_blocks))
+        if self.cond_resample_tokens > 0:
+            self.cond_resampler = cond_encoder.ConditionResampler(
+                dim=128,
+                num_tokens=self.cond_resample_tokens,
+                depth=self.cond_resample_depth,
+                heads=self.cond_resample_heads,
+            )
+            self.cond_sequence_tokens = self.cond_resample_tokens
         self.cond_fusion = cond_encoder.PairConditionFusionV2(
             cond_dim=128,
             alpha_dim=64,
@@ -129,7 +159,7 @@ class MorphSLatFlow(nn.Module):
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
-            torch.zeros(1, self.cond_encoder.num_blocks, model_channels)
+            torch.zeros(1, self.cond_sequence_tokens, model_channels)
         )
 
         self.slat_flow = structured_latent_flow.SLatFlowModel(
@@ -187,6 +217,12 @@ class MorphSLatFlow(nn.Module):
         mean = self.slat_mean.to(device=feats.device, dtype=feats.dtype)
         std = self.slat_std.to(device=feats.device, dtype=feats.dtype)
         return (feats - mean) / std
+
+    def encode_condition_tokens(self, feats: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        cond = self.cond_encoder(feats, coords)
+        if hasattr(self, "cond_resampler"):
+            cond = self.cond_resampler(cond)
+        return cond
 
     def normalize_condition_tokens(
         self,
@@ -249,8 +285,8 @@ class MorphSLatFlow(nn.Module):
     ):
         src_1_feats = self.normalize_condition_feats(src_1_feats)
         src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.cond_encoder(src_1_feats, src_1_coords)
-        cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
+        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
         cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
 
         if not self.separate_cond:
@@ -322,8 +358,8 @@ class MorphSLatFlow(nn.Module):
 
         src_1_feats = self.normalize_condition_feats(src_1_feats)
         src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.cond_encoder(src_1_feats, src_1_coords)
-        cond2 = self.cond_encoder(src_2_feats, src_2_coords)
+        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
+        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
         cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
 
         if not self.separate_cond:

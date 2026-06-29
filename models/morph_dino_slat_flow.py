@@ -51,7 +51,10 @@ class MorphDinoSLatFlow(MorphSLatFlow):
             separate_cond=separate_cond,
             use_checkpoint=use_checkpoint,
             separate_cond_gate=separate_cond_gate,
-            cond_resample_tokens=cond_resample_tokens,
+            # DINO uses cond_resample_tokens to downsample image tokens in _encode_images.
+            # Do not instantiate the SLat condition resampler from the base class here,
+            # otherwise old DINO checkpoints would gain unused/missing parameters.
+            cond_resample_tokens=0,
             cond_resample_depth=cond_resample_depth,
             cond_resample_heads=cond_resample_heads,
             cond_encoder_type=cond_encoder_type,

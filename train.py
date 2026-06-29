@@ -85,6 +85,12 @@ def build_parser():
     parser.add_argument("--cond_input_norm", type=str, choices=["none", "trellis"], default=None, help="Explicit source-SLat normalization before the condition encoder. Overrides --normalize_cond_latents when set.")
     parser.add_argument("--cond_token_norm", type=str, choices=["none", "layernorm", "adaln_alpha"], default="none", help="Optional normalization/modulation on condition tokens after the condition encoder.")
     parser.add_argument("--cond_proj_norm", type=str, choices=["none", "layernorm"], default="none", help="Optional normalization on SLat condition tokens after separate_cond_proj, matching the DINO path's dino_out_norm.")
+    parser.add_argument("--cond_style_tokens", type=int, default=0, help="Number of global per-source style tokens appended by sparse_conv3d condition encoder.")
+    parser.add_argument("--cond_use_occupancy", type=int, choices=[0, 1], default=0, help="Use explicit occupied/empty token handling in sparse_conv3d condition encoder.")
+    parser.add_argument("--cond_hybrid_pool_stats", type=int, choices=[0, 1], default=0, help="Fuse local mean/max/std/count pooling stats next to sparse-conv condition features.")
+    parser.add_argument("--cond_residual_blocks_64", type=int, default=0, help="Number of submanifold residual sparse blocks before first 64->32 downsample.")
+    parser.add_argument("--cond_residual_blocks_32", type=int, default=0, help="Number of submanifold residual sparse blocks after 64->32 downsample.")
+    parser.add_argument("--cond_residual_blocks_16", type=int, default=0, help="Number of submanifold residual sparse blocks after 32->16 downsample.")
     parser.add_argument("--source_images_root", type=str, default=None, help="Root containing the source images used to generate dataset assets.")
     parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory. Empty also searches root/<asset>.png/jpg/webp.")
     parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg", help="Frozen DINOv2 torch.hub model used when --slat_condition_source=dino.")
@@ -291,6 +297,12 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "normalize_cond_latents": use_condition_input_norm(args),
         "cond_token_norm": args.cond_token_norm,
         "cond_proj_norm": args.cond_proj_norm,
+        "cond_style_tokens": args.cond_style_tokens,
+        "cond_use_occupancy": args.cond_use_occupancy == 1,
+        "cond_hybrid_pool_stats": args.cond_hybrid_pool_stats == 1,
+        "cond_residual_blocks_64": args.cond_residual_blocks_64,
+        "cond_residual_blocks_32": args.cond_residual_blocks_32,
+        "cond_residual_blocks_16": args.cond_residual_blocks_16,
         "residual_interp_gate": args.residual_interp_gate,
         "residual_interp_gate_min": args.residual_interp_gate_min,
         "residual_endpoint_prob": args.residual_endpoint_prob,
@@ -1225,6 +1237,14 @@ def train(args):
     accelerator.print(f"Normalize condition SLat latents: {use_condition_input_norm(args)}")
     accelerator.print(f"Condition token norm: {args.cond_token_norm}")
     accelerator.print(f"Condition projected-token norm: {args.cond_proj_norm}")
+    accelerator.print(f"Condition style tokens: {args.cond_style_tokens}")
+    accelerator.print(f"Condition explicit occupancy: {args.cond_use_occupancy == 1}")
+    accelerator.print(f"Condition hybrid pool stats: {args.cond_hybrid_pool_stats == 1}")
+    accelerator.print(
+        f"Condition residual sparse blocks: 64^3={args.cond_residual_blocks_64} "
+        f"32^3={args.cond_residual_blocks_32} 16^3={args.cond_residual_blocks_16}"
+    )
+    accelerator.print(f"Condition resampler tokens: {args.cond_resample_tokens}")
     if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
         accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
         accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")

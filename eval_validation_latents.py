@@ -175,6 +175,13 @@ def build_model(ckpt, model_type, flow_target):
         "cond_encoder_type": args.get("cond_encoder_type", "block"),
         "normalize_cond_latents": normalize_cond_latents,
         "cond_token_norm": args.get("cond_token_norm", "none"),
+        "cond_proj_norm": args.get("cond_proj_norm", "none"),
+        "cond_style_tokens": int(args.get("cond_style_tokens", 0)),
+        "cond_use_occupancy": bool(int(args.get("cond_use_occupancy", 0))),
+        "cond_hybrid_pool_stats": bool(int(args.get("cond_hybrid_pool_stats", 0))),
+        "cond_residual_blocks_64": int(args.get("cond_residual_blocks_64", 0)),
+        "cond_residual_blocks_32": int(args.get("cond_residual_blocks_32", 0)),
+        "cond_residual_blocks_16": int(args.get("cond_residual_blocks_16", 0)),
         "residual_interp_gate": args.get("residual_interp_gate", "alpha"),
         "residual_interp_gate_min": float(args.get("residual_interp_gate_min", 1e-3)),
         "residual_endpoint_prob": float(args.get("residual_endpoint_prob", 0.0)),
@@ -694,11 +701,19 @@ def main():
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"cond_encoder_type: {checkpoint_args(ckpt).get('cond_encoder_type', 'block')}")
     print(f"cond_input_norm: {checkpoint_args(ckpt).get('cond_input_norm', 'legacy')}")
+    print(f"cond_style_tokens: {checkpoint_args(ckpt).get('cond_style_tokens', 0)}")
+    print(f"cond_use_occupancy: {checkpoint_args(ckpt).get('cond_use_occupancy', 0)}")
+    print(f"cond_hybrid_pool_stats: {checkpoint_args(ckpt).get('cond_hybrid_pool_stats', 0)}")
+    print(f"cond_residual_blocks: 64^3={checkpoint_args(ckpt).get('cond_residual_blocks_64', 0)} 32^3={checkpoint_args(ckpt).get('cond_residual_blocks_32', 0)} 16^3={checkpoint_args(ckpt).get('cond_residual_blocks_16', 0)}")
     print(f"model_type: {model_type}")
     if pipeline_mode:
         print(f"slat_model_type: {slat_model_type}")
         print(f"slat_cond_encoder_type: {checkpoint_args(slat_ckpt).get('cond_encoder_type', 'block')}")
         print(f"slat_cond_input_norm: {checkpoint_args(slat_ckpt).get('cond_input_norm', 'legacy')}")
+        print(f"slat_cond_style_tokens: {checkpoint_args(slat_ckpt).get('cond_style_tokens', 0)}")
+        print(f"slat_cond_use_occupancy: {checkpoint_args(slat_ckpt).get('cond_use_occupancy', 0)}")
+        print(f"slat_cond_hybrid_pool_stats: {checkpoint_args(slat_ckpt).get('cond_hybrid_pool_stats', 0)}")
+        print(f"slat_cond_residual_blocks: 64^3={checkpoint_args(slat_ckpt).get('cond_residual_blocks_64', 0)} 32^3={checkpoint_args(slat_ckpt).get('cond_residual_blocks_32', 0)} 16^3={checkpoint_args(slat_ckpt).get('cond_residual_blocks_16', 0)}")
     print(f"cfg_scale: {args.cfg_scale}")
     if pipeline_mode:
         print(f"slat_cfg_scale: {args.slat_cfg_scale if args.slat_cfg_scale is not None else args.cfg_scale}")
