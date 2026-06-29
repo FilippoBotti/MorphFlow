@@ -258,6 +258,9 @@ class MorphSLatFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            if hasattr(self, "cond_proj_layer_norm"):
+                cond1 = self.cond_proj_layer_norm(cond1)
+                cond2 = self.cond_proj_layer_norm(cond2)
             cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
 
@@ -333,6 +336,9 @@ class MorphSLatFlow(nn.Module):
         else:
             cond1 = self.separate_cond_proj(cond1)
             cond2 = self.separate_cond_proj(cond2)
+            if hasattr(self, "cond_proj_layer_norm"):
+                cond1 = self.cond_proj_layer_norm(cond1)
+                cond2 = self.cond_proj_layer_norm(cond2)
             cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
             batch_size = cond1.shape[0]
