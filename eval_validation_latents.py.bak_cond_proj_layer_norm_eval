@@ -196,15 +196,8 @@ def build_model(ckpt, model_type, flow_target):
         print(f"  {key}: {value}")
 
     model = model_cls(**kwargs)
-    state_dict = unwrap_state_dict(ckpt)
-
-    if any(key.startswith("cond_proj_layer_norm.") for key in state_dict):
-        if not hasattr(model, "cond_proj_layer_norm"):
-            model.cond_proj_layer_norm = torch.nn.LayerNorm(model.model_channels)
-            print("Added cond_proj_layer_norm for checkpoint compatibility.")
-
     maybe_insert_lora(model, args)
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(unwrap_state_dict(ckpt), strict=True)
     return model
 
 
