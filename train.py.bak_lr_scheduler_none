@@ -51,7 +51,7 @@ def build_parser():
     parser.add_argument("--flow_lr", type=float, default=None, help="LR for TRELLIS flow. If omitted, defaults to 1e-5 for image_large full fine-tuning, otherwise --lr.")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--lr_scheduler", type=str, choices=["none", "cosine", "plateau"], default="cosine", help="none keeps a constant LR; cosine steps every batch; plateau warms up then uses validation loss.")
+    parser.add_argument("--lr_scheduler", type=str, choices=["cosine", "plateau"], default="cosine", help="cosine steps every batch; plateau warms up then uses validation loss.")
     parser.add_argument("--plateau_factor", type=float, default=0.5)
     parser.add_argument("--plateau_patience", type=int, default=3)
     parser.add_argument("--plateau_threshold", type=float, default=1e-4)
@@ -811,9 +811,6 @@ def apply_plateau_warmup(optimizer, step: int, warmup_steps: int):
 def build_lr_scheduler(optimizer, args, total_training_steps: int, warmup_steps: int):
     remember_base_lrs(optimizer)
 
-    if args.lr_scheduler == "none":
-        return None
-
     if args.lr_scheduler == "cosine":
         from transformers import get_cosine_schedule_with_warmup
 
@@ -1354,7 +1351,7 @@ def train(args):
                 accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             optimizer.step()
-            if scheduler is not None and args.lr_scheduler == "cosine":
+            if args.lr_scheduler == "cosine":
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
