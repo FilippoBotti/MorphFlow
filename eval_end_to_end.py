@@ -12,7 +12,47 @@ from models.morph_slat_flow import MorphSLatFlow
 import time
 from tqdm import tqdm
 from TRELLIS.trellis.models import from_pretrained as trellis_from_pretrained
-from TRELLIS.trellis.modules import sparse as sp
+from modules import sparse as sp
+import trimesh
+import numpy as np
+
+
+def ensure_batch_coords(coords):
+    if coords.shape[-1] == 4:
+        return coords
+    batch = torch.zeros((coords.shape[0], 1), dtype=coords.dtype, device=coords.device)
+    return torch.cat([batch, coords], dim=-1)
+
+
+def rgba_from_rgb(rgb, alpha=255):
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.max(initial=0) <= 1.0:
+        arr = arr * 255.0
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape[0] == 4:
+        return arr
+    return np.concatenate([arr[:3], np.array([alpha], dtype=np.uint8)])
+
+
+def decoded_vertex_colors(decoded, fallback_rgb=(210, 210, 210)):
+    attrs = getattr(decoded, "vertex_attrs", None)
+    if attrs is None:
+        color = rgba_from_rgb(fallback_rgb)
+        return np.repeat(color[None, :], int(decoded.vertices.shape[0]), axis=0)
+
+    attrs = attrs.detach().float().cpu()
+    if attrs.ndim != 2 or attrs.shape[0] != int(decoded.vertices.shape[0]) or attrs.shape[1] < 3:
+        color = rgba_from_rgb(fallback_rgb)
+        return np.repeat(color[None, :], int(decoded.vertices.shape[0]), axis=0)
+
+    colors = attrs[:, :3].numpy()
+    if colors.max(initial=0.0) <= 1.0 and colors.min(initial=0.0) >= 0.0:
+        colors = colors * 255.0
+    colors = np.clip(colors, 0, 255).astype(np.uint8)
+    alpha = np.full((colors.shape[0], 1), 255, dtype=np.uint8)
+    return np.concatenate([colors, alpha], axis=1)
+
+
 
 def build_model(flow_target) -> torch.nn.Module:
     if flow_target == "slat":
@@ -91,8 +131,7 @@ def sample_slat(model, coords, src1_feats, src2_feats, src1_coords, src2_coords,
             feats=torch.randn(coords.shape[0], model.slat_flow.in_channels).to('cuda'),
             coords=coords.to('cuda'),
         )
-    x_t = x_t.replace(torch.randn_like(x_t.feats))
-    for i in range(steps):
+    for i in tqdm(range(steps)):
         t = torch.full((x_t.shape[0],), float(t_seq[i].item()), device=device)
         dt = t_seq[i] - t_seq[i + 1]
         pred = model.forward_flow(
@@ -106,20 +145,59 @@ def sample_slat(model, coords, src1_feats, src2_feats, src1_coords, src2_coords,
                 )
         x_t = x_t - dt * pred.float()
 
-    return model.denormalize_slat(x_t), x_t, x0
+    return model.denormalize_slat(x_t)
+
+@torch.no_grad()
+def save_slat_glb(
+    mesh_decoder,
+    sparse_tensor_cls,
+    feats,
+    coords,
+    path,
+    device,
+    mixed_precision,
+    fallback_color=(210, 210, 210),
+):
+    feats = feats.to(device=device, dtype=torch.float32)
+    coords = ensure_batch_coords(coords).to(device=device, dtype=torch.int32)
+    st = sparse_tensor_cls(feats=feats, coords=coords)
+
+    # TRELLIS mesh extraction allocates several float32 work buffers internally
+    # and expects attrs to match them. Keep this export path in fp32 even when
+    # the flow sampling itself uses bf16/fp16 autocast.
+    
+    decoded = mesh_decoder(st)[0]
+
+    if not getattr(decoded, "success", False):
+        return False
+
+    mesh = trimesh.Trimesh(
+        vertices=decoded.vertices.detach().float().cpu().numpy(),
+        faces=decoded.faces.detach().cpu().numpy(),
+        visual=trimesh.visual.ColorVisuals(
+            vertex_colors=decoded_vertex_colors(decoded, fallback_color)
+        ),
+        process=False,
+    )
+    mesh.export(path)
+    return True
 
 
 def eval():
-    slat_feats_1 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0000_stout-anthropomorphic-alpaca-friendly-welcoming/slat_feats.pt"
-    slat_feats_2 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0001_knight-like-anthropomorphic-wyvern-relaxed/slat_feats.pt"
-
-    slat_cords_1 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0000_stout-anthropomorphic-alpaca-friendly-welcoming/slat_coords.pt"
-    slat_cords_2 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0001_knight-like-anthropomorphic-wyvern-relaxed/slat_coords.pt"
+    slat_feats_1 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0050_scholarly-gargoyle-scout-guarding-stance/slat_feats.pt"
+    slat_feats_2 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0970_jungle-anthropomorphic-lizard-battle-ready/slat_feats.pt"
+    slat_target_feats = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/targets/0050_scholarly-gargoyle-scout-guarding-stance+0970_jungle-anthropomorphic-lizard-battle-ready/alpha_0p506207/slat_feats.pt"
+    
+    slat_cords_1 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0050_scholarly-gargoyle-scout-guarding-stance/slat_coords.pt"
+    slat_cords_2 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0970_jungle-anthropomorphic-lizard-battle-ready/slat_coords.pt"
+    slat_cords_target = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/targets/0050_scholarly-gargoyle-scout-guarding-stance+0970_jungle-anthropomorphic-lizard-battle-ready/alpha_0p506207/slat_coords.pt"
 
     src1_feats = torch.load(slat_feats_1, map_location="cuda")
     src2_feats = torch.load(slat_feats_2, map_location="cuda")
+    target_feats = torch.load(slat_target_feats, map_location="cuda")
     src1_coords = torch.load(slat_cords_1, map_location="cuda")
     src2_coords = torch.load(slat_cords_2, map_location="cuda")
+    target_coords = torch.load(slat_cords_target, map_location="cuda")
 
     ckpt_ss_flow = "/home/filippo/checkpoints/3d/morphflow_ss_best.pt"
     ckpt_slat_flow = "/home/filippo/checkpoints/3d/morphflow_slat_best.pt"
@@ -134,6 +212,9 @@ def eval():
 
     ss_decoder = trellis_from_pretrained(
             "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
+        ).to('cuda').eval()
+    slat_decoder = trellis_from_pretrained(
+            "microsoft/TRELLIS-image-large/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16"
         ).to('cuda').eval()
 
     model_ss.load_state_dict(ckpt_ss_flow["model"])
@@ -153,7 +234,7 @@ def eval():
             src1_coords,
             src2_coords,
             alpha,
-            1,
+            25,
             'cuda'
         )
         end_time = time.time()
@@ -173,7 +254,27 @@ def eval():
         )   
         end_time = time.time()
         print(f"SLAT Morphing Time: {end_time - start_time:.4f} seconds")
+        from TRELLIS.trellis.modules import sparse as sp
+        save_slat_glb(
+            slat_decoder,
+            sp.SparseTensor,
+            out_slat.feats,
+            out_slat.coords,
+            "./outputs/evaluation_time/morphing_result.glb",
+            'cuda',
+            mixed_precision=False,
+        )
+        end_time = time.time()
         print(f"Total Morphing Time: {end_time - start_total_time:.4f} seconds")
 
+    save_slat_glb(
+        slat_decoder,
+        sp.SparseTensor,
+        target_feats,
+        target_coords,
+        "./outputs/evaluation_time/target.glb",
+        'cuda',
+        mixed_precision=False,
+    )
 if __name__ == "__main__":
     eval()

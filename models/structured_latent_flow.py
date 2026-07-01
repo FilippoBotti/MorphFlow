@@ -58,7 +58,6 @@ class SparseResBlock3d(nn.Module):
     def forward(self, x: sp.SparseTensor, emb: torch.Tensor) -> sp.SparseTensor:
         emb_out = self.emb_layers(emb).type(x.dtype)
         scale, shift = torch.chunk(emb_out, 2, dim=1)
-
         x = self._updown(x)
         h = x.replace(self.norm1(x.feats))
         h = h.replace(F.silu(h.feats))
