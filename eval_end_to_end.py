@@ -91,6 +91,7 @@ def sample_slat(model, coords, src1_feats, src2_feats, src1_coords, src2_coords,
             feats=torch.randn(coords.shape[0], model.slat_flow.in_channels).to('cuda'),
             coords=coords.to('cuda'),
         )
+    x_t = x_t.replace(torch.randn_like(x_t.feats))
     for i in range(steps):
         t = torch.full((x_t.shape[0],), float(t_seq[i].item()), device=device)
         dt = t_seq[i] - t_seq[i + 1]

@@ -335,6 +335,9 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
         t = torch.full((x0.shape[0],), float(t_seq[i].item()), device=device)
         dt = t_seq[i] - t_seq[i + 1]
         with autocast_context(device, mixed_precision):
+            print(type(x_t), type(t), type(src1_feats), type(src2_feats), type(src1_coords), type(src2_coords), type(alpha))
+            print(x_t.shape, t.shape, src1_feats.shape, src2_feats.shape, src1_coords.shape, src2_coords.shape, alpha.shape)
+            exit()
             if cfg_scale == 1.0:
                 pred = model.forward_flow(
                     x_t,
