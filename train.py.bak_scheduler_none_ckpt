@@ -936,7 +936,7 @@ def save_checkpoint(
         "step": global_step,
         "model": accelerator.get_state_dict(model),
         "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scheduler": scheduler.state_dict(),
         "model_type": args.trellis_model,
         "flow_target": args.flow_target,
         "sigma_min": accelerator.unwrap_model(model).sigma_min,
@@ -1173,17 +1173,12 @@ def train(args):
             except Exception as exc:
                 accelerator.print(f"Could not restore optimizer state: {exc}")
 
-            sched_state = resume_ckpt.get("scheduler", None)
-            if scheduler is not None and sched_state is not None:
+            if "scheduler" in resume_ckpt:
                 try:
-                    scheduler.load_state_dict(sched_state)
+                    scheduler.load_state_dict(resume_ckpt["scheduler"])
                     accelerator.print("Scheduler state restored.")
                 except Exception as exc:
                     accelerator.print(f"Could not restore scheduler state: {exc}")
-            elif scheduler is None:
-                accelerator.print("No scheduler in this run; skipping scheduler state restore.")
-            elif sched_state is None:
-                accelerator.print("Checkpoint has no scheduler state; skipping scheduler restore.")
         else:
             accelerator.print("Skipping optimizer/scheduler restore because --resume_optimizer=0.")
 
@@ -1464,7 +1459,7 @@ def train(args):
             )
             model.train()
 
-            if scheduler is not None and args.lr_scheduler == "plateau":
+            if args.lr_scheduler == "plateau":
                 lr_before = [group["lr"] for group in optimizer.param_groups]
                 scheduler.step(val_avg)
                 lr_after = [group["lr"] for group in optimizer.param_groups]

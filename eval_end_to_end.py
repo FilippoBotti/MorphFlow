@@ -1,4 +1,6 @@
 
+import tempfile
+
 import torch
 import inspect
 import argparse
@@ -15,6 +17,8 @@ from TRELLIS.trellis.models import from_pretrained as trellis_from_pretrained
 from modules import sparse as sp
 import trimesh
 import numpy as np
+import encode
+from TRELLIS.trellis.modules import sparse as sp_trellis
 
 
 def ensure_batch_coords(coords):
@@ -148,6 +152,11 @@ def sample_slat(model, coords, src1_feats, src2_feats, src1_coords, src2_coords,
     return model.denormalize_slat(x_t)
 
 @torch.no_grad()
+def extract_slat_feats_and_coords(mesh_path, slat_encoder):
+    tmp = slat_encoder.encode_to_slat(mesh_path=mesh_path)
+    return tmp.feats, tmp.coords
+
+@torch.no_grad()
 def save_slat_glb(
     mesh_decoder,
     sparse_tensor_cls,
@@ -162,10 +171,6 @@ def save_slat_glb(
     coords = ensure_batch_coords(coords).to(device=device, dtype=torch.int32)
     st = sparse_tensor_cls(feats=feats, coords=coords)
 
-    # TRELLIS mesh extraction allocates several float32 work buffers internally
-    # and expects attrs to match them. Keep this export path in fp32 even when
-    # the flow sampling itself uses bf16/fp16 autocast.
-    
     decoded = mesh_decoder(st)[0]
 
     if not getattr(decoded, "success", False):
@@ -192,30 +197,31 @@ def eval():
     slat_cords_2 = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/assets/0970_jungle-anthropomorphic-lizard-battle-ready/slat_coords.pt"
     slat_cords_target = "/home/filippo/datasets/3d/morphing_dataset_v2/morphing_dataset_v2/targets/0050_scholarly-gargoyle-scout-guarding-stance+0970_jungle-anthropomorphic-lizard-battle-ready/alpha_0p506207/slat_coords.pt"
 
+    ckpt_ss_flow = "/home/filippo/checkpoints/3d/morphflow_ss_best.pt"
+    ckpt_slat_flow = "/home/filippo/checkpoints/3d/morphflow_slat_best.pt"
+
     src1_feats = torch.load(slat_feats_1, map_location="cuda")
     src2_feats = torch.load(slat_feats_2, map_location="cuda")
     target_feats = torch.load(slat_target_feats, map_location="cuda")
     src1_coords = torch.load(slat_cords_1, map_location="cuda")
     src2_coords = torch.load(slat_cords_2, map_location="cuda")
     target_coords = torch.load(slat_cords_target, map_location="cuda")
-
-    ckpt_ss_flow = "/home/filippo/checkpoints/3d/morphflow_ss_best.pt"
-    ckpt_slat_flow = "/home/filippo/checkpoints/3d/morphflow_slat_best.pt"
-
     ckpt_slat_flow = torch.load(ckpt_slat_flow, map_location="cpu")
     ckpt_ss_flow = torch.load(ckpt_ss_flow, map_location="cpu")
-    alpha = 0.5
-    alpha = torch.tensor([alpha], dtype=torch.float32)
 
+    ########### SLAT ENCODER
+    slat_encoder = encode.TrellisSLatEncoderDebug(
+        device="cuda",
+        slat_encoder=trellis_from_pretrained(
+            "microsoft/TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16"
+        ),
+        blender_bin="/home/filippo/projects/TRELLIS/workspace_encoding/blender/blender-3.0.1-linux-x64/blender"
+    )
+    slat_encoder._slat_encoder.eval()
+
+    ############ MODELS
     model_ss = build_model("ss")
     model_slat = build_model("slat")
-
-    ss_decoder = trellis_from_pretrained(
-            "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
-        ).to('cuda').eval()
-    slat_decoder = trellis_from_pretrained(
-            "microsoft/TRELLIS-image-large/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16"
-        ).to('cuda').eval()
 
     model_ss.load_state_dict(ckpt_ss_flow["model"])
     model_slat.load_state_dict(ckpt_slat_flow["model"])
@@ -225,6 +231,20 @@ def eval():
     
     model_slat.to("cuda")
     model_ss.to("cuda")
+   
+    ############ SS DECODER
+    ss_decoder = trellis_from_pretrained(
+            "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
+        ).to('cuda').eval()
+    
+    ############ SLAT DECODER
+    slat_decoder = trellis_from_pretrained(
+            "microsoft/TRELLIS-image-large/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16"
+        ).to('cuda').eval()
+    
+    alpha = 0.5
+    alpha = torch.tensor([alpha], dtype=torch.float32)
+
     with torch.no_grad():
         start_total_time = time.time()
         out_ss = sample_ss(
@@ -254,10 +274,9 @@ def eval():
         )   
         end_time = time.time()
         print(f"SLAT Morphing Time: {end_time - start_time:.4f} seconds")
-        from TRELLIS.trellis.modules import sparse as sp
         save_slat_glb(
             slat_decoder,
-            sp.SparseTensor,
+            sp_trellis.SparseTensor,
             out_slat.feats,
             out_slat.coords,
             "./outputs/evaluation_time/morphing_result.glb",
@@ -269,7 +288,7 @@ def eval():
 
     save_slat_glb(
         slat_decoder,
-        sp.SparseTensor,
+        sp_trellis.SparseTensor,
         target_feats,
         target_coords,
         "./outputs/evaluation_time/target.glb",
