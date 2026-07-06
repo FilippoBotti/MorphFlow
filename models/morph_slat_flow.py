@@ -6,6 +6,7 @@ from torch import nn
 
 from models import cond_encoder
 from models import structured_latent_flow
+from models.semantic_token_matching import SemanticTokenMatchingMixin
 from modules import sparse as sp
 
 
@@ -32,7 +33,7 @@ TRELLIS_SLAT_STD = (
 )
 
 
-class MorphSLatFlow(nn.Module):
+class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
     """
     MorphFlow variant for TRELLIS structured-latent flow.
 
@@ -65,6 +66,18 @@ class MorphSLatFlow(nn.Module):
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
+        use_semantic_token_matching=False,
+        semantic_match_dim=128,
+        semantic_match_temperature=0.1,
+        semantic_match_max_align=0.25,
+        semantic_match_alpha_weight=True,
+        semantic_match_detach_scores=False,
+        semantic_match_exclude_style_tokens=True,
+        semantic_cycle_loss_weight=0.0,
+        semantic_cycle_loss_prob=1.0,
+        semantic_cycle_detach_targets=True,
+        semantic_cycle_alpha_weight=True,
+        semantic_match_log_stats=True,
     ):
         super().__init__()
         self.sigma_min = sigma_min
@@ -156,6 +169,25 @@ class MorphSLatFlow(nn.Module):
             self.separate_cond_proj = nn.Linear(128, model_channels)
             if self.cond_proj_norm == "layernorm":
                 self.cond_proj_layer_norm = nn.LayerNorm(model_channels)
+
+
+        semantic_style_tokens = 0
+        if semantic_match_exclude_style_tokens and not hasattr(self, "cond_resampler"):
+            semantic_style_tokens = int(getattr(self.cond_encoder, "style_tokens", 0))
+        self._init_semantic_token_matching(
+            use_semantic_token_matching=use_semantic_token_matching,
+            semantic_match_dim=semantic_match_dim,
+            semantic_match_temperature=semantic_match_temperature,
+            semantic_match_max_align=semantic_match_max_align,
+            semantic_match_alpha_weight=semantic_match_alpha_weight,
+            semantic_match_detach_scores=semantic_match_detach_scores,
+            semantic_match_style_tokens=semantic_style_tokens,
+            semantic_cycle_loss_weight=semantic_cycle_loss_weight,
+            semantic_cycle_loss_prob=semantic_cycle_loss_prob,
+            semantic_cycle_detach_targets=semantic_cycle_detach_targets,
+            semantic_cycle_alpha_weight=semantic_cycle_alpha_weight,
+            semantic_match_log_stats=semantic_match_log_stats,
+        )
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
@@ -288,6 +320,7 @@ class MorphSLatFlow(nn.Module):
         cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
         cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
         cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
+        cond1, cond2 = self._apply_semantic_token_matching(cond1, cond2, alpha)
 
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
@@ -335,6 +368,48 @@ class MorphSLatFlow(nn.Module):
         return self.slat_flow(x_t, t_flow, cond, alpha=alpha)
 
     def forward_flow_cfg(
+        self,
+        x_t: sp.SparseTensor,
+        t: torch.Tensor,
+        src_1_feats: torch.Tensor,
+        src_2_feats: torch.Tensor,
+        src_1_coords: torch.Tensor,
+        src_2_coords: torch.Tensor,
+        alpha: torch.Tensor,
+        guidance_scale: float = 1.0,
+    ) -> sp.SparseTensor:
+        if guidance_scale == 1.0:
+            return self.forward_flow(
+                x_t,
+                t,
+                src_1_feats,
+                src_2_feats,
+                src_1_coords,
+                src_2_coords,
+                alpha,
+            )
+
+        cond = self._build_condition(
+            src_1_feats,
+            src_1_coords,
+            src_2_feats,
+            src_2_coords,
+            alpha,
+        )
+        if not self.separate_cond:
+            batch_size = cond.shape[0]
+            null_cond = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond.dtype)
+        else:
+            cond1, cond2, alpha_cond = cond
+            batch_size = cond1.shape[0]
+            null_tensor = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond1.dtype)
+            null_cond = (null_tensor, null_tensor, alpha_cond)
+
+        t_flow = t.float() * 1000.0
+        v_cond = self.slat_flow(x_t, t_flow, cond, alpha=alpha)
+        v_uncond = self.slat_flow(x_t, t_flow, null_cond, alpha=alpha)
+        return v_uncond + guidance_scale * (v_cond - v_uncond)
+
         self,
         x_t: sp.SparseTensor,
         t: torch.Tensor,
@@ -420,6 +495,41 @@ class MorphSLatFlow(nn.Module):
             }
 
     def forward(
+        self,
+        target_feats: torch.Tensor,
+        target_coords: torch.Tensor,
+        src_1_feats: torch.Tensor,
+        src_1_coords: torch.Tensor,
+        src_2_feats: torch.Tensor,
+        src_2_coords: torch.Tensor,
+        alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        x_0 = self.make_slat(target_feats, target_coords)
+        x_0 = self.normalize_slat(x_0)
+
+        batch_size = x_0.shape[0]
+        t = self.sample_t(batch_size, x_0.device)
+        x_t, noise = self.diffuse(x_0, t)
+        velocity = self.get_v(x_0, noise)
+
+        self._begin_semantic_match_record(x_0.device)
+        pred = self.forward_flow(
+            x_t,
+            t,
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+        )
+
+        base_loss = self.batch_mean_mse(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, base_loss.dtype)
+        loss = base_loss + semantic_aux
+        self._update_forward_metrics(pred, velocity, loss)
+        self.last_forward_metrics.update(self._semantic_match_metrics())
+        return loss
+
         self,
         target_feats: torch.Tensor,
         target_coords: torch.Tensor,

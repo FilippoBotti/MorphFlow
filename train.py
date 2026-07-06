@@ -97,6 +97,20 @@ def build_parser():
     parser.add_argument("--dino_dim", type=int, default=1024, help="Feature dimension emitted by the selected DINO model.")
     parser.add_argument("--dino_layer_norm", type=int, choices=[0, 1], default=1)
 
+    # Semantic token matching / cycle consistency on source condition tokens.
+    parser.add_argument("--use_semantic_token_matching", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--semantic_match_dim", type=int, default=128)
+    parser.add_argument("--semantic_match_temperature", type=float, default=0.1)
+    parser.add_argument("--semantic_match_max_align", type=float, default=0.25)
+    parser.add_argument("--semantic_match_alpha_weight", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--semantic_match_detach_scores", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--semantic_match_exclude_style_tokens", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--semantic_cycle_loss_weight", type=float, default=0.0)
+    parser.add_argument("--semantic_cycle_loss_prob", type=float, default=1.0)
+    parser.add_argument("--semantic_cycle_detach_targets", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--semantic_cycle_alpha_weight", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--semantic_match_log_stats", type=int, choices=[0, 1], default=1)
+
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
     parser.add_argument("--endpoint_loss_weight", type=float, default=0.0)
@@ -314,6 +328,18 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "dino_model": args.dino_model,
         "dino_dim": args.dino_dim,
         "dino_layer_norm": args.dino_layer_norm == 1,
+        "use_semantic_token_matching": args.use_semantic_token_matching == 1,
+        "semantic_match_dim": args.semantic_match_dim,
+        "semantic_match_temperature": args.semantic_match_temperature,
+        "semantic_match_max_align": args.semantic_match_max_align,
+        "semantic_match_alpha_weight": args.semantic_match_alpha_weight == 1,
+        "semantic_match_detach_scores": args.semantic_match_detach_scores == 1,
+        "semantic_match_exclude_style_tokens": args.semantic_match_exclude_style_tokens == 1,
+        "semantic_cycle_loss_weight": args.semantic_cycle_loss_weight,
+        "semantic_cycle_loss_prob": args.semantic_cycle_loss_prob,
+        "semantic_cycle_detach_targets": args.semantic_cycle_detach_targets == 1,
+        "semantic_cycle_alpha_weight": args.semantic_cycle_alpha_weight == 1,
+        "semantic_match_log_stats": args.semantic_match_log_stats == 1,
     }
 
     signature = inspect.signature(model_cls.__init__)
@@ -408,6 +434,9 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
     keys = (
         ("relative_improvement", "slat_rel"),
         ("pred_target_cosine", "slat_cos"),
+        ("semantic_cycle_loss_weighted", "sem_cyc"),
+        ("semantic_align_lambda", "sem_lam"),
+        ("semantic_entropy_12", "sem_H12"),
         ("pred_std", "pred_std"),
         ("target_std", "target_std"),
         ("mse_zero", "mse_zero"),
@@ -553,15 +582,17 @@ def compute_loss(
 
 
 FREEZE_MODULE_ALIASES = {
-    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
-    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
-    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "cond": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "semantic_matcher*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "condition": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "semantic_matcher*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
+    "conditioning": ["cond_encoder*", "cond_fusion*", "separate_cond_proj*", "cond_proj_layer_norm*", "cond_resampler*", "cond_token_layer_norm*", "cond_alpha_mod*", "semantic_matcher*", "dino_norm*", "dino_proj*", "dino_out_norm*", "null_cond"],
     "cond_encoder": ["cond_encoder*"],
     "cond_fusion": ["cond_fusion*"],
     "separate_cond_proj": ["separate_cond_proj*", "cond_proj_layer_norm*"],
     "cond_proj_norm": ["cond_proj_layer_norm*"],
     "cond_resampler": ["cond_resampler*"],
     "cond_token_norm": ["cond_token_layer_norm*", "cond_alpha_mod*"],
+    "semantic_matcher": ["semantic_matcher*"],
+    "semantic_token_matching": ["semantic_matcher*"],
     "dino": ["dino_norm*", "dino_proj*", "dino_out_norm*"],
     "null_cond": ["null_cond"],
     "flow": ["sparse_structure_flow*", "slat_flow*"],
@@ -679,7 +710,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         accelerator.print("WARNING: --use_ema is accepted for compatibility but ignored in this simplified train.py.")
 
     if args.slat_condition_source == "dino":
-        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
+        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod", "semantic_matcher"]:
             module = getattr(model, name, None)
             if module is not None:
                 for p in module.parameters():
@@ -698,7 +729,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
             for p in model.cond_fusion.parameters():
                 p.requires_grad = True
 
-        for name in ["cond_encoder", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod"]:
+        for name in ["cond_encoder", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod", "semantic_matcher"]:
             module = getattr(model, name, None)
             if module is not None:
                 for p in module.parameters():
@@ -777,6 +808,7 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
         "cond_resampler",
         "cond_token_layer_norm",
         "cond_alpha_mod",
+        "semantic_matcher",
         "dino_norm",
         "dino_proj",
         "dino_out_norm",
@@ -1047,6 +1079,18 @@ def train(args):
         raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
     if args.t_logit_std <= 0.0:
         raise ValueError(f"--t_logit_std must be > 0, got {args.t_logit_std}")
+    if args.semantic_match_temperature <= 0.0:
+        raise ValueError(f"--semantic_match_temperature must be > 0, got {args.semantic_match_temperature}")
+    if args.semantic_match_dim <= 0:
+        raise ValueError(f"--semantic_match_dim must be > 0, got {args.semantic_match_dim}")
+    if args.semantic_match_max_align < 0.0:
+        raise ValueError(f"--semantic_match_max_align must be >= 0, got {args.semantic_match_max_align}")
+    if args.semantic_cycle_loss_weight < 0.0:
+        raise ValueError(f"--semantic_cycle_loss_weight must be >= 0, got {args.semantic_cycle_loss_weight}")
+    if args.semantic_cycle_loss_prob < 0.0 or args.semantic_cycle_loss_prob > 1.0:
+        raise ValueError(f"--semantic_cycle_loss_prob must be in [0, 1], got {args.semantic_cycle_loss_prob}")
+    if args.semantic_cycle_loss_weight > 0.0 and args.use_semantic_token_matching == 0:
+        raise ValueError("--semantic_cycle_loss_weight > 0 requires --use_semantic_token_matching=1")
     if args.slat_condition_source == "dino" and args.flow_target != "slat":
         raise ValueError("--slat_condition_source dino is only valid with --flow_target slat.")
     if args.slat_condition_source == "dino" and not args.source_images_root:
@@ -1320,6 +1364,18 @@ def train(args):
     accelerator.print(f"Model requires source SS latents: {requires_source_ss_latents}")
     accelerator.print(f"Separate cond: {args.separate_cond == 1}")
     accelerator.print(f"Separate cond gate: {args.separate_cond_gate}")
+    accelerator.print(f"Semantic token matching: {args.use_semantic_token_matching == 1}")
+    if args.use_semantic_token_matching == 1:
+        accelerator.print(f"Semantic match dim: {args.semantic_match_dim}")
+        accelerator.print(f"Semantic match temperature: {args.semantic_match_temperature}")
+        accelerator.print(f"Semantic match max align: {args.semantic_match_max_align}")
+        accelerator.print(f"Semantic match alpha weighting: {args.semantic_match_alpha_weight == 1}")
+        accelerator.print(f"Semantic match detach scores: {args.semantic_match_detach_scores == 1}")
+        accelerator.print(f"Semantic match exclude style tokens: {args.semantic_match_exclude_style_tokens == 1}")
+        accelerator.print(f"Semantic cycle loss weight: {args.semantic_cycle_loss_weight}")
+        accelerator.print(f"Semantic cycle loss probability: {args.semantic_cycle_loss_prob}")
+        accelerator.print(f"Semantic cycle detach targets: {args.semantic_cycle_detach_targets == 1}")
+        accelerator.print(f"Semantic cycle alpha weighting: {args.semantic_cycle_alpha_weight == 1}")
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     if args.use_lora == 1:
         accelerator.print(f"LoRA attention scope: {args.lora_attention_scope}")

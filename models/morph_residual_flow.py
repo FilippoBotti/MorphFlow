@@ -51,6 +51,18 @@ class MorphResidualSSFlow(MorphFlow):
         t_schedule="logit_normal",
         t_logit_mean=0.0,
         t_logit_std=1.0,
+        use_semantic_token_matching=False,
+        semantic_match_dim=128,
+        semantic_match_temperature=0.1,
+        semantic_match_max_align=0.25,
+        semantic_match_alpha_weight=True,
+        semantic_match_detach_scores=False,
+        semantic_match_exclude_style_tokens=True,
+        semantic_cycle_loss_weight=0.0,
+        semantic_cycle_loss_prob=1.0,
+        semantic_cycle_detach_targets=True,
+        semantic_cycle_alpha_weight=True,
+        semantic_match_log_stats=True,
     ):
         super().__init__(
             sigma_min=sigma_min,
@@ -74,6 +86,18 @@ class MorphResidualSSFlow(MorphFlow):
             t_schedule=t_schedule,
             t_logit_mean=t_logit_mean,
             t_logit_std=t_logit_std,
+            use_semantic_token_matching=use_semantic_token_matching,
+            semantic_match_dim=semantic_match_dim,
+            semantic_match_temperature=semantic_match_temperature,
+            semantic_match_max_align=semantic_match_max_align,
+            semantic_match_alpha_weight=semantic_match_alpha_weight,
+            semantic_match_detach_scores=semantic_match_detach_scores,
+            semantic_match_exclude_style_tokens=semantic_match_exclude_style_tokens,
+            semantic_cycle_loss_weight=semantic_cycle_loss_weight,
+            semantic_cycle_loss_prob=semantic_cycle_loss_prob,
+            semantic_cycle_detach_targets=semantic_cycle_detach_targets,
+            semantic_cycle_alpha_weight=semantic_cycle_alpha_weight,
+            semantic_match_log_stats=semantic_match_log_stats,
         )
         if residual_interp_gate not in ("none", "alpha"):
             raise ValueError(
@@ -177,6 +201,47 @@ class MorphResidualSSFlow(MorphFlow):
         )
 
     def flow_matching_loss(
+        self,
+        x_0,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+        alpha,
+        return_terms=False,
+        apply_cfg_drop=True,
+        src1_ss_latent=None,
+        src2_ss_latent=None,
+    ):
+        if src1_ss_latent is None or src2_ss_latent is None:
+            raise ValueError("MorphResidualSSFlow requires src1_ss_latent and src2_ss_latent.")
+
+        B = x_0.shape[0]
+        x_0 = self.ss_to_residual(x_0, src1_ss_latent, src2_ss_latent, alpha)
+        t = self.sample_t(B, x_0.device)
+        x_t, noise = self.diffuse(x_0, t)
+        velocity = self.get_v(x_0, noise)
+
+        self._begin_semantic_match_record(x_0.device)
+        pred = self.forward_flow(
+            x_t,
+            t,
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=apply_cfg_drop,
+        )
+        loss = F.mse_loss(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, loss.dtype)
+        loss = loss + semantic_aux
+        self.last_forward_metrics = self._semantic_match_metrics()
+
+        if return_terms:
+            return loss, x_t, t, pred
+        return loss
+
         self,
         x_0,
         src_1_feats,
