@@ -16,7 +16,7 @@ import utils3d
 from TRELLIS.trellis import models
 from TRELLIS.trellis.modules import sparse as sp
 from dataset_toolkits.utils import sphere_hammersley_sequence
-
+from tqdm import tqdm
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 

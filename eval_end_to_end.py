@@ -247,6 +247,17 @@ def eval():
 
     with torch.no_grad():
         start_total_time = time.time()
+        _, _ = extract_slat_feats_and_coords(
+            "/home/filippo/projects/MorphFlow/outputs/evaluation_time/target.glb",
+            slat_encoder
+        )
+        _, _ = extract_slat_feats_and_coords(
+            "/home/filippo/projects/MorphFlow/outputs/evaluation_time/target.glb",
+            slat_encoder
+        )
+        print("Encoding time: {:.4f} seconds".format(time.time() - start_total_time))
+        
+        morphing_time = time.time()
         out_ss = sample_ss(
             model_ss,
             src1_feats,
@@ -258,7 +269,7 @@ def eval():
             'cuda'
         )
         end_time = time.time()
-        print(f"SS Morphing Time: {end_time - start_total_time:.4f} seconds")
+        print(f"SS Morphing Time: {end_time - morphing_time:.4f} seconds")
         coords = torch.argwhere(ss_decoder(out_ss)>0)[:, [0, 2, 3, 4]].int()
         start_time = time.time()
         out_slat = sample_slat(
