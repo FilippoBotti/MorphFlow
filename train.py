@@ -364,6 +364,20 @@ def model_forward_supports_source_images(model: torch.nn.Module) -> bool:
     return "src1_image" in params and "src2_image" in params
 
 
+def model_forward_supports_residual_endpoint_controls(model: torch.nn.Module) -> bool:
+    signature = inspect.signature(unwrap_model_for_attr(model).forward)
+    params = set(signature.parameters.keys())
+    return "residual_endpoint_loss_weight" in params and "residual_endpoint_loss_prob" in params
+
+
+def forced_prob_for_configured_loss(weight: float, prob: float) -> float:
+    """
+    During validation used for best-checkpoint selection, force each configured
+    SS auxiliary loss active. A loss is configured only if weight > 0 and prob > 0.
+    """
+    return 1.0 if weight > 0.0 and prob > 0.0 else 0.0
+
+
 def get_optional_tensor(batch: Dict[str, Any], key: str, device, dtype=torch.float32):
     value = batch.get(key, None)
     if value is None:
@@ -414,12 +428,16 @@ def compute_loss(
     supports_extra_losses: bool,
     supports_source_ss_latents: bool,
     supports_source_images: bool,
+    supports_residual_endpoint_controls: bool,
     needs_source_ss_latents: bool,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
     endpoint_loss_prob: float,
     symmetry_loss_prob: float,
     use_extra_losses: bool,
+    residual_endpoint_loss_weight: Optional[float] = None,
+    residual_endpoint_loss_prob: Optional[float] = None,
+    force_configured_extra_losses_active: bool = False,
 ):
     src1_feats = batch["src1_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
     src1_coords = batch["src1_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
@@ -457,10 +475,42 @@ def compute_loss(
 
     target_ss_latent = batch["target_ss_latent"].to(device=device, dtype=torch.float32, non_blocking=True)
 
+    effective_endpoint_loss_prob = endpoint_loss_prob
+    effective_symmetry_loss_prob = symmetry_loss_prob
+    effective_residual_endpoint_loss_prob = residual_endpoint_loss_prob
+
+    if force_configured_extra_losses_active:
+        effective_endpoint_loss_prob = forced_prob_for_configured_loss(
+            endpoint_loss_weight,
+            endpoint_loss_prob,
+        )
+        effective_symmetry_loss_prob = forced_prob_for_configured_loss(
+            symmetry_loss_weight,
+            symmetry_loss_prob,
+        )
+        if residual_endpoint_loss_weight is not None and residual_endpoint_loss_prob is not None:
+            effective_residual_endpoint_loss_prob = forced_prob_for_configured_loss(
+                residual_endpoint_loss_weight,
+                residual_endpoint_loss_prob,
+            )
+
     source_kwargs = {}
     if supports_source_ss_latents and (
         needs_source_ss_latents
-        or (supports_extra_losses and use_extra_losses and endpoint_loss_weight > 0.0)
+        or (
+            supports_extra_losses
+            and use_extra_losses
+            and endpoint_loss_weight > 0.0
+            and effective_endpoint_loss_prob > 0.0
+        )
+        or (
+            supports_residual_endpoint_controls
+            and use_extra_losses
+            and residual_endpoint_loss_weight is not None
+            and effective_residual_endpoint_loss_prob is not None
+            and residual_endpoint_loss_weight > 0.0
+            and effective_residual_endpoint_loss_prob > 0.0
+        )
     ):
         source_kwargs["src1_ss_latent"] = get_optional_tensor(batch, "src1_ss_latent", device)
         source_kwargs["src2_ss_latent"] = get_optional_tensor(batch, "src2_ss_latent", device)
@@ -469,10 +519,17 @@ def compute_loss(
         kwargs = {
             "endpoint_loss_weight": endpoint_loss_weight,
             "symmetry_loss_weight": symmetry_loss_weight,
-            "endpoint_loss_prob": endpoint_loss_prob,
-            "symmetry_loss_prob": symmetry_loss_prob,
+            "endpoint_loss_prob": effective_endpoint_loss_prob,
+            "symmetry_loss_prob": effective_symmetry_loss_prob,
             **source_kwargs,
         }
+        if (
+            supports_residual_endpoint_controls
+            and residual_endpoint_loss_weight is not None
+            and effective_residual_endpoint_loss_prob is not None
+        ):
+            kwargs["residual_endpoint_loss_weight"] = residual_endpoint_loss_weight
+            kwargs["residual_endpoint_loss_prob"] = effective_residual_endpoint_loss_prob
 
         return model(
             target_ss_latent,
@@ -1106,6 +1163,7 @@ def train(args):
     supports_extra_losses = model_forward_supports_extra_losses(model)
     supports_source_ss_latents = model_forward_supports_source_ss_latents(model)
     supports_source_images = model_forward_supports_source_images(model)
+    supports_residual_endpoint_controls = model_forward_supports_residual_endpoint_controls(model)
     requires_source_ss_latents = model_requires_source_ss_latents(model)
     if not supports_extra_losses and (args.endpoint_loss_weight > 0.0 or args.symmetry_loss_weight > 0.0):
         accelerator.print(
@@ -1295,6 +1353,12 @@ def train(args):
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
     accelerator.print(f"Symmetry loss probability: {args.symmetry_loss_prob}")
     accelerator.print(f"Extra loss support in MorphFlow.forward: {supports_extra_losses}")
+    accelerator.print(f"Residual endpoint loss controls in model.forward: {supports_residual_endpoint_controls}")
+    if args.flow_target == "ss":
+        accelerator.print(
+            "SS best-checkpoint validation objective: base validation loss plus all configured "
+            "SS auxiliary losses forced active with probability 1.0."
+        )
     accelerator.print(f"Source-image support in model.forward: {supports_source_images}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
@@ -1345,12 +1409,16 @@ def train(args):
                     supports_extra_losses=supports_extra_losses,
                     supports_source_ss_latents=supports_source_ss_latents,
                     supports_source_images=supports_source_images,
+                    supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                     needs_source_ss_latents=requires_source_ss_latents,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
                     endpoint_loss_prob=args.endpoint_loss_prob,
                     symmetry_loss_prob=args.symmetry_loss_prob,
                     use_extra_losses=True,
+                    residual_endpoint_loss_weight=args.residual_endpoint_weight,
+                    residual_endpoint_loss_prob=args.residual_endpoint_prob,
+                    force_configured_extra_losses_active=False,
                 )
 
             accelerator.backward(loss)
@@ -1421,6 +1489,7 @@ def train(args):
 
             with torch.no_grad():
                 for val_batch_idx, val_batch in enumerate(val_bar, start=1):
+                    use_ss_best_extra_losses = args.flow_target == "ss"
                     with accelerator.autocast():
                         val_loss = compute_loss(
                             model=model,
@@ -1430,12 +1499,16 @@ def train(args):
                             supports_extra_losses=supports_extra_losses,
                             supports_source_ss_latents=supports_source_ss_latents,
                             supports_source_images=supports_source_images,
+                            supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                             needs_source_ss_latents=requires_source_ss_latents,
-                            endpoint_loss_weight=0.0,
-                            symmetry_loss_weight=0.0,
-                            endpoint_loss_prob=0.0,
-                            symmetry_loss_prob=0.0,
-                            use_extra_losses=False,
+                            endpoint_loss_weight=args.endpoint_loss_weight if use_ss_best_extra_losses else 0.0,
+                            symmetry_loss_weight=args.symmetry_loss_weight if use_ss_best_extra_losses else 0.0,
+                            endpoint_loss_prob=args.endpoint_loss_prob if use_ss_best_extra_losses else 0.0,
+                            symmetry_loss_prob=args.symmetry_loss_prob if use_ss_best_extra_losses else 0.0,
+                            use_extra_losses=use_ss_best_extra_losses,
+                            residual_endpoint_loss_weight=args.residual_endpoint_weight if use_ss_best_extra_losses else 0.0,
+                            residual_endpoint_loss_prob=args.residual_endpoint_prob if use_ss_best_extra_losses else 0.0,
+                            force_configured_extra_losses_active=use_ss_best_extra_losses,
                         )
 
                     reduced_val_loss = accelerator.reduce(val_loss.detach(), reduction="mean")

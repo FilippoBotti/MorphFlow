@@ -328,9 +328,26 @@ class MorphResidualSSFlow(MorphFlow):
         symmetry_loss_prob=1.0,
         src1_ss_latent=None,
         src2_ss_latent=None,
+        residual_endpoint_loss_weight=None,
+        residual_endpoint_loss_prob=None,
     ):
         if src1_ss_latent is None or src2_ss_latent is None:
             raise ValueError("MorphResidualSSFlow.forward requires src1_ss_latent and src2_ss_latent.")
+
+        residual_endpoint_override = (
+            residual_endpoint_loss_weight is not None
+            or residual_endpoint_loss_prob is not None
+        )
+        effective_residual_endpoint_weight = (
+            self.residual_endpoint_weight
+            if residual_endpoint_loss_weight is None
+            else float(residual_endpoint_loss_weight)
+        )
+        effective_residual_endpoint_prob = (
+            self.residual_endpoint_prob
+            if residual_endpoint_loss_prob is None
+            else float(residual_endpoint_loss_prob)
+        )
 
         endpoint_active = (
             endpoint_loss_weight > 0.0
@@ -338,10 +355,10 @@ class MorphResidualSSFlow(MorphFlow):
         )
         symmetry_active = symmetry_loss_weight > 0.0 and torch.rand((), device=x_0.device).item() < symmetry_loss_prob
         residual_endpoint_active = (
-            self.training
-            and self.residual_endpoint_weight > 0.0
-            and self.residual_endpoint_prob > 0.0
-            and torch.rand((), device=x_0.device).item() < self.residual_endpoint_prob
+            (self.training or residual_endpoint_override)
+            and effective_residual_endpoint_weight > 0.0
+            and effective_residual_endpoint_prob > 0.0
+            and torch.rand((), device=x_0.device).item() < effective_residual_endpoint_prob
         )
 
         loss, x_t, t, pred = self.flow_matching_loss(
@@ -393,7 +410,7 @@ class MorphResidualSSFlow(MorphFlow):
                 src_2_feats,
                 src_2_coords,
             )
-            loss = loss + self.residual_endpoint_weight * residual_endpoint_term
+            loss = loss + effective_residual_endpoint_weight * residual_endpoint_term
 
         self.last_loss_terms = {
             "endpoint_active": endpoint_term is not None,
