@@ -242,43 +242,6 @@ class MorphResidualSSFlow(MorphFlow):
             return loss, x_t, t, pred
         return loss
 
-        self,
-        x_0,
-        src_1_feats,
-        src_1_coords,
-        src_2_feats,
-        src_2_coords,
-        alpha,
-        return_terms=False,
-        apply_cfg_drop=True,
-        src1_ss_latent=None,
-        src2_ss_latent=None,
-    ):
-        if src1_ss_latent is None or src2_ss_latent is None:
-            raise ValueError("MorphResidualSSFlow requires src1_ss_latent and src2_ss_latent.")
-
-        B = x_0.shape[0]
-        x_0 = self.ss_to_residual(x_0, src1_ss_latent, src2_ss_latent, alpha)
-        t = self.sample_t(B, x_0.device)
-        x_t, noise = self.diffuse(x_0, t)
-
-        velocity = self.get_v(x_0, noise)
-        pred = self.forward_flow(
-            x_t,
-            t,
-            src_1_feats,
-            src_2_feats,
-            src_1_coords,
-            src_2_coords,
-            alpha,
-            apply_cfg_drop=apply_cfg_drop,
-        )
-        loss = F.mse_loss(pred, velocity)
-
-        if return_terms:
-            return loss, x_t, t, pred
-        return loss
-
     def endpoint_loss(
         self,
         src_1_ss_latent,

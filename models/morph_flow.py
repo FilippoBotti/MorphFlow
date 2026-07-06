@@ -320,57 +320,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         t_flow = t.float() * 1000.0
         return self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
 
-        self,
-        x_t,
-        t,
-        src_1_feats,
-        src_2_feats,
-        src_1_coords,
-        src_2_coords,
-        alpha,
-        apply_cfg_drop=True,
-    ):
-        # condition
-        src_1_feats = self.normalize_condition_feats(src_1_feats)
-        src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
-        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
-        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
-        
-        if not self.separate_cond:
-            cond = self.cond_fusion(cond1, cond2, alpha)
-        else:
-            cond1 = self.separate_cond_proj(cond1)
-            cond2 = self.separate_cond_proj(cond2)
-            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
-            cond = (cond1, cond2, alpha)
-
-        if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
-            B = cond1.shape[0] if self.separate_cond else cond.shape[0]
-            drop_mask = torch.rand(B, device=cond1.device) < self.cfg_drop_prob
-
-            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
-
-            if not self.separate_cond:
-                cond = torch.where(
-                    drop_mask.view(B, 1, 1),
-                    null_cond,
-                    cond,
-                )
-            else:
-                drop_mask = drop_mask.view(B, 1, 1)
-                cond = (
-                    torch.where(drop_mask, null_cond, cond1),
-                    torch.where(drop_mask, null_cond, cond2),
-                    alpha
-                )
-
-        # diffusion
-        t_flow = t.float() * 1000.0
-        out = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
-
-        return out
-    
     def forward_flow_cfg(self, x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha, guidance_scale=1.0):
         if guidance_scale == 1.0:
             return self.forward_flow(
@@ -403,43 +352,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         t_flow = t.float() * 1000.0
         v_cond = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
         v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond, alpha=alpha)
-        return v_uncond + guidance_scale * (v_cond - v_uncond)
-
-        if guidance_scale == 1.0:
-            return self.forward_flow(
-                x_t,
-                t,
-                src_1_feats,
-                src_2_feats,
-                src_1_coords,
-                src_2_coords,
-                alpha,
-            )
-
-        src_1_feats = self.normalize_condition_feats(src_1_feats)
-        src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
-        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
-        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
-        
-        if not self.separate_cond:
-            cond = self.cond_fusion(cond1, cond2, alpha)
-            B = cond.shape[0]
-            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
-        else:
-            cond1 = self.separate_cond_proj(cond1)
-            cond2 = self.separate_cond_proj(cond2)
-            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
-            cond = (cond1, cond2, alpha)
-            B = cond1.shape[0]
-            null_cond_tensor = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
-            null_cond = (null_cond_tensor, null_cond_tensor, alpha)
-
-        t_flow = t.float() * 1000.0
-
-        v_cond = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
-        v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond, alpha=alpha)
-
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 
     def _prepare_ss_latent(self, x_0):
@@ -479,39 +391,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         semantic_aux = self._semantic_match_aux_loss(x_0.device, loss.dtype)
         loss = loss + semantic_aux
         self.last_forward_metrics = self._semantic_match_metrics()
-
-        if return_terms:
-            return loss, x_t, t, pred
-        return loss
-
-        self,
-        x_0,
-        src_1_feats,
-        src_1_coords,
-        src_2_feats,
-        src_2_coords,
-        alpha,
-        return_terms=False,
-        apply_cfg_drop=True,
-    ):
-        B = x_0.shape[0]
-        x_0 = self._prepare_ss_latent(x_0)
-        t = self.sample_t(B, x_0.device)
-        x_t, noise = self.diffuse(x_0, t)
-
-        velocity = self.get_v(x_0, noise)
-
-        pred = self.forward_flow(
-            x_t,
-            t,
-            src_1_feats,
-            src_2_feats,
-            src_1_coords,
-            src_2_coords,
-            alpha,
-            apply_cfg_drop=apply_cfg_drop,
-        )
-        loss = F.mse_loss(pred, velocity)
 
         if return_terms:
             return loss, x_t, t, pred

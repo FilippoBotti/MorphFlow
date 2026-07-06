@@ -410,51 +410,6 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
         v_uncond = self.slat_flow(x_t, t_flow, null_cond, alpha=alpha)
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 
-        self,
-        x_t: sp.SparseTensor,
-        t: torch.Tensor,
-        src_1_feats: torch.Tensor,
-        src_2_feats: torch.Tensor,
-        src_1_coords: torch.Tensor,
-        src_2_coords: torch.Tensor,
-        alpha: torch.Tensor,
-        guidance_scale: float = 1.0,
-    ) -> sp.SparseTensor:
-        if guidance_scale == 1.0:
-            return self.forward_flow(
-                x_t,
-                t,
-                src_1_feats,
-                src_2_feats,
-                src_1_coords,
-                src_2_coords,
-                alpha,
-            )
-
-        src_1_feats = self.normalize_condition_feats(src_1_feats)
-        src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
-        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
-        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
-
-        if not self.separate_cond:
-            cond = self.cond_fusion(cond1, cond2, alpha)
-            batch_size = cond.shape[0]
-            null_cond = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond.dtype)
-        else:
-            cond1 = self.separate_cond_proj(cond1)
-            cond2 = self.separate_cond_proj(cond2)
-            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
-            cond = (cond1, cond2, alpha)
-            batch_size = cond1.shape[0]
-            null_tensor = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond1.dtype)
-            null_cond = (null_tensor, null_tensor, alpha)
-
-        t_flow = t.float() * 1000.0
-        v_cond = self.slat_flow(x_t, t_flow, cond, alpha=alpha)
-        v_uncond = self.slat_flow(x_t, t_flow, null_cond, alpha=alpha)
-        return v_uncond + guidance_scale * (v_cond - v_uncond)
-
     @staticmethod
     def batch_mean_mse(pred: sp.SparseTensor, target: sp.SparseTensor) -> torch.Tensor:
         if pred.shape[0] <= 1:
@@ -530,33 +485,3 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
         self.last_forward_metrics.update(self._semantic_match_metrics())
         return loss
 
-        self,
-        target_feats: torch.Tensor,
-        target_coords: torch.Tensor,
-        src_1_feats: torch.Tensor,
-        src_1_coords: torch.Tensor,
-        src_2_feats: torch.Tensor,
-        src_2_coords: torch.Tensor,
-        alpha: torch.Tensor,
-    ) -> torch.Tensor:
-        x_0 = self.make_slat(target_feats, target_coords)
-        x_0 = self.normalize_slat(x_0)
-
-        batch_size = x_0.shape[0]
-        t = self.sample_t(batch_size, x_0.device)
-        x_t, noise = self.diffuse(x_0, t)
-        velocity = self.get_v(x_0, noise)
-
-        pred = self.forward_flow(
-            x_t,
-            t,
-            src_1_feats,
-            src_2_feats,
-            src_1_coords,
-            src_2_coords,
-            alpha,
-        )
-
-        loss = self.batch_mean_mse(pred, velocity)
-        self._update_forward_metrics(pred, velocity, loss)
-        return loss
