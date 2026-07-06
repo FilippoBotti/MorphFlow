@@ -1,0 +1,6 @@
+org.label-schema.build-arch: amd64
+org.label-schema.build-date: Wednesday_29_April_2026_14:8:40_CEST
+org.label-schema.schema-version: 1.0
+org.label-schema.usage.singularity.deffile.bootstrap: docker
+org.label-schema.usage.singularity.deffile.from: pytorch/pytorch:2.4.0-cuda11.8-cudnn9-runtime
+org.label-schema.usage.singularity.version: 3.8.7

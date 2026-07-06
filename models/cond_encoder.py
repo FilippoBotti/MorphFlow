@@ -381,8 +381,10 @@ class SparseConv3DConditionEncoder(nn.Module):
                 nn.Linear(out_dim * max(2, self.style_tokens), self.style_tokens * out_dim),
             )
             self.style_pos_emb = nn.Parameter(torch.randn(1, self.style_tokens, out_dim) * 0.02)
+            self.style_pos_emb.register_hook(lambda grad: grad.contiguous())
 
         self.pos_emb = nn.Parameter(torch.randn(1, self.num_blocks, out_dim) * 0.02)
+        self.pos_emb.register_hook(lambda grad: grad.contiguous())
         self.coord_mlp = nn.Sequential(nn.Linear(3, out_dim), nn.SiLU(), nn.Linear(out_dim, out_dim))
         self.pos_scale = nn.Parameter(torch.tensor(1.0))
         self.coord_scale = nn.Parameter(torch.tensor(1.0))

@@ -1,0 +1,249 @@
+===== HOST / SLURM INFO =====
+wn49
+Mon Jun 29 16:31:08 CEST 2026
+
+Currently Loaded Modules:
+  1) go/1.17.8   2) singularity/3.8.7
+
+ 
+
+/hpc/share/tools/singularity/3.8.7/bin/singularity
+singularity version 3.8.7
+PROJECT_DIR=/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow
+TRELLIS_BASE=/hpc/home/marco.barezzi/trellis-singularity
+SIF=/hpc/home/marco.barezzi/containers/trellis-py240-cu118.sif
+-rwxr-xr-x 1 marco.barezzi Person 3.9G Apr 29 14:17 /hpc/home/marco.barezzi/containers/trellis-py240-cu118.sif
+
+===== SINGULARITY INSPECT =====
+org.label-schema.build-arch: amd64
+org.label-schema.build-date: Wednesday_29_April_2026_14:8:40_CEST
+org.label-schema.schema-version: 1.0
+org.label-schema.usage.singularity.deffile.bootstrap: docker
+org.label-schema.usage.singularity.deffile.from: pytorch/pytorch:2.4.0-cuda11.8-cudnn9-runtime
+org.label-schema.usage.singularity.version: 3.8.7
+
+===== SINGULARITY LABELS =====
+org.label-schema.build-arch: amd64
+org.label-schema.build-date: Wednesday_29_April_2026_14:8:40_CEST
+org.label-schema.schema-version: 1.0
+org.label-schema.usage.singularity.deffile.bootstrap: docker
+org.label-schema.usage.singularity.deffile.from: pytorch/pytorch:2.4.0-cuda11.8-cudnn9-runtime
+org.label-schema.usage.singularity.version: 3.8.7
+
+===== SINGULARITY ENVIRONMENT =====
+=== /.singularity.d/env/10-docker2singularity.sh ===
+#!/bin/sh
+export PATH="/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:-"all"}"
+export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-"compute,utility"}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-"/usr/local/nvidia/lib:/usr/local/nvidia/lib64"}"
+export PYTORCH_VERSION="${PYTORCH_VERSION:-"2.4.0"}"
+
+=== /.singularity.d/env/90-environment.sh ===
+#!/bin/sh
+# Custom environment shell code should follow
+
+
+===== SINGULARITY DEFINITION FILE =====
+bootstrap: docker
+from: pytorch/pytorch:2.4.0-cuda11.8-cudnn9-runtime
+
+===== INSIDE CONTAINER =====
+===== OS =====
+PRETTY_NAME="Ubuntu 22.04.4 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.4 LTS (Jammy Jellyfish)"
+VERSION_CODENAME=jammy
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=jammy
+Linux wn49 3.10.0-1160.76.1.el7.x86_64 #1 SMP Wed Aug 10 16:21:17 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux
+
+===== NVIDIA / GPU =====
+/bin/nvidia-smi
+Mon Jun 29 16:31:20 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.144.03             Driver Version: 550.144.03     CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA L40S                    On  |   00000000:41:00.0 Off |                    0 |
+| N/A   28C    P8             32W /  350W |       1MiB /  46068MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+===== CUDA TOOLCHAIN =====
+/usr/bin/bash: line 16: nvcc: command not found
+
+===== PYTHON / PIP / CONDA =====
+/opt/conda/bin/python
+Python 3.11.9
+/opt/conda/bin/pip
+pip 24.0 from /opt/conda/lib/python3.11/site-packages/pip (python 3.11)
+/opt/conda/bin/conda
+conda 24.5.0
+# conda environments:
+#
+morph_trellis            /hpc/home/marco.barezzi/.conda/envs/morph_trellis
+trellis-hpc              /hpc/home/marco.barezzi/.conda/envs/trellis-hpc
+base                     /opt/conda
+
+
+===== PYTORCH / CUDA RUNTIME =====
+Python executable: /opt/conda/bin/python
+Python version: 3.11.9 (main, Apr 19 2024, 16:48:06) [GCC 11.2.0]
+torch: 2.4.0
+torch.version.cuda: 11.8
+torch.cuda.is_available: True
+torch.cuda.device_count: 1
+GPU 0: NVIDIA L40S
+torch.distributed available: True
+NCCL available: True
+torchvision: 0.19.0
+torchaudio: 2.4.0
+xformers: NOT AVAILABLE (ModuleNotFoundError("No module named 'xformers'"))
+flash_attn: NOT AVAILABLE (ModuleNotFoundError("No module named 'flash_attn'"))
+spconv: NOT AVAILABLE (ModuleNotFoundError("No module named 'spconv'"))
+triton: 3.0.0
+transformers: NOT AVAILABLE (ModuleNotFoundError("No module named 'transformers'"))
+accelerate: NOT AVAILABLE (ModuleNotFoundError("No module named 'accelerate'"))
+safetensors: NOT AVAILABLE (ModuleNotFoundError("No module named 'safetensors'"))
+huggingface_hub: NOT AVAILABLE (ModuleNotFoundError("No module named 'huggingface_hub'"))
+diffusers: NOT AVAILABLE (ModuleNotFoundError("No module named 'diffusers'"))
+numpy: 1.26.4
+PIL: 10.4.0
+scipy: NOT AVAILABLE (ModuleNotFoundError("No module named 'scipy'"))
+sklearn: NOT AVAILABLE (ModuleNotFoundError("No module named 'sklearn'"))
+pandas: NOT AVAILABLE (ModuleNotFoundError("No module named 'pandas'"))
+tensorboard: NOT AVAILABLE (ModuleNotFoundError("No module named 'tensorboard'"))
+trimesh: NOT AVAILABLE (ModuleNotFoundError("No module named 'trimesh'"))
+open3d: NOT AVAILABLE (ModuleNotFoundError("No module named 'open3d'"))
+kaolin: NOT AVAILABLE (ModuleNotFoundError("No module named 'kaolin'"))
+nvdiffrast: NOT AVAILABLE (ModuleNotFoundError("No module named 'nvdiffrast'"))
+pytorch3d: NOT AVAILABLE (ModuleNotFoundError("No module named 'pytorch3d'"))
+einops: NOT AVAILABLE (ModuleNotFoundError("No module named 'einops'"))
+omegaconf: NOT AVAILABLE (ModuleNotFoundError("No module named 'omegaconf'"))
+tqdm: 4.66.4
+
+===== SELECTED PACKAGE VERSIONS =====
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+triton==3.0.0
+numpy==1.26.4
+pillow==10.4.0
+tqdm==4.66.4
+
+===== PIP 
+pip freeze || true
+
+echo
+echo =
+/hpc/home/marco.barezzi/trellis-singularity/work
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs/eval_ss
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs/eval_pipeline
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs/eval_slat
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/models
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/models/structured_latent_vae
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/models/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/container_audit
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data/dataset_scripts
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/modules
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/modules/transformer
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/modules/sparse
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/modules/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/modules/attention
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/logs
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/hooks
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/refs
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/objects
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/branches
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/.git/info
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/scripts
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/trainers
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/representations
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/utils
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/models
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/renderers
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/modules
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/trellis/pipelines
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/assets
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/assets/example_morphing
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/assets/example_style
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/assets/example_pokemon
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/extensions
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/extensions/vox2seq
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/logs
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/hooks
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/refs
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/objects
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/branches
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/.git/info
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/morphing_distill
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/morphing_distill/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.github
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.github/workflows
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/datasets
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/trainers
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/representations
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/utils
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/models
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/renderers
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/modules
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/__pycache__
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/trellis/pipelines
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/dataset_toolkits
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/dataset_toolkits/datasets
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/dataset_toolkits/blender_script
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/configs
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/configs/vae
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/configs/generation
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/assets
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/assets/example_image
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/assets/example_multi_image
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/logs
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/hooks
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/refs
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/objects
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/branches
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/info
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/.git/modules
+
+===== RELEVANT FILES =====
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/container_audit/environment.txt
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/extensions/vox2seq/setup.py
+/hpc/home/marco.barezzi/trellis-singularity/work/MorphAny3D/setup.sh
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/dataset_toolkits/setup.sh
+/hpc/home/marco.barezzi/trellis-singularity/work/TRELLIS/setup.sh
+
+Audit completed.
+Main output: /hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/container_audit/runtime_full.txt

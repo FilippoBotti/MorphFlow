@@ -1,0 +1,12 @@
+=== /.singularity.d/env/10-docker2singularity.sh ===
+#!/bin/sh
+export PATH="/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:-"all"}"
+export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-"compute,utility"}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-"/usr/local/nvidia/lib:/usr/local/nvidia/lib64"}"
+export PYTORCH_VERSION="${PYTORCH_VERSION:-"2.4.0"}"
+
+=== /.singularity.d/env/90-environment.sh ===
+#!/bin/sh
+# Custom environment shell code should follow
+
