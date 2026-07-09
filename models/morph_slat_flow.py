@@ -397,6 +397,7 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
         cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
         cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
         cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
+        cond1, cond2 = self._apply_semantic_token_matching(cond1, cond2, alpha)
 
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
