@@ -6,6 +6,7 @@ from torch import nn
 
 from models import cond_encoder
 from models import structured_latent_flow
+from models.semantic_token_matching import SemanticTokenMatchingMixin
 from modules import sparse as sp
 
 
@@ -32,7 +33,7 @@ TRELLIS_SLAT_STD = (
 )
 
 
-class MorphSLatFlow(nn.Module):
+class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
     """
     MorphFlow variant for TRELLIS structured-latent flow.
 
@@ -65,6 +66,18 @@ class MorphSLatFlow(nn.Module):
         t_schedule: str = "logit_normal",
         t_logit_mean: float = 0.0,
         t_logit_std: float = 1.0,
+        use_semantic_token_matching=False,
+        semantic_match_dim=128,
+        semantic_match_temperature=0.1,
+        semantic_match_max_align=0.25,
+        semantic_match_alpha_weight=True,
+        semantic_match_detach_scores=False,
+        semantic_match_exclude_style_tokens=True,
+        semantic_cycle_loss_weight=0.0,
+        semantic_cycle_loss_prob=1.0,
+        semantic_cycle_detach_targets=True,
+        semantic_cycle_alpha_weight=True,
+        semantic_match_log_stats=True,
     ):
         super().__init__()
         self.sigma_min = sigma_min
@@ -156,6 +169,24 @@ class MorphSLatFlow(nn.Module):
             self.separate_cond_proj = nn.Linear(128, model_channels)
             if self.cond_proj_norm == "layernorm":
                 self.cond_proj_layer_norm = nn.LayerNorm(model_channels)
+
+        semantic_style_tokens = 0
+        if semantic_match_exclude_style_tokens and not hasattr(self, "cond_resampler"):
+            semantic_style_tokens = int(getattr(self.cond_encoder, "style_tokens", 0))
+        self._init_semantic_token_matching(
+            use_semantic_token_matching=use_semantic_token_matching,
+            semantic_match_dim=semantic_match_dim,
+            semantic_match_temperature=semantic_match_temperature,
+            semantic_match_max_align=semantic_match_max_align,
+            semantic_match_alpha_weight=semantic_match_alpha_weight,
+            semantic_match_detach_scores=semantic_match_detach_scores,
+            semantic_match_style_tokens=semantic_style_tokens,
+            semantic_cycle_loss_weight=semantic_cycle_loss_weight,
+            semantic_cycle_loss_prob=semantic_cycle_loss_prob,
+            semantic_cycle_detach_targets=semantic_cycle_detach_targets,
+            semantic_cycle_alpha_weight=semantic_cycle_alpha_weight,
+            semantic_match_log_stats=semantic_match_log_stats,
+        )
 
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
@@ -289,6 +320,7 @@ class MorphSLatFlow(nn.Module):
         cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
         cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
         cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
+        cond1, cond2 = self._apply_semantic_token_matching(cond1, cond2, alpha)
 
         if not self.separate_cond:
             cond = self.cond_fusion(cond1, cond2, alpha)
@@ -564,6 +596,7 @@ class MorphSLatFlow(nn.Module):
         x_t, noise = self.diffuse(x_0, t)
         velocity = self.get_v(x_0, noise)
 
+        self._begin_semantic_match_record(x_0.device)
         pred = self.forward_flow(
             x_t,
             t,
@@ -576,7 +609,10 @@ class MorphSLatFlow(nn.Module):
             **forward_flow_kwargs,
         )
 
-        loss = self.batch_mean_mse(pred, velocity)
+        base_loss = self.batch_mean_mse(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, base_loss.dtype)
+        semantic_metrics = self._semantic_match_metrics()
+        loss = base_loss + semantic_aux
 
         endpoint_term = None
         if endpoint_active:
@@ -605,9 +641,13 @@ class MorphSLatFlow(nn.Module):
             loss = loss + symmetry_loss_weight * symmetry_term
 
         self._update_forward_metrics(pred, velocity, loss)
+        self.last_forward_metrics.update(semantic_metrics)
         self.last_loss_terms = {
             "endpoint_active": endpoint_term is not None,
             "symmetry_active": symmetry_term is not None,
         }
+
+        if hasattr(self, "null_cond") and self.null_cond.requires_grad:
+            loss = loss + 0.0 * self.null_cond.sum()
 
         return loss

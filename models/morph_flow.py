@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from models import sparse_structure_flow
 from models import cond_encoder
+from models.semantic_token_matching import SemanticTokenMatchingMixin
 
 
 TRELLIS_SLAT_MEAN = (
@@ -29,7 +30,7 @@ TRELLIS_SLAT_STD = (
 )
 
 
-class MorphFlow(nn.Module):
+class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
     def __init__(
         self,
         sigma_min=1e-5,
@@ -53,6 +54,18 @@ class MorphFlow(nn.Module):
         t_schedule="logit_normal",
         t_logit_mean=0.0,
         t_logit_std=1.0,
+        use_semantic_token_matching=False,
+        semantic_match_dim=128,
+        semantic_match_temperature=0.1,
+        semantic_match_max_align=0.25,
+        semantic_match_alpha_weight=True,
+        semantic_match_detach_scores=False,
+        semantic_match_exclude_style_tokens=True,
+        semantic_cycle_loss_weight=0.0,
+        semantic_cycle_loss_prob=1.0,
+        semantic_cycle_detach_targets=True,
+        semantic_cycle_alpha_weight=True,
+        semantic_match_log_stats=True,
     ):
         super().__init__()
         
@@ -142,6 +155,25 @@ class MorphFlow(nn.Module):
             if self.cond_proj_norm == "layernorm":
                 self.cond_proj_layer_norm = nn.LayerNorm(model_channels)
 
+
+        semantic_style_tokens = 0
+        if semantic_match_exclude_style_tokens and not hasattr(self, "cond_resampler"):
+            semantic_style_tokens = int(getattr(self.cond_encoder, "style_tokens", 0))
+        self._init_semantic_token_matching(
+            use_semantic_token_matching=use_semantic_token_matching,
+            semantic_match_dim=semantic_match_dim,
+            semantic_match_temperature=semantic_match_temperature,
+            semantic_match_max_align=semantic_match_max_align,
+            semantic_match_alpha_weight=semantic_match_alpha_weight,
+            semantic_match_detach_scores=semantic_match_detach_scores,
+            semantic_match_style_tokens=semantic_style_tokens,
+            semantic_cycle_loss_weight=semantic_cycle_loss_weight,
+            semantic_cycle_loss_prob=semantic_cycle_loss_prob,
+            semantic_cycle_detach_targets=semantic_cycle_detach_targets,
+            semantic_cycle_alpha_weight=semantic_cycle_alpha_weight,
+            semantic_match_log_stats=semantic_match_log_stats,
+        )
+
         self.cfg_drop_prob = 0.0
         self.null_cond = nn.Parameter(
             torch.zeros(1, self.cond_sequence_tokens, model_channels)
@@ -210,6 +242,45 @@ class MorphFlow(nn.Module):
             return cond1, cond2
         return self.cond_proj_layer_norm(cond1), self.cond_proj_layer_norm(cond2)
 
+    def _build_condition(
+        self,
+        src_1_feats,
+        src_2_feats,
+        src_1_coords,
+        src_2_coords,
+        alpha,
+        apply_cfg_drop=True,
+    ):
+        src_1_feats = self.normalize_condition_feats(src_1_feats)
+        src_2_feats = self.normalize_condition_feats(src_2_feats)
+        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
+        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
+        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
+        cond1, cond2 = self._apply_semantic_token_matching(cond1, cond2, alpha)
+
+        if not self.separate_cond:
+            cond = self.cond_fusion(cond1, cond2, alpha)
+        else:
+            cond1 = self.separate_cond_proj(cond1)
+            cond2 = self.separate_cond_proj(cond2)
+            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
+            cond = (cond1, cond2, alpha)
+
+        if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
+            B = cond1.shape[0] if self.separate_cond else cond.shape[0]
+            drop_mask = torch.rand(B, device=cond1.device) < self.cfg_drop_prob
+            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
+            if not self.separate_cond:
+                cond = torch.where(drop_mask.view(B, 1, 1), null_cond, cond)
+            else:
+                drop_mask = drop_mask.view(B, 1, 1)
+                cond = (
+                    torch.where(drop_mask, null_cond, cond1),
+                    torch.where(drop_mask, null_cond, cond2),
+                    alpha,
+                )
+        return cond
+
     def get_v(self, x_0, noise):
         return (1 - self.sigma_min) * noise - x_0
     
@@ -238,47 +309,17 @@ class MorphFlow(nn.Module):
         alpha,
         apply_cfg_drop=True,
     ):
-        # condition
-        src_1_feats = self.normalize_condition_feats(src_1_feats)
-        src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
-        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
-        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
-        
-        if not self.separate_cond:
-            cond = self.cond_fusion(cond1, cond2, alpha)
-        else:
-            cond1 = self.separate_cond_proj(cond1)
-            cond2 = self.separate_cond_proj(cond2)
-            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
-            cond = (cond1, cond2, alpha)
-
-        if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
-            B = cond1.shape[0] if self.separate_cond else cond.shape[0]
-            drop_mask = torch.rand(B, device=cond1.device) < self.cfg_drop_prob
-
-            null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
-
-            if not self.separate_cond:
-                cond = torch.where(
-                    drop_mask.view(B, 1, 1),
-                    null_cond,
-                    cond,
-                )
-            else:
-                drop_mask = drop_mask.view(B, 1, 1)
-                cond = (
-                    torch.where(drop_mask, null_cond, cond1),
-                    torch.where(drop_mask, null_cond, cond2),
-                    alpha
-                )
-
-        # diffusion
+        cond = self._build_condition(
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=apply_cfg_drop,
+        )
         t_flow = t.float() * 1000.0
-        out = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
+        return self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
 
-        return out
-    
     def forward_flow_cfg(self, x_t, t, src_1_feats, src_2_feats, src_1_coords, src_2_coords, alpha, guidance_scale=1.0):
         if guidance_scale == 1.0:
             return self.forward_flow(
@@ -291,30 +332,26 @@ class MorphFlow(nn.Module):
                 alpha,
             )
 
-        src_1_feats = self.normalize_condition_feats(src_1_feats)
-        src_2_feats = self.normalize_condition_feats(src_2_feats)
-        cond1 = self.encode_condition_tokens(src_1_feats, src_1_coords)
-        cond2 = self.encode_condition_tokens(src_2_feats, src_2_coords)
-        cond1, cond2 = self.normalize_condition_tokens(cond1, cond2, alpha)
-        
+        cond = self._build_condition(
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=False,
+        )
         if not self.separate_cond:
-            cond = self.cond_fusion(cond1, cond2, alpha)
             B = cond.shape[0]
             null_cond = self.null_cond.expand(B, -1, -1).to(dtype=cond.dtype)
         else:
-            cond1 = self.separate_cond_proj(cond1)
-            cond2 = self.separate_cond_proj(cond2)
-            cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
-            cond = (cond1, cond2, alpha)
+            cond1, cond2, alpha_cond = cond
             B = cond1.shape[0]
             null_cond_tensor = self.null_cond.expand(B, -1, -1).to(dtype=cond1.dtype)
-            null_cond = (null_cond_tensor, null_cond_tensor, alpha)
+            null_cond = (null_cond_tensor, null_cond_tensor, alpha_cond)
 
         t_flow = t.float() * 1000.0
-
         v_cond = self.sparse_structure_flow(x_t, t_flow, cond, alpha=alpha)
         v_uncond = self.sparse_structure_flow(x_t, t_flow, null_cond, alpha=alpha)
-
         return v_uncond + guidance_scale * (v_cond - v_uncond)
 
     def _prepare_ss_latent(self, x_0):
@@ -337,9 +374,9 @@ class MorphFlow(nn.Module):
         x_0 = self._prepare_ss_latent(x_0)
         t = self.sample_t(B, x_0.device)
         x_t, noise = self.diffuse(x_0, t)
-
         velocity = self.get_v(x_0, noise)
 
+        self._begin_semantic_match_record(x_0.device)
         pred = self.forward_flow(
             x_t,
             t,
@@ -351,6 +388,9 @@ class MorphFlow(nn.Module):
             apply_cfg_drop=apply_cfg_drop,
         )
         loss = F.mse_loss(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, loss.dtype)
+        loss = loss + semantic_aux
+        self.last_forward_metrics = self._semantic_match_metrics()
 
         if return_terms:
             return loss, x_t, t, pred

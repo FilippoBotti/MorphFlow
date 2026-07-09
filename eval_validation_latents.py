@@ -193,6 +193,18 @@ def build_model(ckpt, model_type, flow_target):
         "dino_model": args.get("dino_model", "dinov2_vitl14_reg"),
         "dino_dim": int(args.get("dino_dim", 1024)),
         "dino_layer_norm": bool(int(args.get("dino_layer_norm", 1))),
+        "use_semantic_token_matching": bool(int(args.get("use_semantic_token_matching", 0))),
+        "semantic_match_dim": int(args.get("semantic_match_dim", 128)),
+        "semantic_match_temperature": float(args.get("semantic_match_temperature", 0.1)),
+        "semantic_match_max_align": float(args.get("semantic_match_max_align", 0.25)),
+        "semantic_match_alpha_weight": bool(int(args.get("semantic_match_alpha_weight", 1))),
+        "semantic_match_detach_scores": bool(int(args.get("semantic_match_detach_scores", 0))),
+        "semantic_match_exclude_style_tokens": bool(int(args.get("semantic_match_exclude_style_tokens", 1))),
+        "semantic_cycle_loss_weight": float(args.get("semantic_cycle_loss_weight", 0.0)),
+        "semantic_cycle_loss_prob": float(args.get("semantic_cycle_loss_prob", 1.0)),
+        "semantic_cycle_detach_targets": bool(int(args.get("semantic_cycle_detach_targets", 1))),
+        "semantic_cycle_alpha_weight": bool(int(args.get("semantic_cycle_alpha_weight", 1))),
+        "semantic_match_log_stats": bool(int(args.get("semantic_match_log_stats", 1))),
     }
 
     supported = set(inspect.signature(model_cls.__init__).parameters)
