@@ -387,10 +387,18 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             alpha,
             apply_cfg_drop=apply_cfg_drop,
         )
-        loss = F.mse_loss(pred, velocity)
-        semantic_aux = self._semantic_match_aux_loss(x_0.device, loss.dtype)
-        loss = loss + semantic_aux
+        base_loss = F.mse_loss(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, base_loss.dtype)
+        loss = base_loss + semantic_aux
         self.last_forward_metrics = self._semantic_match_metrics()
+        self.last_forward_metrics.update(
+            {
+                "base_mse": base_loss.detach(),
+                "flow_matching_loss": loss.detach(),
+                "semantic_aux_loss_weighted": semantic_aux.detach(),
+                "total_loss": loss.detach(),
+            }
+        )
 
         if return_terms:
             return loss, x_t, t, pred
@@ -530,6 +538,18 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             )
             loss = loss + symmetry_loss_weight * symmetry_term
 
+        zero_metric = loss.detach().new_zeros(())
+        self.last_forward_metrics.update(
+            {
+                "endpoint_loss": endpoint_term.detach() if endpoint_term is not None else zero_metric,
+                "endpoint_loss_weighted": (endpoint_loss_weight * endpoint_term).detach() if endpoint_term is not None else zero_metric,
+                "symmetry_loss": symmetry_term.detach() if symmetry_term is not None else zero_metric,
+                "symmetry_loss_weighted": (symmetry_loss_weight * symmetry_term).detach() if symmetry_term is not None else zero_metric,
+                "endpoint_active": loss.detach().new_tensor(1.0 if endpoint_term is not None else 0.0),
+                "symmetry_active": loss.detach().new_tensor(1.0 if symmetry_term is not None else 0.0),
+                "total_loss": loss.detach(),
+            }
+        )
         self.last_loss_terms = {
             "endpoint_active": endpoint_term is not None,
             "symmetry_active": symmetry_term is not None,

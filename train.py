@@ -432,9 +432,22 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
     if not metrics:
         return ""
     keys = (
+        ("total_loss", "tot"),
+        ("base_mse", "base_mse"),
+        ("flow_matching_loss", "fm"),
+        ("semantic_aux_loss_weighted", "sem_aux"),
+        ("semantic_cycle_loss_weighted", "sem_cyc"),
+        ("endpoint_loss", "end_raw"),
+        ("endpoint_loss_weighted", "end"),
+        ("symmetry_loss", "sym_raw"),
+        ("symmetry_loss_weighted", "sym"),
+        ("residual_endpoint_loss", "res_end_raw"),
+        ("residual_endpoint_loss_weighted", "res_end"),
+        ("endpoint_active", "end_on"),
+        ("symmetry_active", "sym_on"),
+        ("residual_endpoint_active", "res_end_on"),
         ("relative_improvement", "slat_rel"),
         ("pred_target_cosine", "slat_cos"),
-        ("semantic_cycle_loss_weighted", "sem_cyc"),
         ("semantic_align_lambda", "sem_lam"),
         ("semantic_entropy_12", "sem_H12"),
         ("pred_std", "pred_std"),
