@@ -282,6 +282,7 @@ class MorphSLatFlow(nn.Module):
         src_2_feats: torch.Tensor,
         src_2_coords: torch.Tensor,
         alpha: torch.Tensor,
+        apply_cfg_drop: bool = True,
     ):
         src_1_feats = self.normalize_condition_feats(src_1_feats)
         src_2_feats = self.normalize_condition_feats(src_2_feats)
@@ -297,7 +298,7 @@ class MorphSLatFlow(nn.Module):
             cond1, cond2 = self.normalize_projected_condition_tokens(cond1, cond2)
             cond = (cond1, cond2, alpha)
 
-        if self.training and self.cfg_drop_prob > 0.0:
+        if apply_cfg_drop and self.training and self.cfg_drop_prob > 0.0:
             batch_size = cond1.shape[0] if self.separate_cond else cond.shape[0]
             drop_mask = torch.rand(batch_size, device=cond1.device) < self.cfg_drop_prob
             null_cond = self.null_cond.expand(batch_size, -1, -1).to(dtype=cond1.dtype)
@@ -323,6 +324,8 @@ class MorphSLatFlow(nn.Module):
         src_1_coords: torch.Tensor,
         src_2_coords: torch.Tensor,
         alpha: torch.Tensor,
+        apply_cfg_drop: bool = True,
+        **forward_flow_kwargs,
     ) -> sp.SparseTensor:
         cond = self._build_condition(
             src_1_feats,
@@ -330,6 +333,7 @@ class MorphSLatFlow(nn.Module):
             src_2_feats,
             src_2_coords,
             alpha,
+            apply_cfg_drop=apply_cfg_drop,
         )
         t_flow = t.float() * 1000.0
         return self.slat_flow(x_t, t_flow, cond, alpha=alpha)
@@ -419,6 +423,115 @@ class MorphSLatFlow(nn.Module):
                 ),
             }
 
+    def pred_x0_from_velocity(
+        self,
+        x_t: sp.SparseTensor,
+        t: torch.Tensor,
+        pred_velocity: sp.SparseTensor,
+    ) -> sp.SparseTensor:
+        sigma_t = self.sigma_min + (1.0 - self.sigma_min) * t
+        sigma_t = sigma_t.view(-1, 1)
+        return (1.0 - self.sigma_min) * x_t - sigma_t * pred_velocity
+
+
+    def _select_endpoint_slat(
+        self,
+        src_1_slat: sp.SparseTensor,
+        src_2_slat: sp.SparseTensor,
+        endpoint_is_src1: torch.Tensor,
+    ) -> sp.SparseTensor:
+        pieces = []
+        for batch_idx in range(src_1_slat.shape[0]):
+            source = src_1_slat if bool(endpoint_is_src1[batch_idx].item()) else src_2_slat
+            pieces.append(source[batch_idx])
+        return sp.sparse_cat(pieces, dim=0)
+
+
+    def swap_forward_flow_kwargs(self, forward_flow_kwargs: dict) -> dict:
+        return dict(forward_flow_kwargs)
+
+
+    def endpoint_loss(
+        self,
+        src_1_feats: torch.Tensor,
+        src_1_coords: torch.Tensor,
+        src_2_feats: torch.Tensor,
+        src_2_coords: torch.Tensor,
+        **forward_flow_kwargs,
+    ) -> torch.Tensor:
+        src_1_slat = self.normalize_slat(self.make_slat(src_1_feats, src_1_coords))
+        src_2_slat = self.normalize_slat(self.make_slat(src_2_feats, src_2_coords))
+
+        batch_size = src_1_slat.shape[0]
+        endpoint_is_src1 = torch.rand(batch_size, device=src_1_slat.device) < 0.5
+        alpha = endpoint_is_src1.to(dtype=torch.float32)
+
+        target_x0 = self._select_endpoint_slat(
+            src_1_slat,
+            src_2_slat,
+            endpoint_is_src1,
+        )
+
+        t = self.sample_t(batch_size, target_x0.device)
+        x_t, _ = self.diffuse(target_x0, t)
+
+        pred_velocity = self.forward_flow(
+            x_t,
+            t,
+            src_1_feats,
+            src_2_feats,
+            src_1_coords,
+            src_2_coords,
+            alpha,
+            apply_cfg_drop=False,
+            **forward_flow_kwargs,
+        )
+
+        pred_x0 = self.pred_x0_from_velocity(x_t, t, pred_velocity)
+        return self.batch_mean_mse(pred_x0, target_x0)
+
+
+    def symmetry_loss(
+        self,
+        x_t: sp.SparseTensor,
+        t: torch.Tensor,
+        src_1_feats: torch.Tensor,
+        src_1_coords: torch.Tensor,
+        src_2_feats: torch.Tensor,
+        src_2_coords: torch.Tensor,
+        alpha: torch.Tensor,
+        pred_forward: Optional[sp.SparseTensor] = None,
+        **forward_flow_kwargs,
+    ) -> torch.Tensor:
+        if pred_forward is None:
+            pred_forward = self.forward_flow(
+                x_t,
+                t,
+                src_1_feats,
+                src_2_feats,
+                src_1_coords,
+                src_2_coords,
+                alpha,
+                apply_cfg_drop=False,
+                **forward_flow_kwargs,
+            )
+
+        swapped_forward_flow_kwargs = self.swap_forward_flow_kwargs(forward_flow_kwargs)
+
+        pred_swapped = self.forward_flow(
+            x_t,
+            t,
+            src_2_feats,
+            src_1_feats,
+            src_2_coords,
+            src_1_coords,
+            1.0 - alpha,
+            apply_cfg_drop=False,
+            **swapped_forward_flow_kwargs,
+        )
+
+        return self.batch_mean_mse(pred_forward, pred_swapped)
+
     def forward(
         self,
         target_feats: torch.Tensor,
@@ -428,9 +541,23 @@ class MorphSLatFlow(nn.Module):
         src_2_feats: torch.Tensor,
         src_2_coords: torch.Tensor,
         alpha: torch.Tensor,
+        endpoint_loss_weight: float = 0.0,
+        symmetry_loss_weight: float = 0.0,
+        endpoint_loss_prob: float = 0.25,
+        symmetry_loss_prob: float = 1.0,
+        **forward_flow_kwargs,
     ) -> torch.Tensor:
         x_0 = self.make_slat(target_feats, target_coords)
         x_0 = self.normalize_slat(x_0)
+
+        endpoint_active = (
+            endpoint_loss_weight > 0.0
+            and torch.rand((), device=x_0.device).item() < endpoint_loss_prob
+        )
+        symmetry_active = (
+            symmetry_loss_weight > 0.0
+            and torch.rand((), device=x_0.device).item() < symmetry_loss_prob
+        )
 
         batch_size = x_0.shape[0]
         t = self.sample_t(batch_size, x_0.device)
@@ -445,8 +572,42 @@ class MorphSLatFlow(nn.Module):
             src_1_coords,
             src_2_coords,
             alpha,
+            apply_cfg_drop=not symmetry_active,
+            **forward_flow_kwargs,
         )
 
         loss = self.batch_mean_mse(pred, velocity)
+
+        endpoint_term = None
+        if endpoint_active:
+            endpoint_term = self.endpoint_loss(
+                src_1_feats,
+                src_1_coords,
+                src_2_feats,
+                src_2_coords,
+                **forward_flow_kwargs,
+            )
+            loss = loss + endpoint_loss_weight * endpoint_term
+
+        symmetry_term = None
+        if symmetry_active:
+            symmetry_term = self.symmetry_loss(
+                x_t,
+                t,
+                src_1_feats,
+                src_1_coords,
+                src_2_feats,
+                src_2_coords,
+                alpha,
+                pred_forward=pred,
+                **forward_flow_kwargs,
+            )
+            loss = loss + symmetry_loss_weight * symmetry_term
+
         self._update_forward_metrics(pred, velocity, loss)
+        self.last_loss_terms = {
+            "endpoint_active": endpoint_term is not None,
+            "symmetry_active": symmetry_term is not None,
+        }
+
         return loss
