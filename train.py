@@ -1046,11 +1046,14 @@ def save_checkpoint(
     best_epoch: Optional[int] = None,
     final: bool = False,
     best: bool = False,
+    last: bool = False,
 ):
     if not accelerator.is_main_process:
         return
 
-    if best:
+    if last:
+        filename = "morphflow_last.pt"
+    elif best:
         filename = "morphflow_best.pt"
     elif final:
         filename = f"morphflow_final_epoch_{epoch:04d}_step_{global_step:07d}.pt"
@@ -1675,6 +1678,23 @@ def train(args):
                     f"Validation did not improve. best_val_loss={best_val_loss:.6f} "
                     f"at epoch {best_epoch}; current_val_loss={val_avg:.6f}."
                 )
+
+        # Always save the latest completed epoch for automatic resume.
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            ckpt_dir=ckpt_dir,
+            epoch=epoch,
+            global_step=global_step,
+            train_loss=epoch_avg,
+            val_loss=val_avg,
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
+            last=True,
+        )
 
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
             accelerator.print(f"Saving periodic checkpoint at epoch {epoch}.")
