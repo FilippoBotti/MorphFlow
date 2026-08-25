@@ -65,6 +65,7 @@ class MorphingDistillDataset(Dataset):
         load_source_images: bool = False,
         source_images_root: Optional[str] = None,
         source_image_filename: Optional[str] = None,
+        augment_source_swap: bool = False,
     ):
         self.root = Path(root)
         self.assets_root = self.root / "assets"
@@ -80,6 +81,7 @@ class MorphingDistillDataset(Dataset):
         self.load_source_images = bool(load_source_images)
         self.source_images_root = Path(source_images_root) if source_images_root else None
         self.source_image_filename = source_image_filename or None
+        self.augment_source_swap = bool(augment_source_swap)
 
         if split is not None and split not in VALID_SPLITS:
             raise ValueError(f"split must be one of {VALID_SPLITS}, got {split!r}")
@@ -100,7 +102,8 @@ class MorphingDistillDataset(Dataset):
             raise RuntimeError("No valid samples found after filtering metadata.")
 
     def __len__(self) -> int:
-        return len(self.metadata)
+        multiplier = 2 if self.augment_source_swap else 1
+        return multiplier * len(self.metadata)
 
     def _resolve_metadata_path(self, metadata_file: Optional[str], split: Optional[str]) -> Path:
         if metadata_file is not None:
@@ -370,7 +373,17 @@ class MorphingDistillDataset(Dataset):
     def _load_tensor(self, paths: Dict[str, Path], key: str) -> torch.Tensor:
         return self._torch_load_safe(paths[key])
 
-    def _load_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _swap_sources(sample: Dict[str, Any]) -> Dict[str, Any]:
+        for suffix in ("feats", "coords", "ss_latent", "occupancy", "image", "name"):
+            src1_key = f"src1_{suffix}"
+            src2_key = f"src2_{suffix}"
+            if src1_key in sample and src2_key in sample:
+                sample[src1_key], sample[src2_key] = sample[src2_key], sample[src1_key]
+        sample["alpha"] = 1.0 - sample["alpha"]
+        return sample
+
+    def _load_entry(self, entry: Dict[str, Any], swap_sources: bool = False) -> Dict[str, Any]:
         paths = self._paths_for_entry(entry)
         src1_feats, src1_coords = self._load_slat(paths, "src1")
         src2_feats, src2_coords = self._load_slat(paths, "src2")
@@ -402,20 +415,28 @@ class MorphingDistillDataset(Dataset):
             sample["src1_image"] = self._load_source_image(sample["src1_name"], entry, "src1")
             sample["src2_image"] = self._load_source_image(sample["src2_name"], entry, "src2")
 
-        return sample
+        return self._swap_sources(sample) if swap_sources else sample
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Dataset index out of range: {idx}")
+
+        num_base_samples = len(self.metadata)
+        swap_sources = self.augment_source_swap and idx >= num_base_samples
+        base_idx = idx % num_base_samples
         max_attempts = min(32, len(self.metadata))
         for attempt in range(max_attempts):
-            real_idx = (idx + attempt) % len(self.metadata)
+            real_idx = (base_idx + attempt) % num_base_samples
             entry = self.metadata[real_idx]
             try:
-                return self._load_entry(entry)
+                return self._load_entry(entry, swap_sources=swap_sources)
             except (FileNotFoundError, RuntimeError, KeyError, TypeError) as exc:
                 if self.verbose:
                     print(
                         f"[MorphingDistillDataset][runtime-skip] idx={real_idx} "
-                        f"target={entry.get('target', 'unknown')} reason={exc}"
+                        f"swapped={swap_sources} target={entry.get('target', 'unknown')} reason={exc}"
                     )
                 continue
         raise RuntimeError("Unable to load a valid sample after multiple attempts.")
@@ -493,6 +514,7 @@ def build_dataloader(
     load_source_images: bool = False,
     source_images_root: Optional[str] = None,
     source_image_filename: Optional[str] = None,
+    augment_source_swap: bool = False,
 ):
     dataset = MorphingDistillDataset(
         root=root,
@@ -508,6 +530,7 @@ def build_dataloader(
         load_source_images=load_source_images,
         source_images_root=source_images_root,
         source_image_filename=source_image_filename,
+        augment_source_swap=augment_source_swap,
     )
 
     loader = DataLoader(
@@ -531,6 +554,11 @@ if __name__ == "__main__":
     parser.add_argument("--split", default="train", choices=VALID_SPLITS)
     parser.add_argument("--metadata-file", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--augment-source-swap",
+        action="store_true",
+        help="Double the dataset with (src2, src1, target, 1-alpha) samples.",
+    )
     args = parser.parse_args()
 
     dataset, loader = build_dataloader(
@@ -540,6 +568,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=0,
         shuffle=False,
+        augment_source_swap=args.augment_source_swap,
     )
     print(f"samples: {len(dataset)}")
     for batch in loader:

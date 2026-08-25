@@ -30,6 +30,13 @@ def build_parser():
     parser.add_argument("--metadata", type=str, default=os.environ.get("METADATA", "metadata_train.json"))
     parser.add_argument("--val_metadata", type=str, default=os.environ.get("VAL_METADATA", "metadata_val.json"))
     parser.add_argument("--exclude_val_assets_from_train", type=int, choices=[0, 1], default=1)
+    parser.add_argument(
+        "--augment_source_swap",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Double only the training set with (src2, src1, target, 1-alpha) samples.",
+    )
 
     # Output
     parser.add_argument("--out_dir", type=str, default="./outputs")
@@ -1178,6 +1185,7 @@ def train(args):
         load_source_images=args.flow_target == "slat" and args.slat_condition_source == "dino",
         source_images_root=args.source_images_root,
         source_image_filename=args.source_image_filename,
+        augment_source_swap=args.augment_source_swap == 1,
     )
 
     loader = DataLoader(
@@ -1459,6 +1467,7 @@ def train(args):
             "Residual endpoint loss is only applied to SS residual models."
         )
     accelerator.print(f"Source-image support in model.forward: {supports_source_images}")
+    accelerator.print(f"Source-swap training augmentation: {args.augment_source_swap == 1}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
         accelerator.print(f"Train metadata source assets: {train_metadata_asset_count}")
