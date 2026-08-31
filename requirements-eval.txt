@@ -1,0 +1,2 @@
+# Evaluation-only dependency for eval_fid_kid.py
+clean-fid>=0.1.35,<1
