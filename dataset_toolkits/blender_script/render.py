@@ -42,15 +42,19 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.render.image_settings.color_mode = 'RGBA'
     bpy.context.scene.render.film_transparent = True
     
-    bpy.context.scene.cycles.device = 'GPU'
-    bpy.context.scene.cycles.samples = 128 if not geo_mode else 1
-    bpy.context.scene.cycles.filter_type = 'BOX'
-    bpy.context.scene.cycles.filter_width = 1
-    bpy.context.scene.cycles.diffuse_bounces = 1
-    bpy.context.scene.cycles.glossy_bounces = 1
-    bpy.context.scene.cycles.transparent_max_bounces = 3 if not geo_mode else 0
-    bpy.context.scene.cycles.transmission_bounces = 3 if not geo_mode else 1
-    bpy.context.scene.cycles.use_denoising = True
+    cycles = bpy.context.scene.cycles
+    cycles.device = 'GPU'
+    cycles.samples = 128 if not geo_mode else 1
+    if hasattr(cycles, 'pixel_filter_type'):
+        cycles.pixel_filter_type = 'BOX'
+    else:
+        cycles.filter_type = 'BOX'
+    cycles.filter_width = 1
+    cycles.diffuse_bounces = 1
+    cycles.glossy_bounces = 1
+    cycles.transparent_max_bounces = 3 if not geo_mode else 0
+    cycles.transmission_bounces = 3 if not geo_mode else 1
+    cycles.use_denoising = True
         
     bpy.context.preferences.addons['cycles'].preferences.get_devices()
     bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
@@ -62,10 +66,11 @@ def init_nodes(save_depth=False, save_normal=False, save_albedo=False, save_mist
     spec_nodes = {}
     
     bpy.context.scene.use_nodes = True
-    bpy.context.scene.view_layers['View Layer'].use_pass_z = save_depth
-    bpy.context.scene.view_layers['View Layer'].use_pass_normal = save_normal
-    bpy.context.scene.view_layers['View Layer'].use_pass_diffuse_color = save_albedo
-    bpy.context.scene.view_layers['View Layer'].use_pass_mist = save_mist
+    view_layer = bpy.context.view_layer
+    view_layer.use_pass_z = save_depth
+    view_layer.use_pass_normal = save_normal
+    view_layer.use_pass_diffuse_color = save_albedo
+    view_layer.use_pass_mist = save_mist
     
     nodes = bpy.context.scene.node_tree.nodes
     links = bpy.context.scene.node_tree.links
@@ -298,7 +303,7 @@ def override_material():
     bsdf.inputs[1].default_value = 1
     output = new_mat.node_tree.nodes.new('ShaderNodeOutputMaterial')
     new_mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-    bpy.context.scene.view_layers['View Layer'].material_override = new_mat
+    bpy.context.view_layer.material_override = new_mat
 
 def unhide_all_objects() -> None:
     """Unhides all objects in the scene.
@@ -400,6 +405,27 @@ def normalize_scene() -> Tuple[float, Vector]:
     
     return scale, offset
 
+
+def convert_scene_to_z_up(up_axis: str) -> None:
+    """Rotate all imported roots so the requested object up axis becomes Blender Z."""
+    up_axis = up_axis.upper()
+    if up_axis == "Z":
+        return
+    if up_axis not in {"X", "Y"}:
+        raise ValueError(f"Unsupported object up axis: {up_axis}")
+
+    orientation_root = bpy.data.objects.new("ObjectUpAxis", None)
+    bpy.context.scene.collection.objects.link(orientation_root)
+    for obj in [obj for obj in bpy.context.scene.objects.values() if not obj.parent]:
+        if obj != orientation_root:
+            obj.parent = orientation_root
+
+    if up_axis == "Y":
+        orientation_root.rotation_euler[0] = math.radians(-90.0)
+    else:
+        orientation_root.rotation_euler[1] = math.radians(-90.0)
+    bpy.context.view_layer.update()
+
 def get_transform_matrix(obj: bpy.types.Object) -> list:
     pos, rt, _ = obj.matrix_world.decompose()
     rt = rt.to_matrix()
@@ -433,6 +459,8 @@ def main(arg):
             split_mesh_normal()
         # delete_custom_normals()
     print('[INFO] Scene initialized.')
+
+    convert_scene_to_z_up(arg.object_up_axis)
     
     # normalize scene
     scale, offset = normalize_scene()
@@ -514,6 +542,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_folder', type=str, default='/tmp', help='The path the output will be dumped to.')
     parser.add_argument('--resolution', type=int, default=512, help='Resolution of the images.')
     parser.add_argument('--engine', type=str, default='CYCLES', help='Blender internal engine for rendering. E.g. CYCLES, BLENDER_EEVEE, ...')
+    parser.add_argument('--object_up_axis', choices=['X', 'Y', 'Z'], default='Z', help='Object up axis to convert to Blender Z-up.')
     parser.add_argument('--geo_mode', action='store_true', help='Geometry mode for rendering.')
     parser.add_argument('--save_depth', action='store_true', help='Save the depth maps.')
     parser.add_argument('--save_normal', action='store_true', help='Save the normal maps.')
@@ -525,4 +554,3 @@ if __name__ == '__main__':
     args = parser.parse_args(argv)
 
     main(args)
-    

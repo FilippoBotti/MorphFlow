@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pitch_degrees", type=float, default=15.0)
     parser.add_argument("--radius", type=float, default=2.0)
     parser.add_argument("--fov_degrees", type=float, default=40.0)
+    parser.add_argument(
+        "--object_up_axis",
+        choices=["X", "Y", "Z"],
+        default="Y",
+        help="Up axis stored in the evaluation GLBs; they are converted to Blender Z-up.",
+    )
     parser.add_argument("--render_engine", default="CYCLES")
     parser.add_argument("--render_batch_size", type=int, default=64)
     parser.add_argument(
@@ -226,6 +232,7 @@ def build_manifest(
         "pitch_degrees": args.pitch_degrees,
         "radius": args.radius,
         "fov_degrees": args.fov_degrees,
+        "object_up_axis": args.object_up_axis,
         "engine": args.render_engine,
         "normalization": "each mesh centered and scaled to a unit cube",
         "background": "white RGB after alpha compositing",
@@ -383,9 +390,10 @@ def render_meshes(args: argparse.Namespace, output_dir: Path, manifest: Dict[str
         jobs_path = jobs_dir / f"jobs_{batch_id:04d}.json"
         write_json(jobs_path, chunk)
         command = [
-            blender, "-b", "--python", str(render_script), "--",
+            blender, "-b", "--python-exit-code", "1", "--python", str(render_script), "--",
             "--manifest", str(jobs_path), "--views", views,
             "--resolution", str(args.resolution), "--engine", args.render_engine,
+            "--object_up_axis", args.object_up_axis,
         ]
         if not args.use_materials:
             command.append("--geo_mode")

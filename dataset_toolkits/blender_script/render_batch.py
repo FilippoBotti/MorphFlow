@@ -32,6 +32,7 @@ def main(args):
             output_folder=job["output_folder"],
             resolution=args.resolution,
             engine=args.engine,
+            object_up_axis=args.object_up_axis,
             geo_mode=args.geo_mode,
             save_depth=False,
             save_normal=False,
@@ -49,6 +50,7 @@ if __name__ == "__main__":
     parser.add_argument("--views", required=True)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--engine", type=str, default="CYCLES")
+    parser.add_argument("--object_up_axis", choices=["X", "Y", "Z"], default="Z")
     parser.add_argument("--geo_mode", action="store_true")
     argv = __import__("sys").argv
     args = parser.parse_args(argv[argv.index("--") + 1 :])
