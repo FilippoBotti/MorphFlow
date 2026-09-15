@@ -1845,26 +1845,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
                 del ss_latent, slat, voxels
                 cleanup_old_index(work_cache, idx - 1)
-
-                # In file-cache mode MorphAny3D increments tfsa_cache_bytes
-                # whenever it writes TFSA tensors. cleanup_old_index() removes
-                # the previous frame from disk, so resynchronize the logical
-                # counter with the ACTUAL cache directory size.
-                #
-                # Without this, tfsa_cache_bytes grows cumulatively across
-                # morphing frames even though old cache files were deleted,
-                # eventually causing a false CACHE_LIMIT_EXCEEDED.
-                if (
-                    args.tfsa_cache_mode == "file"
-                    and tfsa_cache_bytes is not None
-                ):
-                    tfsa_cache_bytes[0] = directory_size_bytes(work_cache)
-
-                cleanup_old_tfsa_cache(
-                    tfsa_cache,
-                    idx - 1,
-                    tfsa_cache_bytes,
-                )
+                cleanup_old_tfsa_cache(tfsa_cache, idx - 1, tfsa_cache_bytes)
         except Exception as exc:
             pair_cache_limit_hit = True
 

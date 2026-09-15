@@ -1655,27 +1655,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         | {p.request.canon_b for p in planned}
     )
 
-    bad_assets = set()
-
     for asset_name in required_assets:
-        try:
-            ensure_asset_latents(
-                pipeline,
-                asset_name,
-                name_to_path[asset_name],
-                args.output_dir,
-                args.seed,
-                cond_cache,
-                sparse_sampler_params,
-                slat_sampler_params,
-            )
-        except Exception as exc:
-            bad_assets.add(asset_name)
-            print(
-                f"[asset] {asset_name}: SKIPPED after error "
-                f"{type(exc).__name__}: {exc}"
-            )
-            torch.cuda.empty_cache()
+        ensure_asset_latents(
+            pipeline,
+            asset_name,
+            name_to_path[asset_name],
+            args.output_dir,
+            args.seed,
+            cond_cache,
+            sparse_sampler_params,
+            slat_sampler_params,
+        )
 
     # Endpoint targets are copied only to keep the loader simple.
     for item in [p for p in planned if p.direction.startswith("endpoint")]:
@@ -1730,14 +1720,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             src_name, tar_name = req.canon_a, req.canon_b
         else:
             src_name, tar_name = req.canon_b, req.canon_a
-
-        if src_name in bad_assets or tar_name in bad_assets:
-            print(
-                f"[pair] {split} {pair_name} {direction}: "
-                f"SKIPPED because source asset failed "
-                f"(src={src_name}, tar={tar_name})"
-            )
-            continue
 
         src_cond = cond_cache[src_name]
         tar_cond = cond_cache[tar_name]
@@ -1845,40 +1827,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
                 del ss_latent, slat, voxels
                 cleanup_old_index(work_cache, idx - 1)
-
-                # In file-cache mode MorphAny3D increments tfsa_cache_bytes
-                # whenever it writes TFSA tensors. cleanup_old_index() removes
-                # the previous frame from disk, so resynchronize the logical
-                # counter with the ACTUAL cache directory size.
-                #
-                # Without this, tfsa_cache_bytes grows cumulatively across
-                # morphing frames even though old cache files were deleted,
-                # eventually causing a false CACHE_LIMIT_EXCEEDED.
-                if (
-                    args.tfsa_cache_mode == "file"
-                    and tfsa_cache_bytes is not None
-                ):
-                    tfsa_cache_bytes[0] = directory_size_bytes(work_cache)
-
-                cleanup_old_tfsa_cache(
-                    tfsa_cache,
-                    idx - 1,
-                    tfsa_cache_bytes,
-                )
-        except Exception as exc:
+                cleanup_old_tfsa_cache(tfsa_cache, idx - 1, tfsa_cache_bytes)
+        except RuntimeError as exc:
+            if CACHE_LIMIT_MARKER not in str(exc):
+                raise
             pair_cache_limit_hit = True
-
-            if CACHE_LIMIT_MARKER in str(exc):
-                print(
-                    f"[pair] {split} {pair_name} {direction}: "
-                    f"SKIPPED cache limit: {exc}"
-                )
-            else:
-                print(
-                    f"[pair] {split} {pair_name} {direction}: "
-                    f"SKIPPED after error "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            print(
+                f"[pair] {split} {pair_name} {direction}: skipped because "
+                f"temporary TFSA cache exceeded {args.max_work_cache_gb:g} GB; {exc}"
+            )
         finally:
             shutil.rmtree(work_cache, ignore_errors=True)
             torch.cuda.empty_cache()

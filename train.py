@@ -908,7 +908,7 @@ def collect_param_groups(model: torch.nn.Module, args) -> Tuple[List[Dict[str, A
         lora_lr = args.lr if args.lora_lr is None else args.lora_lr
         param_groups.append({"params": lora_params, "lr": lora_lr, "name": "lora"})
     if flow_adapter_params:
-        param_groups.append({"params": flow_adapter_params, "lr": cond_lr, "name": "flow_adapter"})
+        param_groups.append({"params": flow_adapter_params, "lr": flow_lr, "name": "flow_adapter"})
     if flow_params:
         param_groups.append({"params": flow_params, "lr": flow_lr, "name": "flow"})
 
