@@ -8,6 +8,7 @@ outputs/
 scripts/
 tmp/
 logs/
+slurm/
 
 # IDE
 .vscode/
