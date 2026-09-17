@@ -6,6 +6,22 @@ from torch import nn
 import torch.nn.functional as F
 
 
+# Every enabled matcher must report this same schema on every rank, even when
+# cycle loss is sampled off locally or attention-stat logging is disabled.
+SEMANTIC_METRIC_NAMES = (
+    "semantic_align_lambda",
+    "semantic_entropy_12",
+    "semantic_entropy_21",
+    "semantic_usage_12_max",
+    "semantic_usage_12_min",
+    "semantic_usage_21_max",
+    "semantic_usage_21_min",
+    "semantic_cycle_loss",
+    "semantic_cycle_loss_weighted",
+    "semantic_cycle_active",
+)
+
+
 class SemanticTokenMatcher(nn.Module):
     """
     Bidirectional soft semantic matching for MorphFlow condition tokens.
@@ -294,8 +310,9 @@ class SemanticTokenMatchingMixin:
     def _semantic_match_metrics(self) -> Dict[str, torch.Tensor]:
         if not getattr(self, "use_semantic_token_matching", False):
             return {}
-        metrics = dict(getattr(self, "_semantic_match_last_metrics", {}))
-        if "semantic_cycle_active" not in metrics:
-            device = next(self.parameters()).device
-            metrics["semantic_cycle_active"] = torch.zeros((), device=device, dtype=torch.float32)
-        return metrics
+        metrics = getattr(self, "_semantic_match_last_metrics", {})
+        device = next(self.parameters()).device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        # Missing cycle metrics represent a zero contribution from this rank.
+        # Keep both keys and order independent of its random loss activation.
+        return {name: metrics.get(name, zero) for name in SEMANTIC_METRIC_NAMES}

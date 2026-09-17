@@ -20,6 +20,7 @@ from models.morph_dino_slat_flow import MorphDinoSLatFlow
 from models.morph_flow import MorphFlow
 from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
+from modules.training_metrics import collect_reduced_forward_metrics
 
 
 def build_parser():
@@ -416,23 +417,6 @@ def get_optional_tensor(batch: Dict[str, Any], key: str, device, dtype=torch.flo
     if value is None:
         return None
     return value.to(device=device, dtype=dtype, non_blocking=True)
-
-
-def collect_reduced_forward_metrics(
-    accelerator: Accelerator,
-    model: torch.nn.Module,
-) -> Dict[str, float]:
-    metrics = getattr(accelerator.unwrap_model(model), "last_forward_metrics", None)
-    if not metrics:
-        return {}
-
-    reduced = {}
-    for name, value in metrics.items():
-        if not torch.is_tensor(value):
-            value = torch.tensor(float(value), device=accelerator.device)
-        value = value.detach().to(device=accelerator.device, dtype=torch.float32)
-        reduced[name] = float(accelerator.reduce(value, reduction="mean").item())
-    return reduced
 
 
 def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
