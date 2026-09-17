@@ -31,6 +31,8 @@ BUNDLE_FILES = (
     "occupancy.pt", "mesh.glb", "manifest.json",
 )
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+# Cache placement and capacity do not change the sampled pair/alpha/model setup.
+RESUMABLE_CACHE_SETTINGS = {"tfsa_cache_mode", "max_work_cache_gb"}
 
 
 def read_json(path):
@@ -192,12 +194,12 @@ def parse_args(argv=None):
     parser.add_argument("--teacher-ss-cfg", type=float, default=7.5)
     parser.add_argument("--teacher-slat-cfg", type=float, default=3.0)
     parser.add_argument("--tfsa-alpha", type=float, default=0.8)
-    parser.add_argument("--tfsa-cache-mode", choices=("file", "memory"), default="file")
+    parser.add_argument("--tfsa-cache-mode", choices=("file", "memory"), default="memory")
     parser.add_argument("--max-work-cache-gb", type=float, default=60.0)
     parser.add_argument("--mixed-precision", choices=("auto", "no", "fp16", "bf16"), default="auto")
     parser.add_argument("--work-cache-dir", help="Temporary TFSA directory; prefer node-local storage")
     parser.add_argument("--stage", choices=("all", "teacher", "student"), default="all")
-    parser.add_argument("--resume", action="store_true", help="Resume only an identical saved plan")
+    parser.add_argument("--resume", action="store_true", help="Resume the saved plan; cache mode/capacity may change")
     parser.add_argument("--dry-run", action="store_true", help="Write plan.dry_run.json without ML dependencies")
     args = parser.parse_args(argv)
     if not 0 <= args.seed < 2**32:
@@ -252,6 +254,54 @@ def build_plan(args):
 
 def step_name(index):
     return f"alpha_{index:04d}"
+
+
+def resume_compatible(saved, requested):
+    def generation_plan(plan):
+        return {**plan, "config": {key: value for key, value in plan["config"].items()
+                                   if key not in RESUMABLE_CACHE_SETTINGS}}
+    return generation_plan(saved) == generation_plan(requested)
+
+
+def prepare_work_cache(root, args, cache_dir):
+    cache_root = Path(cache_dir or os.environ.get("TMPDIR", str(root / ".cache")))
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if args.tfsa_cache_mode == "file":
+        free_gb = shutil.disk_usage(cache_root).free / 1024**3
+        # Leave headroom for the current atomic write and auxiliary tensors.
+        required_gb = args.max_work_cache_gb + 2 if args.max_work_cache_gb else 2
+        if free_gb < required_gb:
+            raise RuntimeError(
+                f"Insufficient space for file TFSA cache at {cache_root}: "
+                f"{free_gb:.1f} GiB free, need at least {required_gb:.1f} GiB. "
+                "Use --tfsa-cache-mode memory (TFSA_CACHE_MODE=memory in Slurm), "
+                "or --work-cache-dir on local NVMe / WORK_CACHE_ROOT. "
+                "Completed assets can be reused with --resume."
+            )
+    print(f"TFSA cache: mode={args.tfsa_cache_mode}, limit={args.max_work_cache_gb} GiB, "
+          f"temporary directory={cache_root}", flush=True)
+    return cache_root
+
+
+def cache_write_error(exc, work, mode):
+    """Add the cache location to PyTorch's otherwise opaque write failure."""
+    message = str(exc).lower()
+    if any(marker in message for marker in (
+        "file write failed", "pytorchstreamwriter", "unexpected pos", "no space left", "disk quota exceeded",
+    )):
+        free_gb = shutil.disk_usage(work).free / 1024**3
+        return RuntimeError(
+            f"TFSA cache write failed at {work} (mode={mode}, {free_gb:.1f} GiB free). "
+            "Check free space, quota and write permissions. "
+            "Resume with TFSA_CACHE_MODE=memory / --tfsa-cache-mode memory, "
+            "or choose a larger WORK_CACHE_ROOT / --work-cache-dir. "
+            f"Original error: {exc}"
+        )
+    return None
+
+
+def launcher_log(path):
+    return path.is_file() and re.fullmatch(r"slurm-comparison-[A-Za-z0-9_-]+\.(out|err)", path.name) is not None
 
 
 def relative_link(source, destination):
@@ -365,6 +415,7 @@ def teacher_phase(root, plan, cache_dir):
     if all(bundle_ready(path) for path in required):
         publish_version(root, plan, "teacher")
         return
+    cache_root = prepare_work_cache(root, args, cache_dir)
     pipeline = TrellisImageTo3DPipeline.from_pretrained(args.model_id)
     for key in ("slat_decoder_gs", "slat_decoder_rf"):
         pipeline.models.pop(key, None)
@@ -394,8 +445,6 @@ def teacher_phase(root, plan, cache_dir):
             del ss, slat, cond
             torch.cuda.empty_cache()
 
-        cache_root = Path(cache_dir or os.environ.get("TMPDIR", str(root / ".cache")))
-        cache_root.mkdir(parents=True, exist_ok=True)
         for pair in plan["pairs"]:
             folders = [root / "teacher" / pair["id"] / step_name(i)
                        for i in range(1, len(plan["alphas"]) + 1)]
@@ -411,11 +460,17 @@ def teacher_phase(root, plan, cache_dir):
                 limit = int(args.max_work_cache_gb * 1024**3) if args.max_work_cache_gb else None
                 for index, (alpha, folder) in enumerate(zip(plan["alphas"], folders), 1):
                     print(f"[teacher] {pair['id']} {index}/{len(folders)} alpha={alpha:.9f}", flush=True)
-                    ss, slat, occupancy = teacher.run_one_morphany3d_step(
-                        pipeline, conditions[0], conditions[1], work, args.seed,
-                        index, len(folders) + 2, alpha, args.tfsa_alpha, sparse_params, slat_params,
-                        tfsa_cache=tfsa_cache, max_tfsa_cache_bytes=limit, tfsa_cache_bytes=cache_bytes,
-                    )
+                    try:
+                        ss, slat, occupancy = teacher.run_one_morphany3d_step(
+                            pipeline, conditions[0], conditions[1], work, args.seed,
+                            index, len(folders) + 2, alpha, args.tfsa_alpha, sparse_params, slat_params,
+                            tfsa_cache=tfsa_cache, max_tfsa_cache_bytes=limit, tfsa_cache_bytes=cache_bytes,
+                        )
+                    except (RuntimeError, OSError) as exc:
+                        diagnostic = cache_write_error(exc, work, args.tfsa_cache_mode)
+                        if diagnostic is not None:
+                            raise diagnostic from exc
+                        raise
                     if not bundle_ready(folder):
                         save_bundle(folder, ss, slat, ss_decoder, mesh_decoder, SparseTensor, pipeline.device,
                                     {**pair, "kind": "teacher", "alpha": alpha, "seed": args.seed,
@@ -569,10 +624,15 @@ def main(argv=None):
         if plan_path.exists():
             if not args.resume:
                 raise FileExistsError(f"{plan_path} already exists; use --resume or a new output directory")
-            if read_json(plan_path) != plan:
+            saved_plan = read_json(plan_path)
+            if not resume_compatible(saved_plan, plan):
                 raise ValueError("Resume plan differs: inputs, checkpoints, exclusions or settings changed. Use a new output directory.")
+            if saved_plan != plan:
+                print("Resuming with updated TFSA cache settings; reusing completed assets.", flush=True)
+                write_json(plan_path, plan)
         else:
-            unexpected = [p for p in root.iterdir() if p.name not in {".run.lock", "plan.dry_run.json"}]
+            unexpected = [p for p in root.iterdir()
+                          if p.name not in {".run.lock", "plan.dry_run.json"} and not launcher_log(p)]
             if unexpected:
                 raise FileExistsError(f"Output directory is not empty: {root}")
             write_json(plan_path, plan)

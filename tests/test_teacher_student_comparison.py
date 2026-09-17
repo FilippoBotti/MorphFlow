@@ -115,6 +115,43 @@ class ComparisonTests(unittest.TestCase):
                 comparison.main(self.argv + ["--resume"])
             self.assertEqual(run.call_count, 2)
 
+    def test_resume_allows_cache_reconfiguration_and_preexisting_job_logs(self):
+        for filename in ("ss.pt", "slat.pt"):
+            (self.root / filename).write_bytes(b"checkpoint")
+        self.output.mkdir()
+        (self.output / "slurm-comparison-12345.out").write_text("job starting\n")
+        (self.output / "slurm-comparison-12345.err").touch()
+        with patch.object(comparison.subprocess, "run") as run:
+            comparison.main(self.argv + ["--stage", "teacher", "--tfsa-cache-mode", "file"])
+            original = comparison.read_json(self.output / "plan.json")
+            asset = self.output / "assets" / next(iter(original["sources"]))
+            fake_bundle(asset)
+            completed_at = (asset / "complete.json").stat().st_mtime_ns
+            comparison.main(self.argv + ["--stage", "teacher", "--resume", "--tfsa-cache-mode", "memory",
+                                        "--max-work-cache-gb", "80"])
+            updated = comparison.read_json(self.output / "plan.json")
+            self.assertEqual(updated["config"]["tfsa_cache_mode"], "memory")
+            self.assertEqual(updated["config"]["max_work_cache_gb"], 80)
+            self.assertEqual(updated["pairs"], original["pairs"])
+            self.assertEqual((asset / "complete.json").stat().st_mtime_ns, completed_at)
+            with self.assertRaisesRegex(ValueError, "Resume plan differs"):
+                comparison.main(self.argv + ["--resume", "--tfsa-alpha", "0.7"])
+            self.assertEqual(run.call_count, 2)
+
+    def test_file_cache_space_is_checked_but_memory_cache_avoids_disk_requirement(self):
+        args = comparison.parse_args(self.argv)
+        self.assertEqual(args.tfsa_cache_mode, "memory")
+        with patch.object(comparison.shutil, "disk_usage", side_effect=AssertionError("No bulk disk cache")):
+            comparison.prepare_work_cache(self.output, args, str(self.root / "cache"))
+        args.tfsa_cache_mode = "file"
+        with patch.object(comparison.shutil, "disk_usage", return_value=SimpleNamespace(free=1024**3)):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient space.*need at least 62.0 GiB"):
+                comparison.prepare_work_cache(self.output, args, str(self.root / "cache"))
+        diagnostic = comparison.cache_write_error(RuntimeError("unexpected pos 640 vs 534"), self.root, "file")
+        self.assertIn(str(self.root), str(diagnostic))
+        self.assertIn("TFSA_CACHE_MODE=memory", str(diagnostic))
+        self.assertIsNone(comparison.cache_write_error(RuntimeError("CUDA out of memory"), self.root, "memory"))
+
     def test_incomplete_mesh_cannot_be_published_as_success(self):
         plan = self.plan()
         with self.assertRaisesRegex(RuntimeError, "Missing matched"):
@@ -192,6 +229,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual([c.args[5] for c in calls], list(range(1, 8)))
         self.assertEqual([c.args[6] for c in calls], [9] * 7)
         self.assertEqual([c.args[7] for c in calls], plan["alphas"])
+        self.assertTrue(all(isinstance(c.kwargs["tfsa_cache"], dict) for c in calls))
         self.assertEqual(save.call_count, 6)
         self.assertEqual(list((self.root / "cache").iterdir()), [])
 
@@ -250,13 +288,14 @@ class ComparisonTests(unittest.TestCase):
     def test_slurm_forwards_paths_with_spaces_and_gpu_visibility(self):
         binary_dir = self.root / "bin"
         binary_dir.mkdir()
-        (binary_dir / "module").write_text("#!/bin/bash\nexit 0\n")
+        (binary_dir / "module").write_text("#!/bin/bash\necho module-stdout\necho module-stderr >&2\n")
         (binary_dir / "module").chmod(0o755)
         capture = self.root / "singularity.json"
         (binary_dir / "singularity").write_text(
             f"#!{sys.executable}\nimport json, os, sys\n"
             "with open(os.environ['CAPTURE'], 'w') as f:\n"
             "    json.dump({'args': sys.argv[1:], 'cuda': os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES'), 'script': sys.stdin.read()}, f)\n"
+            "print('container-stdout')\nprint('container-stderr', file=sys.stderr)\n"
         )
         (binary_dir / "singularity").chmod(0o755)
         base = self.root / "trellis base"
@@ -284,7 +323,46 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(result["args"][result["args"].index(flag) + 1], value)
         self.assertEqual(result["args"][-1], "--dry-run")
         self.assertIn(f"{self.assets}:{self.assets}:ro", result["args"])
+        self.assertEqual(result["args"][result["args"].index("--tfsa-cache-mode") + 1], "memory")
         self.assertEqual(list(cache.iterdir()), [])
+        stdout = (self.output / "slurm-comparison-12345.out").read_text()
+        stderr = (self.output / "slurm-comparison-12345.err").read_text()
+        self.assertIn("module-stdout", stdout)
+        self.assertIn("container-stdout", stdout)
+        self.assertIn("module-stderr", stderr)
+        self.assertIn("container-stderr", stderr)
+        # An early configuration failure must also land in OUTPUT_DIR, before CUDA/container startup.
+        env.pop("CHECKPOINT_PATH")
+        env["SLURM_JOB_ID"] = "12346"
+        failed = subprocess.run(["bash", str(project / "slurm/generate_teacher_student_comparison.slurm")],
+                                env=env, capture_output=True, text=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Set CHECKPOINT_PATH", (self.output / "slurm-comparison-12346.err").read_text())
+
+    def test_submitter_configures_slurm_logs_before_job_start(self):
+        binary_dir = self.root / "bin"
+        binary_dir.mkdir()
+        capture = self.root / "sbatch.json"
+        (binary_dir / "sbatch").write_text(
+            f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+            "assert pathlib.Path(os.environ['OUTPUT_DIR']).is_dir()\n"
+            "with open(os.environ['CAPTURE'], 'w') as f:\n"
+            "    json.dump({'args': sys.argv[1:], 'output': os.environ['OUTPUT_DIR']}, f)\n"
+        )
+        (binary_dir / "sbatch").chmod(0o755)
+        project = Path(comparison.__file__).parent
+        env = {**os.environ, "PATH": f"{binary_dir}:{os.environ['PATH']}",
+               "OUTPUT_DIR": str(self.root / "unused output"), "CAPTURE": str(capture)}
+        subprocess.run(["bash", str(project / "slurm/submit_teacher_student_comparison.sh"),
+                        "--time=02:00:00", "--", "--output-dir", str(self.output), "--resume"],
+                       env=env, check=True, capture_output=True, text=True)
+        result = comparison.read_json(capture)
+        self.assertEqual(result["output"], str(self.output))
+        self.assertIn(f"--output={self.output}/slurm-comparison-%j.out", result["args"])
+        self.assertIn(f"--error={self.output}/slurm-comparison-%j.err", result["args"])
+        self.assertIn("--time=02:00:00", result["args"])
+        self.assertIn("--resume", result["args"])
+        self.assertFalse((self.root / "unused output").exists())
 
 
 if __name__ == "__main__":

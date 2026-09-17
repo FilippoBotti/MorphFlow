@@ -26,15 +26,31 @@ export SLAT_CHECKPOINT_PATH=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/run_
 export OUTPUT_DIR=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/comparison/experiment_01
 export NUM_PAIRS=20
 export NUM_INTERMEDIATES=9
-sbatch slurm/generate_teacher_student_comparison.slurm
+bash slurm/submit_teacher_student_comparison.sh
 ```
 
 Default: account/partition/QOS `g_vbd`/`gpu_vbd`/`gpu_vbd`, una L40S, 8 CPU,
 128 GB RAM, 24 ore, modulo `singularity/3.8.7`, immagine
 `$HOME/containers/trellis-py240-cu118.sif`, ambiente `/opt/trellis/env`.
-Le risorse si possono cambiare con le normali opzioni `sbatch`, ad esempio
-`sbatch --time=2-00:00:00 ...`. I log Slurm vengono scritti nella directory di
-submit; questa scelta non richiede di creare in anticipo una directory log.
+Il submitter crea `OUTPUT_DIR` prima di inviare il job e imposta i log Slurm:
+
+```text
+$OUTPUT_DIR/slurm-comparison-<jobid>.out
+$OUTPUT_DIR/slurm-comparison-<jobid>.err
+```
+
+Questi file includono anche gli errori di avvio del job. Le opzioni prima di `--`
+vanno a `sbatch`, quelle dopo a Python. Ad esempio:
+
+```bash
+bash slurm/submit_teacher_student_comparison.sh --time=2-00:00:00 -- --resume
+tail -f "$OUTPUT_DIR"/slurm-comparison-*.err
+```
+
+Resta possibile `sbatch slurm/generate_teacher_student_comparison.slurm`: lo
+script redirige subito stdout/stderr negli stessi file dentro `OUTPUT_DIR`,
+prima di caricare moduli e container. Per includere anche gli errori Slurm che
+precedono l'avvio dello script, usare il submitter.
 
 Percorsi configurabili tramite variabili esportate:
 
@@ -46,7 +62,7 @@ Percorsi configurabili tramite variabili esportate:
 | `SIF` | `$HOME/containers/trellis-py240-cu118.sif` |
 | `ASSETS_DIR` | `/hpc/scratch/marco.barezzi/3d_dataset/flux_outputs` |
 | `DATASET_DIR` | `/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v3` |
-| `OUTPUT_DIR` | archivio `morphflow_runs/comparison/job_<jobid>` |
+| `OUTPUT_DIR` | archivio `morphflow_runs/comparison/run_<timestamp>_<pid>` con il submitter; `job_<jobid>` con sbatch diretto |
 | `WORK_CACHE_ROOT` | `$SLURM_TMPDIR`, altrimenti `/tmp` |
 
 Il checkout MorphAny3D deve contenere `trellis/` con i metodi di morphing già usati
@@ -59,11 +75,19 @@ sulla stessa GPU, liberando i pesi del teacher prima di caricare i due checkpoin
 Parametri principali esportabili: `NUM_PAIRS=10`, `NUM_INTERMEDIATES=5`, `SEED=42`,
 `STEPS=50`, `SLAT_STEPS=50`, `CFG_SCALE=3.0`, `SLAT_CFG_SCALE=3.0`,
 `TEACHER_SS_STEPS=25`, `TEACHER_SLAT_STEPS=25`, `TEACHER_SS_CFG=7.5`,
-`TEACHER_SLAT_CFG=3.0`, `TFSA_ALPHA=0.8`, `TFSA_CACHE_MODE=file`,
+`TEACHER_SLAT_CFG=3.0`, `TFSA_ALPHA=0.8`, `TFSA_CACHE_MODE=memory`,
 `MAX_WORK_CACHE_GB=60`, `MIXED_PRECISION=auto`, `MODEL_ID=microsoft/TRELLIS-image-large`.
-Con `file` la cache TFSA richiede spazio locale; su nodi con NVMe si può impostare
-`WORK_CACHE_ROOT=/nvme/$USER`. `memory` usa la RAM. Il limite è per coppia;
-`MAX_WORK_CACHE_GB=0` disabilita il limite. La cache temporanea viene eliminata
+Il default `memory` conserva in RAM i tensori di attenzione TFSA, evitando le
+grandi scritture su `/tmp` che possono causare `PytorchStreamWriter ... file write
+failed` / `unexpected pos`. Restano solo eventuali piccoli file ausiliari nella
+directory temporanea. MCA e TFSA restano attive.
+Con `file` la cache richiede spazio su disco: prima di caricare i modelli si
+verifica la disponibilità di `MAX_WORK_CACHE_GB + 2` GiB. Su nodi con NVMe si può
+impostare `WORK_CACHE_ROOT=/nvme/$USER`. Il controllo dello spazio libero non
+verifica le quote personali; gli errori di scrittura riportano directory e spazio
+residuo. Il limite è per coppia; `MAX_WORK_CACHE_GB=0` disabilita il limite dei
+tensori (resta il controllo di almeno 2 GiB liberi in modalità file).
+La cache temporanea viene eliminata
 all'uscita, compresi gli errori intercettati. Un arresto forzato del job può
 richiedere la pulizia della sua directory temporanea.
 
@@ -84,14 +108,16 @@ python generate_teacher_student_comparison.py \
 Scrive `plan.dry_run.json`. Togliendo `--dry-run`, gli stessi parametri avviano
 la generazione e scrivono `plan.json`. Per uso diretto serve l'ambiente GPU del
 progetto, con `TRELLIS_REPO=/path/MorphAny3D` e il checkout nel `PYTHONPATH`.
-La modalità dry run è disponibile anche dal launcher Slurm aggiungendo
-`--dry-run` dopo il nome dello script; il launcher verifica comunque l'esistenza
-dei checkpoint e richiede le risorse del job.
+La modalità dry run è disponibile anche con
+`bash slurm/submit_teacher_student_comparison.sh -- --dry-run`; il launcher
+verifica comunque l'esistenza dei checkpoint e richiede le risorse del job.
 
 ## Output e confronto metriche
 
 ```text
 output/
+  slurm-comparison-<jobid>.out      # avanzamento e stdout
+  slurm-comparison-<jobid>.err      # traceback, warning e stderr
   plan.json                       # input, checkpoint, esclusioni, seed, alpha
   status.json                     # running / failed / teacher_complete / complete
   assets/<asset>/                  # sorgenti TRELLIS condivise
@@ -148,7 +174,19 @@ anche lo stesso `OUTPUT_DIR`, perché il default cambia con il job ID.
 
 Il piano registra hash SHA-256 delle immagini selezionate e dei metadata di
 esclusione, dimensione/mtime dei checkpoint e tutti i parametri. La ripresa
-rifiuta input o configurazioni differenti. Gli asset completi vengono saltati;
+rifiuta input o parametri di generazione differenti. Si possono cambiare la
+modalità `TFSA_CACHE_MODE` e il limite `MAX_WORK_CACHE_GB` (oltre alla directory
+temporanea): il piano registra le nuove impostazioni e riutilizza gli asset
+completi. Per riprendere un job fallito scrivendo la cache su `/tmp`, mantenere
+gli stessi checkpoint, n, k, seed e output, poi usare:
+
+```bash
+export TFSA_CACHE_MODE=memory
+export RESUME=1
+bash slurm/submit_teacher_student_comparison.sh
+```
+
+Gli asset completi vengono saltati;
 se una sequenza teacher è parziale, viene ricalcolata dall'inizio per ricostruire
 la TFSA, conservando gli asset già completati. Errori CUDA, mesh vuote o limiti di
 cache interrompono il job, evitando di pubblicare silenziosamente meno di n*k

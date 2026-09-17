@@ -9,19 +9,41 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=slurm-comparison-%j.out
-#SBATCH --error=slurm-comparison-%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
+#SBATCH --open-mode=append
 
 # Ateneo: same Singularity image/environment as generate_morphany3d_v3.slurm.
-# Set CHECKPOINT_PATH and SLAT_CHECKPOINT_PATH before sbatch. All other settings
+# Prefer submit_teacher_student_comparison.sh: it configures Slurm's own logs
+# inside OUTPUT_DIR before submission, including scheduler/startup errors.
+# Direct sbatch also redirects the running script's logs into OUTPUT_DIR.
+# Set CHECKPOINT_PATH and SLAT_CHECKPOINT_PATH before submission. Other settings
 # below can be overridden via exported variables. Extra CLI arguments are passed
 # verbatim to Python (e.g. --dry-run, --stage teacher, --resume).
 set -euo pipefail
 
+PROJECT_DIR="${PROJECT_DIR:-$HOME/trellis-singularity/work/MorphFlow}"
+OUTPUT_DIR="${OUTPUT_DIR:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/comparison/job_${SLURM_JOB_ID:-local}}"
+# Honor the Python override before opening logs, including paths with spaces.
+CLI_ARGS=("$@")
+for ((arg_index=0; arg_index<${#CLI_ARGS[@]}; arg_index++)); do
+    case "${CLI_ARGS[$arg_index]}" in
+        --output-dir)
+            arg_index=$((arg_index + 1))
+            OUTPUT_DIR="${CLI_ARGS[$arg_index]:?--output-dir needs a value}"
+            ;;
+        --output-dir=*) OUTPUT_DIR="${CLI_ARGS[$arg_index]#--output-dir=}" ;;
+    esac
+done
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
+exec >>"$OUTPUT_DIR/slurm-comparison-${SLURM_JOB_ID:-local}.out" \
+     2>>"$OUTPUT_DIR/slurm-comparison-${SLURM_JOB_ID:-local}.err"
+printf 'Job %s on %s; output=%s\n' "${SLURM_JOB_ID:-local}" "${SLURMD_NODENAME:-unknown}" "$OUTPUT_DIR"
+
 module purge
 module load "${SINGULARITY_MODULE:-singularity/3.8.7}"
 
-PROJECT_DIR="${PROJECT_DIR:-$HOME/trellis-singularity/work/MorphFlow}"
 MORPHANY3D_DIR="${MORPHANY3D_DIR:-$HOME/trellis-singularity/work/MorphAny3D}"
 TRELLIS_BASE="${TRELLIS_BASE:-$HOME/trellis-singularity}"
 SIF="${SIF:-$HOME/containers/trellis-py240-cu118.sif}"
@@ -29,7 +51,6 @@ ASSETS_DIR="${ASSETS_DIR:-/hpc/scratch/marco.barezzi/3d_dataset/flux_outputs}"
 DATASET_DIR="${DATASET_DIR:-/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v3}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to the trained SS checkpoint}"
 SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:?Set SLAT_CHECKPOINT_PATH to the trained SLat checkpoint}"
-OUTPUT_DIR="${OUTPUT_DIR:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/comparison/job_${SLURM_JOB_ID:-local}}"
 NUM_PAIRS="${NUM_PAIRS:-10}"
 NUM_INTERMEDIATES="${NUM_INTERMEDIATES:-5}"
 SEED="${SEED:-42}"
@@ -45,7 +66,7 @@ TEACHER_SLAT_STEPS="${TEACHER_SLAT_STEPS:-25}"
 TEACHER_SS_CFG="${TEACHER_SS_CFG:-7.5}"
 TEACHER_SLAT_CFG="${TEACHER_SLAT_CFG:-3.0}"
 TFSA_ALPHA="${TFSA_ALPHA:-0.8}"
-TFSA_CACHE_MODE="${TFSA_CACHE_MODE:-file}"
+TFSA_CACHE_MODE="${TFSA_CACHE_MODE:-memory}"
 MAX_WORK_CACHE_GB="${MAX_WORK_CACHE_GB:-60}"
 MIXED_PRECISION="${MIXED_PRECISION:-auto}"
 # Set WORK_CACHE_ROOT=/nvme/$USER on nodes that offer local NVMe.
