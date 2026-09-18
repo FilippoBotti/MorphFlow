@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=eval_morphflow_v3
 #SBATCH --account=g_vbd
-#SBATCH --partition=gpu
-#SBATCH --qos=gpu
+#SBATCH --partition=gpu_vbd
+#SBATCH --qos=gpu_vbd
 #SBATCH --nodes=1
-#SBATCH --nodelist=wn45
-#SBATCH --gres=gpu:a100_80g:1
+#SBATCH --nodelist=wn46
+#SBATCH --gres=gpu:a100_vbd:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=04:00:00

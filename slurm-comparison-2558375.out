@@ -1,0 +1,164 @@
+Comparison: 10 pairs, 3 intermediates; output=/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs/comparison/job_2558375
+[SPARSE] Backend: spconv, Attention: xformers
+[MorphAny3D] render_utils unavailable, skipping render-only helpers: No module named 'nvdiffrast'
+[SPARSE] Backend: spconv, Attention: xformers
+[ATTENTION] Using backend: xformers
+[SPARSE][CONV] spconv algo: native
+[SPARSE][CONV] spconv algo: native
+[ATTENTION] Using backend: xformers
+[source] 0233_stormforged-anthropomorphic-badger-ready-stance
+[source] 0298_bard-like-anthropomorphic-cobra-one
+[source] 0844_mystical-yeti-neutral-pose-retro
+[source] 0999_stormforged-anthropomorphic-komodo-dragon-monk
+[source] 1094_bone-plated-anthropomorphic-porcupine-chieftain
+[source] 1403_swamp-born-anthropomorphic-jaguar-shaman
+[source] 2374_serene-anthropomorphic-cheetah-slightly-crouched
+[source] 2649_feathered-anthropomorphic-owl-standing-confidently
+[source] 3044_ornate-anthropomorphic-pegasus-sneaky-pose
+[source] 4117_volcanic-swamp-monster-calm-idle
+[source] 5071_armored-anthropomorphic-elephant-hunter-three
+[source] 5319_bone-plated-anthropomorphic-boar-guarding
+[source] 5557_ornate-stone-golem-beast-three
+[source] 5805_shamanic-anthropomorphic-badger-balanced-front
+[source] 6154_tribal-anthropomorphic-weasel-guarding-stance
+[source] 6345_playful-anthropomorphic-orca-shaman-one
+[source] 6897_dreamlike-anthropomorphic-frog-bard-calm
+[source] 7402_monk-like-anthropomorphic-porcupine-dynamic
+[source] 8133_weathered-anthropomorphic-penguin-guardian-battle
+[source] 8678_infernal-anthropomorphic-manticore-ready-stance
+[teacher] pair_000000 1/3 alpha=0.750000000
+[teacher] pair_000000 2/3 alpha=0.500000000
+[teacher] pair_000000 3/3 alpha=0.250000000
+[teacher] pair_000001 1/3 alpha=0.750000000
+[teacher] pair_000001 2/3 alpha=0.500000000
+[teacher] pair_000001 3/3 alpha=0.250000000
+[teacher] pair_000002 1/3 alpha=0.750000000
+[teacher] pair_000002 2/3 alpha=0.500000000
+[teacher] pair_000002 3/3 alpha=0.250000000
+[teacher] pair_000003 1/3 alpha=0.750000000
+[teacher] pair_000003 2/3 alpha=0.500000000
+[teacher] pair_000003 3/3 alpha=0.250000000
+[teacher] pair_000004 1/3 alpha=0.750000000
+[teacher] pair_000004 2/3 alpha=0.500000000
+[teacher] pair_000004 3/3 alpha=0.250000000
+[teacher] pair_000005 1/3 alpha=0.750000000
+[teacher] pair_000005 2/3 alpha=0.500000000
+[teacher] pair_000005 3/3 alpha=0.250000000
+[teacher] pair_000006 1/3 alpha=0.750000000
+[teacher] pair_000006 2/3 alpha=0.500000000
+[teacher] pair_000006 3/3 alpha=0.250000000
+[teacher] pair_000007 1/3 alpha=0.750000000
+[teacher] pair_000007 2/3 alpha=0.500000000
+[teacher] pair_000007 3/3 alpha=0.250000000
+[teacher] pair_000008 1/3 alpha=0.750000000
+[teacher] pair_000008 2/3 alpha=0.500000000
+[teacher] pair_000008 3/3 alpha=0.250000000
+[teacher] pair_000009 1/3 alpha=0.750000000
+[teacher] pair_000009 2/3 alpha=0.500000000
+[teacher] pair_000009 3/3 alpha=0.250000000
+[SPARSE] Backend: spconv, Attention: xformers
+[ATTENTION] Using backend: xformers
+[SPARSE][CONV] spconv algo: native
+MorphFlow kwargs:
+  model_type: image_large
+  separate_cond: True
+  use_checkpoint: False
+  separate_cond_gate: token
+  cond_resample_tokens: 0
+  cond_resample_depth: 1
+  cond_resample_heads: 8
+  cond_encoder_type: sparse_conv3d
+  normalize_cond_latents: True
+  cond_token_norm: none
+  cond_proj_norm: layernorm
+  cond_style_tokens: 8
+  cond_use_occupancy: True
+  cond_hybrid_pool_stats: True
+  cond_residual_blocks_64: 2
+  cond_residual_blocks_32: 2
+  cond_residual_blocks_16: 2
+  t_schedule: logit_normal
+  t_logit_mean: 1.0
+  t_logit_std: 1.0
+  use_semantic_token_matching: False
+  semantic_match_dim: 128
+  semantic_match_temperature: 0.1
+  semantic_match_max_align: 0.0
+  semantic_match_alpha_weight: True
+  semantic_match_detach_scores: False
+  semantic_match_exclude_style_tokens: True
+  semantic_cycle_loss_weight: 0.0
+  semantic_cycle_loss_prob: 0.0
+  semantic_cycle_detach_targets: True
+  semantic_cycle_alpha_weight: True
+  semantic_match_log_stats: True
+MorphSLatFlow kwargs:
+  model_type: image_large
+  separate_cond: True
+  use_checkpoint: False
+  separate_cond_gate: token
+  cond_resample_tokens: 0
+  cond_resample_depth: 1
+  cond_resample_heads: 8
+  cond_encoder_type: sparse_conv3d
+  normalize_cond_latents: True
+  cond_token_norm: none
+  cond_proj_norm: layernorm
+  cond_style_tokens: 8
+  cond_use_occupancy: True
+  cond_hybrid_pool_stats: True
+  cond_residual_blocks_64: 2
+  cond_residual_blocks_32: 2
+  cond_residual_blocks_16: 2
+  t_schedule: logit_normal
+  t_logit_mean: 1.0
+  t_logit_std: 1.0
+  use_semantic_token_matching: False
+  semantic_match_dim: 128
+  semantic_match_temperature: 0.1
+  semantic_match_max_align: 0.0
+  semantic_match_alpha_weight: True
+  semantic_match_detach_scores: False
+  semantic_match_exclude_style_tokens: True
+  semantic_cycle_loss_weight: 0.0
+  semantic_cycle_loss_prob: 0.0
+  semantic_cycle_detach_targets: True
+  semantic_cycle_alpha_weight: True
+  semantic_match_log_stats: True
+[SPARSE] Backend: spconv, Attention: xformers
+[MorphAny3D] render_utils unavailable, skipping render-only helpers: No module named 'nvdiffrast'
+Loading TRELLIS SLAT mesh decoder...
+[SPARSE][CONV] spconv algo: native
+[ATTENTION] Using backend: xformers
+Loading TRELLIS sparse-structure decoder...
+[student] pair_000000 1/3 alpha=0.750000000
+[student] pair_000000 2/3 alpha=0.500000000
+[student] pair_000000 3/3 alpha=0.250000000
+[student] pair_000001 1/3 alpha=0.750000000
+[student] pair_000001 2/3 alpha=0.500000000
+[student] pair_000001 3/3 alpha=0.250000000
+[student] pair_000002 1/3 alpha=0.750000000
+[student] pair_000002 2/3 alpha=0.500000000
+[student] pair_000002 3/3 alpha=0.250000000
+[student] pair_000003 1/3 alpha=0.750000000
+[student] pair_000003 2/3 alpha=0.500000000
+[student] pair_000003 3/3 alpha=0.250000000
+[student] pair_000004 1/3 alpha=0.750000000
+[student] pair_000004 2/3 alpha=0.500000000
+[student] pair_000004 3/3 alpha=0.250000000
+[student] pair_000005 1/3 alpha=0.750000000
+[student] pair_000005 2/3 alpha=0.500000000
+[student] pair_000005 3/3 alpha=0.250000000
+[student] pair_000006 1/3 alpha=0.750000000
+[student] pair_000006 2/3 alpha=0.500000000
+[student] pair_000006 3/3 alpha=0.250000000
+[student] pair_000007 1/3 alpha=0.750000000
+[student] pair_000007 2/3 alpha=0.500000000
+[student] pair_000007 3/3 alpha=0.250000000
+[student] pair_000008 1/3 alpha=0.750000000
+[student] pair_000008 2/3 alpha=0.500000000
+[student] pair_000008 3/3 alpha=0.250000000
+[student] pair_000009 1/3 alpha=0.750000000
+[student] pair_000009 2/3 alpha=0.500000000
+[student] pair_000009 3/3 alpha=0.250000000
+Finished: /hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/outputs/comparison/job_2558375

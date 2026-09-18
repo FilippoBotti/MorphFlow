@@ -190,7 +190,7 @@ accelerate launch \
   --semantic_match_alpha_weight 1 \
   --semantic_match_detach_scores 0 \
   --semantic_match_exclude_style_tokens 1 \
-  --semantic_cycle_loss_weight 0.01 \
+  --semantic_cycle_loss_weight 1.0 \
   --semantic_cycle_loss_prob 0.25 \
   --semantic_cycle_detach_targets 1 \
   --semantic_cycle_alpha_weight 1 \
