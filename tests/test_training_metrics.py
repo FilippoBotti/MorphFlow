@@ -23,14 +23,16 @@ from modules.training_metrics import collect_reduced_forward_metrics
 class SemanticTrainingProbe(SemanticTokenMatchingMixin, torch.nn.Module):
     """Exercise the real matcher, stochastic gate, auxiliary loss and gradients."""
 
-    def __init__(self, log_stats=True, enabled=True):
+    def __init__(self, log_stats=True, enabled=True, usage_weight=0.0, usage_cap=4.0, cycle_weight=0.01):
         super().__init__()
         self._init_semantic_token_matching(
             use_semantic_token_matching=enabled,
             semantic_match_dim=8,
-            semantic_cycle_loss_weight=0.01 if enabled else 0.0,
+            semantic_cycle_loss_weight=cycle_weight if enabled else 0.0,
             semantic_cycle_loss_prob=0.25,
             semantic_match_log_stats=log_stats,
+            semantic_usage_loss_weight=usage_weight,
+            semantic_usage_cap=usage_cap,
         )
 
     def forward(self, src1, src2, alpha, draw):
@@ -81,9 +83,9 @@ def distributed_regression(rank, store_path):
                             world_size=2, timeout=timedelta(seconds=20))
     try:
         accelerator = CPUAccelerator(distributed=True)
-        for log_stats in (True, False):
+        for log_stats, usage_weight in ((True, 0.0), (False, 0.0), (True, 0.01), (False, 0.01)):
             torch.manual_seed(100 + rank)
-            model = DistributedDataParallel(SemanticTrainingProbe(log_stats=log_stats),
+            model = DistributedDataParallel(SemanticTrainingProbe(log_stats=log_stats, usage_weight=usage_weight, usage_cap=1.0),
                                            find_unused_parameters=False)
             optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
             src1, src2 = torch.randn(2, 4, 128), torch.randn(2, 5, 128)
@@ -116,6 +118,9 @@ def distributed_regression(rank, store_path):
                     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
                 torch.testing.assert_close(reduced["semantic_cycle_active"],
                                            0.5 if step < 2 else float(step == 3))
+                torch.testing.assert_close(reduced["semantic_usage_active"], float(usage_weight > 0))
+                torch.testing.assert_close(reduced["semantic_aux_loss_weighted"],
+                                           reduced["semantic_cycle_loss_weighted"] + reduced["semantic_usage_loss_weighted"])
             # Check that DDP parameters remain synchronized after all steps.
             weights = torch.cat([p.detach().flatten() for p in model.parameters()])
             copies = [torch.empty_like(weights), torch.empty_like(weights)]

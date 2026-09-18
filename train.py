@@ -2,6 +2,7 @@ import argparse
 import fnmatch
 import inspect
 import json
+import math
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -118,6 +119,10 @@ def build_parser():
     parser.add_argument("--semantic_cycle_detach_targets", type=int, choices=[0, 1], default=1)
     parser.add_argument("--semantic_cycle_alpha_weight", type=int, choices=[0, 1], default=1)
     parser.add_argument("--semantic_match_log_stats", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--semantic_usage_loss_weight", type=float, default=0.0,
+                        help="Weight of bidirectional capped hubness loss. 0 disables it; initial trial: 0.01 with cycle weight 0.")
+    parser.add_argument("--semantic_usage_cap", type=float, default=4.0,
+                        help="Penalize normalized token usage only above this cap (>=1); uniform usage is 1.")
 
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
@@ -348,10 +353,14 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "semantic_cycle_detach_targets": args.semantic_cycle_detach_targets == 1,
         "semantic_cycle_alpha_weight": args.semantic_cycle_alpha_weight == 1,
         "semantic_match_log_stats": args.semantic_match_log_stats == 1,
+        "semantic_usage_loss_weight": args.semantic_usage_loss_weight,
+        "semantic_usage_cap": args.semantic_usage_cap,
     }
 
     signature = inspect.signature(model_cls.__init__)
     supported = set(signature.parameters.keys())
+    if args.semantic_usage_loss_weight > 0.0 and "semantic_usage_loss_weight" not in supported:
+        raise ValueError(f"{model_cls.__name__} does not support semantic usage loss; use SS or SLat-conditioned SLat flow.")
 
     model_kwargs = {
         key: value
@@ -428,6 +437,8 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         ("flow_matching_loss", "fm"),
         ("semantic_aux_loss_weighted", "sem_aux"),
         ("semantic_cycle_loss_weighted", "sem_cyc"),
+        ("semantic_usage_loss", "hub_raw"),
+        ("semantic_usage_loss_weighted", "hub"),
         ("endpoint_loss", "end_raw"),
         ("endpoint_loss_weighted", "end"),
         ("symmetry_loss", "sym_raw"),
@@ -441,6 +452,9 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         ("pred_target_cosine", "slat_cos"),
         ("semantic_align_lambda", "sem_lam"),
         ("semantic_entropy_12", "sem_H12"),
+        ("semantic_entropy_21", "sem_H21"),
+        ("semantic_usage_12_max", "usage12_max"),
+        ("semantic_usage_21_max", "usage21_max"),
         ("pred_std", "pred_std"),
         ("target_std", "target_std"),
         ("mse_zero", "mse_zero"),
@@ -1124,6 +1138,12 @@ def train(args):
         raise ValueError(f"--semantic_cycle_loss_prob must be in [0, 1], got {args.semantic_cycle_loss_prob}")
     if args.semantic_cycle_loss_weight > 0.0 and args.use_semantic_token_matching == 0:
         raise ValueError("--semantic_cycle_loss_weight > 0 requires --use_semantic_token_matching=1")
+    if not math.isfinite(args.semantic_usage_loss_weight) or args.semantic_usage_loss_weight < 0.0:
+        raise ValueError("--semantic_usage_loss_weight must be finite and >= 0")
+    if not math.isfinite(args.semantic_usage_cap) or args.semantic_usage_cap < 1.0:
+        raise ValueError("--semantic_usage_cap must be finite and >= 1")
+    if args.semantic_usage_loss_weight > 0.0 and args.use_semantic_token_matching == 0:
+        raise ValueError("--semantic_usage_loss_weight > 0 requires --use_semantic_token_matching=1")
     if args.slat_condition_source == "dino" and args.flow_target != "slat":
         raise ValueError("--slat_condition_source dino is only valid with --flow_target slat.")
     if args.slat_condition_source == "dino" and not args.source_images_root:
@@ -1410,6 +1430,10 @@ def train(args):
         accelerator.print(f"Semantic cycle loss probability: {args.semantic_cycle_loss_prob}")
         accelerator.print(f"Semantic cycle detach targets: {args.semantic_cycle_detach_targets == 1}")
         accelerator.print(f"Semantic cycle alpha weighting: {args.semantic_cycle_alpha_weight == 1}")
+        accelerator.print(f"Semantic usage (hubness) loss weight: {args.semantic_usage_loss_weight}")
+        accelerator.print(f"Semantic usage cap: {args.semantic_usage_cap}")
+        if args.semantic_usage_loss_weight > 0.0:
+            accelerator.print("Usage loss: mean squared excess above cap, averaged over both directions; applied every train/validation forward.")
     accelerator.print(f"CFG drop probability: {args.cfg_drop_prob}")
     if args.use_lora == 1:
         accelerator.print(f"LoRA attention scope: {args.lora_attention_scope}")

@@ -34,6 +34,12 @@ OUT_ROOT_HOST="$ARCHIVE_HOST/morphflow_runs"
 OUT_ROOT_IN="/archive/morphflow_runs"
 
 RUN_NAME="${RUN_NAME:-$SLURM_JOB_NAME}"
+# Trial: SEMANTIC_CYCLE_LOSS_WEIGHT=0 SEMANTIC_USAGE_LOSS_WEIGHT=0.01
+#        SEMANTIC_USAGE_CAP=4.0, with a new RUN_NAME.
+SEMANTIC_CYCLE_LOSS_WEIGHT="${SEMANTIC_CYCLE_LOSS_WEIGHT:-1.0}"
+SEMANTIC_CYCLE_LOSS_PROB="${SEMANTIC_CYCLE_LOSS_PROB:-0.25}"
+SEMANTIC_USAGE_LOSS_WEIGHT="${SEMANTIC_USAGE_LOSS_WEIGHT:-0.0}"
+SEMANTIC_USAGE_CAP="${SEMANTIC_USAGE_CAP:-4.0}"
 RUN_DIR_HOST="$OUT_ROOT_HOST/$RUN_NAME"
 LOG_DIR_HOST="$RUN_DIR_HOST/logs"
 
@@ -84,6 +90,9 @@ echo "RUN_DIR_HOST=$RUN_DIR_HOST"
 echo "DATA_ROOT_HOST=$DATA_ROOT_HOST"
 echo "AUTO_RESUME=$AUTO_RESUME"
 echo "RESUME_FROM=$RESUME_FROM"
+echo "SEMANTIC_CYCLE_LOSS_WEIGHT=$SEMANTIC_CYCLE_LOSS_WEIGHT"
+echo "SEMANTIC_USAGE_LOSS_WEIGHT=$SEMANTIC_USAGE_LOSS_WEIGHT"
+echo "SEMANTIC_USAGE_CAP=$SEMANTIC_USAGE_CAP"
 
 export SINGULARITYENV_PROJECT_DIR="$PROJECT_DIR"
 export SINGULARITYENV_DATA_ROOT_IN="$DATA_ROOT_IN"
@@ -91,6 +100,10 @@ export SINGULARITYENV_FLUX_ROOT_IN="$FLUX_ROOT_IN"
 export SINGULARITYENV_OUT_ROOT_IN="$OUT_ROOT_IN"
 export SINGULARITYENV_RUN_NAME="$RUN_NAME"
 export SINGULARITYENV_RESUME_ARG="$RESUME_ARG"
+export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_WEIGHT="$SEMANTIC_CYCLE_LOSS_WEIGHT"
+export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_PROB="$SEMANTIC_CYCLE_LOSS_PROB"
+export SINGULARITYENV_SEMANTIC_USAGE_LOSS_WEIGHT="$SEMANTIC_USAGE_LOSS_WEIGHT"
+export SINGULARITYENV_SEMANTIC_USAGE_CAP="$SEMANTIC_USAGE_CAP"
 
 singularity exec --cleanenv --nv \
   --bind "$TRELLIS_BASE:/opt/trellis" \
@@ -190,10 +203,12 @@ accelerate launch \
   --semantic_match_alpha_weight 1 \
   --semantic_match_detach_scores 0 \
   --semantic_match_exclude_style_tokens 1 \
-  --semantic_cycle_loss_weight 1.0 \
-  --semantic_cycle_loss_prob 0.25 \
+  --semantic_cycle_loss_weight "$SEMANTIC_CYCLE_LOSS_WEIGHT" \
+  --semantic_cycle_loss_prob "$SEMANTIC_CYCLE_LOSS_PROB" \
   --semantic_cycle_detach_targets 1 \
   --semantic_cycle_alpha_weight 1 \
+  --semantic_usage_loss_weight "$SEMANTIC_USAGE_LOSS_WEIGHT" \
+  --semantic_usage_cap "$SEMANTIC_USAGE_CAP" \
   --semantic_match_log_stats 1 \
   --separate_cond 1 \
   --separate_cond_gate token \

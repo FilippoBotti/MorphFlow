@@ -66,6 +66,8 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         semantic_cycle_detach_targets=True,
         semantic_cycle_alpha_weight=True,
         semantic_match_log_stats=True,
+        semantic_usage_loss_weight=0.0,
+        semantic_usage_cap=4.0,
     ):
         super().__init__()
         
@@ -172,6 +174,8 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             semantic_cycle_detach_targets=semantic_cycle_detach_targets,
             semantic_cycle_alpha_weight=semantic_cycle_alpha_weight,
             semantic_match_log_stats=semantic_match_log_stats,
+            semantic_usage_loss_weight=semantic_usage_loss_weight,
+            semantic_usage_cap=semantic_usage_cap,
         )
 
         self.cfg_drop_prob = 0.0

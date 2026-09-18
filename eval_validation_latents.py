@@ -205,6 +205,8 @@ def build_model(ckpt, model_type, flow_target):
         "semantic_cycle_detach_targets": bool(int(args.get("semantic_cycle_detach_targets", 1))),
         "semantic_cycle_alpha_weight": bool(int(args.get("semantic_cycle_alpha_weight", 1))),
         "semantic_match_log_stats": bool(int(args.get("semantic_match_log_stats", 1))),
+        "semantic_usage_loss_weight": float(args.get("semantic_usage_loss_weight", 0.0)),
+        "semantic_usage_cap": float(args.get("semantic_usage_cap", 4.0)),
     }
 
     supported = set(inspect.signature(model_cls.__init__).parameters)

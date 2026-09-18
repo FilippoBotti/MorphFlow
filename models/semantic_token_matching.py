@@ -1,4 +1,5 @@
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -19,6 +20,9 @@ SEMANTIC_METRIC_NAMES = (
     "semantic_cycle_loss",
     "semantic_cycle_loss_weighted",
     "semantic_cycle_active",
+    "semantic_usage_loss",
+    "semantic_usage_loss_weighted",
+    "semantic_usage_active",
 )
 
 
@@ -47,6 +51,7 @@ class SemanticTokenMatcher(nn.Module):
         style_tokens: int = 0,
         cycle_detach_targets: bool = True,
         cycle_alpha_weight: bool = True,
+        usage_cap: float = 4.0,
     ):
         super().__init__()
         if dim <= 0:
@@ -59,6 +64,8 @@ class SemanticTokenMatcher(nn.Module):
             raise ValueError(f"max_align must be >= 0, got {max_align}")
         if style_tokens < 0:
             raise ValueError(f"style_tokens must be >= 0, got {style_tokens}")
+        if not math.isfinite(usage_cap) or usage_cap < 1.0:
+            raise ValueError(f"usage_cap must be finite and >= 1, got {usage_cap}")
 
         self.dim = int(dim)
         self.match_dim = int(match_dim)
@@ -69,6 +76,7 @@ class SemanticTokenMatcher(nn.Module):
         self.style_tokens = int(style_tokens)
         self.cycle_detach_targets = bool(cycle_detach_targets)
         self.cycle_alpha_weight = bool(cycle_alpha_weight)
+        self.usage_cap = float(usage_cap)
 
         self.q_proj = nn.Linear(self.dim, self.match_dim)
         self.k_proj = nn.Linear(self.dim, self.match_dim)
@@ -110,6 +118,21 @@ class SemanticTokenMatcher(nn.Module):
         usage = attn.mean(dim=1) * float(attn.shape[-1])
         return usage.max(dim=-1).values.mean(), usage.min(dim=-1).values.mean()
 
+    def _usage_loss(self, a12: torch.Tensor, a21: torch.Tensor) -> torch.Tensor:
+        """Penalize only excessive destination-token usage in both directions.
+
+        For [B, queries, destinations], destinations * mean_queries(A) has mean
+        one even when the two sources have different token counts. This loss
+        leaves all usage <= cap unpenalized; it does not enforce uniform usage.
+        Keep the reductions in fp32 and attached to Q/K's computation graph.
+        """
+        u12 = a12.float().mean(dim=1) * float(a12.shape[-1])
+        u21 = a21.float().mean(dim=1) * float(a21.shape[-1])
+        return 0.5 * (
+            torch.relu(u12 - self.usage_cap).square().mean()
+            + torch.relu(u21 - self.usage_cap).square().mean()
+        )
+
     def _cycle_loss(
         self,
         cond1: torch.Tensor,
@@ -144,6 +167,7 @@ class SemanticTokenMatcher(nn.Module):
         alpha: torch.Tensor,
         return_aux: bool = False,
         compute_cycle: bool = False,
+        compute_usage: bool = False,
     ):
         if cond1.ndim != 3 or cond2.ndim != 3:
             raise ValueError(
@@ -162,6 +186,7 @@ class SemanticTokenMatcher(nn.Module):
         if spatial1.shape[1] == 0 or spatial2.shape[1] == 0 or self.max_align == 0.0:
             aux = {
                 "cycle_loss": cond1.new_zeros(()),
+                "usage_loss": cond1.new_zeros(()),
                 "metrics": {
                     "semantic_align_lambda": cond1.new_zeros(()),
                     "semantic_entropy_12": cond1.new_zeros(()),
@@ -207,7 +232,8 @@ class SemanticTokenMatcher(nn.Module):
                 "semantic_usage_21_min": usage21_min.detach(),
             }
         cycle_loss = self._cycle_loss(spatial1, spatial2, a12, a21, alpha) if compute_cycle else cond1.new_zeros(())
-        return cond1_out, cond2_out, {"cycle_loss": cycle_loss, "metrics": metrics}
+        usage_loss = self._usage_loss(a12, a21) if compute_usage else cond1.new_zeros(())
+        return cond1_out, cond2_out, {"cycle_loss": cycle_loss, "usage_loss": usage_loss, "metrics": metrics}
 
 
 class SemanticTokenMatchingMixin:
@@ -226,6 +252,8 @@ class SemanticTokenMatchingMixin:
         semantic_cycle_detach_targets: bool = True,
         semantic_cycle_alpha_weight: bool = True,
         semantic_match_log_stats: bool = True,
+        semantic_usage_loss_weight: float = 0.0,
+        semantic_usage_cap: float = 4.0,
     ) -> None:
         if semantic_cycle_loss_weight < 0.0:
             raise ValueError(f"semantic_cycle_loss_weight must be >= 0, got {semantic_cycle_loss_weight}")
@@ -233,13 +261,23 @@ class SemanticTokenMatchingMixin:
             raise ValueError(f"semantic_cycle_loss_prob must be in [0, 1], got {semantic_cycle_loss_prob}")
         if semantic_cycle_loss_weight > 0.0 and not use_semantic_token_matching:
             raise ValueError("semantic_cycle_loss_weight > 0 requires use_semantic_token_matching=True")
+        if not math.isfinite(semantic_usage_loss_weight) or semantic_usage_loss_weight < 0.0:
+            raise ValueError("semantic_usage_loss_weight must be finite and >= 0")
+        if not math.isfinite(semantic_usage_cap) or semantic_usage_cap < 1.0:
+            raise ValueError("semantic_usage_cap must be finite and >= 1")
+        if semantic_usage_loss_weight > 0.0 and not use_semantic_token_matching:
+            raise ValueError("semantic_usage_loss_weight > 0 requires use_semantic_token_matching=True")
 
         self.use_semantic_token_matching = bool(use_semantic_token_matching)
         self.semantic_cycle_loss_weight = float(semantic_cycle_loss_weight)
         self.semantic_cycle_loss_prob = float(semantic_cycle_loss_prob)
         self.semantic_match_log_stats = bool(semantic_match_log_stats)
+        self.semantic_usage_loss_weight = float(semantic_usage_loss_weight)
+        self.semantic_usage_cap = float(semantic_usage_cap)
         self._semantic_match_record_aux = False
         self._semantic_match_cycle_terms = []
+        self._semantic_match_record_usage = False
+        self._semantic_match_usage_terms = []
         self._semantic_match_last_metrics: Dict[str, torch.Tensor] = {}
 
         if self.use_semantic_token_matching:
@@ -253,12 +291,19 @@ class SemanticTokenMatchingMixin:
                 style_tokens=semantic_match_style_tokens,
                 cycle_detach_targets=semantic_cycle_detach_targets,
                 cycle_alpha_weight=semantic_cycle_alpha_weight,
+                usage_cap=semantic_usage_cap,
             )
 
     def _begin_semantic_match_record(self, device: torch.device) -> None:
         self._semantic_match_cycle_terms = []
+        self._semantic_match_usage_terms = []
         self._semantic_match_last_metrics = {}
         self._semantic_match_record_aux = False
+        # Usage regularization is cheap and deterministic: apply on every loss
+        # forward, including validation, independently of cycle activation/alpha.
+        self._semantic_match_record_usage = bool(
+            self.use_semantic_token_matching and self.semantic_usage_loss_weight > 0.0
+        )
         if (
             self.training
             and getattr(self, "use_semantic_token_matching", False)
@@ -277,7 +322,7 @@ class SemanticTokenMatchingMixin:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not getattr(self, "use_semantic_token_matching", False):
             return cond1, cond2
-        return_aux = bool(self._semantic_match_record_aux or self.semantic_match_log_stats)
+        return_aux = bool(self._semantic_match_record_aux or self._semantic_match_record_usage or self.semantic_match_log_stats)
         if return_aux:
             cond1, cond2, aux = self.semantic_matcher(
                 cond1,
@@ -285,27 +330,35 @@ class SemanticTokenMatchingMixin:
                 alpha,
                 return_aux=True,
                 compute_cycle=self._semantic_match_record_aux,
+                compute_usage=self._semantic_match_record_usage,
             )
             self._semantic_match_last_metrics = aux["metrics"]
             if self._semantic_match_record_aux:
                 self._semantic_match_cycle_terms.append(aux["cycle_loss"])
+            if self._semantic_match_record_usage:
+                self._semantic_match_usage_terms.append(aux["usage_loss"])
             return cond1, cond2
         return self.semantic_matcher(cond1, cond2, alpha, return_aux=False)
 
     def _semantic_match_aux_loss(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        if not self._semantic_match_cycle_terms:
-            self._semantic_match_record_aux = False
-            return torch.zeros((), device=device, dtype=dtype)
-        raw = torch.stack([t.to(device=device, dtype=torch.float32) for t in self._semantic_match_cycle_terms]).mean()
-        weighted = raw * self.semantic_cycle_loss_weight
-        self._semantic_match_last_metrics = {
-            **self._semantic_match_last_metrics,
-            "semantic_cycle_loss": raw.detach(),
-            "semantic_cycle_loss_weighted": weighted.detach(),
-            "semantic_cycle_active": torch.ones((), device=device, dtype=torch.float32),
-        }
+        total = torch.zeros((), device=device, dtype=torch.float32)
+        for prefix, terms, weight in (
+            ("semantic_cycle", self._semantic_match_cycle_terms, self.semantic_cycle_loss_weight),
+            ("semantic_usage", self._semantic_match_usage_terms, self.semantic_usage_loss_weight),
+        ):
+            if not terms:
+                continue
+            raw = torch.stack([t.to(device=device, dtype=torch.float32) for t in terms]).mean()
+            weighted = raw * weight
+            total = total + weighted
+            self._semantic_match_last_metrics.update({
+                f"{prefix}_loss": raw.detach(),
+                f"{prefix}_loss_weighted": weighted.detach(),
+                f"{prefix}_active": torch.ones((), device=device, dtype=torch.float32),
+            })
         self._semantic_match_record_aux = False
-        return weighted.to(dtype=dtype)
+        self._semantic_match_record_usage = False
+        return total.to(dtype=dtype)
 
     def _semantic_match_metrics(self) -> Dict[str, torch.Tensor]:
         if not getattr(self, "use_semantic_token_matching", False):
