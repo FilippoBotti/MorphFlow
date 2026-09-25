@@ -373,14 +373,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         alpha,
         return_terms=False,
         apply_cfg_drop=True,
-        teacher_mid_weight=1.0,
     ):
-        if not 0.0 <= float(teacher_mid_weight) <= 1.0:
-            raise ValueError(
-                "teacher_mid_weight must be in [0, 1], got "
-                f"{teacher_mid_weight}"
-            )
-
         B = x_0.shape[0]
         x_0 = self._prepare_ss_latent(x_0)
         t = self.sample_t(B, x_0.device)
@@ -398,35 +391,13 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             alpha,
             apply_cfg_drop=apply_cfg_drop,
         )
-        per_item_mse = (
-            (pred.float() - velocity.float())
-            .pow(2)
-            .flatten(1)
-            .mean(dim=1)
-        )
-
-        a = alpha.float().reshape(-1)
-        profile = (4.0 * a * (1.0 - a)).clamp(0.0, 1.0)
-
-        teacher_weight = (
-            1.0
-            - (1.0 - float(teacher_mid_weight)) * profile
-        )
-
-        base_mse_raw = per_item_mse.mean()
-        base_loss = (teacher_weight * per_item_mse).mean()
-
-        semantic_aux = self._semantic_match_aux_loss(
-            x_0.device,
-            base_loss.dtype,
-        )
+        base_loss = F.mse_loss(pred, velocity)
+        semantic_aux = self._semantic_match_aux_loss(x_0.device, base_loss.dtype)
         loss = base_loss + semantic_aux
         self.last_forward_metrics = self._semantic_match_metrics()
         self.last_forward_metrics.update(
             {
-                "base_mse": base_mse_raw.detach(),
-                "teacher_loss_weighted": base_loss.detach(),
-                "teacher_weight_mean": teacher_weight.mean().detach(),
+                "base_mse": base_loss.detach(),
                 "flow_matching_loss": loss.detach(),
                 "semantic_aux_loss_weighted": semantic_aux.detach(),
                 "total_loss": loss.detach(),
@@ -519,7 +490,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         src_2_feats,
         src_2_coords,
         alpha,
-        teacher_mid_weight=1.0,
         endpoint_loss_weight=0.0,
         symmetry_loss_weight=0.0,
         endpoint_loss_prob=0.25,
@@ -544,7 +514,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             alpha,
             return_terms=True,
             apply_cfg_drop=not symmetry_active,
-            teacher_mid_weight=teacher_mid_weight,
         )
 
         endpoint_term = None

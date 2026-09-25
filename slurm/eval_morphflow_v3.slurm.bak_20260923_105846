@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_v3_ss_slat_cfg3_s50
+#SBATCH --job-name=eval_morphflow_v3
 #SBATCH --account=g_vbd
-#SBATCH --partition=gpu_guest
-#SBATCH --qos=gpu_guest
+#SBATCH --partition=gpu_vbd
+#SBATCH --qos=gpu_vbd
 #SBATCH --nodes=1
 #SBATCH --nodelist=wn46
 #SBATCH --gres=gpu:a100_vbd:1
@@ -38,16 +38,16 @@ SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:-}"
 
 METADATA="${METADATA:-metadata_test.json}"
 EVAL_TYPE="${EVAL_TYPE:-eval_test_latents}"
-RUN_NAME="${RUN_NAME:-eval_ss_loralr1e-4_slat_T0p05_cfg3_s50}"
+RUN_NAME="${RUN_NAME:-$(basename "$(dirname "$(dirname "$CHECKPOINT_PATH")")")}"
 
-NUM_SAMPLES="${NUM_SAMPLES:-50}"
+NUM_SAMPLES="${NUM_SAMPLES:-10}"
 SEED="${SEED:-42}"
-STEPS="${STEPS:-50}"
-SLAT_STEPS="${SLAT_STEPS:-50}"
+STEPS="${STEPS:-25}"
+SLAT_STEPS="${SLAT_STEPS:-25}"
 CFG_VALUES="${CFG_VALUES:-1.0}"
 SLAT_CFG_SCALE="${SLAT_CFG_SCALE:-1.0}"
 TRELLIS_MODEL="${TRELLIS_MODEL:-image_large}"
-MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
+MIXED_PRECISION="${MIXED_PRECISION:-auto}"
 SAVE_LATENTS="${SAVE_LATENTS:-0}"
 
 OUTPUT_DIR_HOST="${OUTPUT_DIR:-$PROJECT_DIR/outputs/$EVAL_TYPE/$RUN_NAME}"

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v3_ss_teacherSoft0p6_semStrong_T0p05_align0p35_hub0p01_lora5e-5
+#SBATCH --job-name=v3_slat_lora_cross_r32_tokenGate_semMatch_hub_w0p01_cap4_lr5e-5_noAlphaEmb
 #SBATCH --account=g_vbd
 #SBATCH --partition=gpu_vbd
 #SBATCH --qos=gpu_vbd
@@ -37,7 +37,7 @@ RUN_NAME="${RUN_NAME:-$SLURM_JOB_NAME}"
 # SLat: LoRA cross-attn + semantic matching + hubness regularization.
 # Cycle OFF; usage weight=0.01 cap=4; flow alpha embedder frozen/off.
 SEMANTIC_CYCLE_LOSS_WEIGHT="${SEMANTIC_CYCLE_LOSS_WEIGHT:-0.0}"
-SEMANTIC_CYCLE_LOSS_PROB="${SEMANTIC_CYCLE_LOSS_PROB:-0.0}"
+SEMANTIC_CYCLE_LOSS_PROB="${SEMANTIC_CYCLE_LOSS_PROB:-0.25}"
 SEMANTIC_USAGE_LOSS_WEIGHT="${SEMANTIC_USAGE_LOSS_WEIGHT:-0.01}"
 SEMANTIC_USAGE_CAP="${SEMANTIC_USAGE_CAP:-4.0}"
 RUN_DIR_HOST="$OUT_ROOT_HOST/$RUN_NAME"
@@ -149,13 +149,13 @@ accelerate launch \
   --run_name "$RUN_NAME" \
   --train_bs 2 \
   --val_bs 1 \
-  --train_epochs 25 \
-  --lr 1e-4 \
-  --cond_lr 1e-4 \
+  --train_epochs 60 \
+  --lr 5e-5 \
+  --cond_lr 5e-5 \
   --flow_lr 5e-5 \
   --lora_lr 5e-5 \
   --weight_decay 1e-4 \
-  --warmup_steps 10000 \
+  --warmup_steps 20000 \
   --plateau_factor 0.5 \
   --plateau_patience 5 \
   --grad_clip 1.0 \
@@ -176,8 +176,7 @@ accelerate launch \
   --cond_residual_blocks_16 2 \
   --cfg_drop_prob 0.2 \
   --trellis_model image_large \
-  --flow_target ss \
-  --teacher_mid_weight 0.60 \
+  --flow_target slat \
   --slat_condition_source slat \
   --source_images_root "$FLUX_ROOT_IN" \
   --dino_model dinov2_vitl14_reg \
@@ -198,8 +197,8 @@ accelerate launch \
   --endpoint_loss_prob 0.0 \
   --symmetry_loss_prob 0.0 \
   --use_semantic_token_matching 1 \
-  --semantic_match_max_align 0.35 \
-  --semantic_match_temperature 0.05 \
+  --semantic_match_max_align 0.25 \
+  --semantic_match_temperature 0.1 \
   --semantic_match_dim 128 \
   --semantic_match_alpha_weight 1 \
   --semantic_match_detach_scores 0 \

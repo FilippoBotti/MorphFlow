@@ -126,15 +126,6 @@ def build_parser():
 
     # Optional future losses.
     # They are passed to MorphFlow.forward only if it supports them.
-    parser.add_argument(
-        "--teacher_mid_weight",
-        type=float,
-        default=1.0,
-        help=(
-            "Teacher flow-matching weight at alpha=0.5. "
-            "Endpoints always keep weight 1.0."
-        ),
-    )
     parser.add_argument("--endpoint_loss_weight", type=float, default=0.0)
     parser.add_argument("--endpoint_loss_prob", type=float, default=0.25, help="Probability of adding an alpha=0/1 endpoint flow-matching batch when endpoint loss is enabled.")
     parser.add_argument("--symmetry_loss_weight", type=float, default=0.0)
@@ -404,15 +395,6 @@ def model_requires_source_ss_latents(model: torch.nn.Module) -> bool:
     return bool(getattr(unwrap_model_for_attr(model), "requires_source_ss_latents", False))
 
 
-def model_forward_supports_teacher_mid_weight(
-    model: torch.nn.Module,
-) -> bool:
-    signature = inspect.signature(
-        unwrap_model_for_attr(model).forward
-    )
-    return "teacher_mid_weight" in signature.parameters
-
-
 def model_forward_supports_source_ss_latents(model: torch.nn.Module) -> bool:
     signature = inspect.signature(unwrap_model_for_attr(model).forward)
     params = set(signature.parameters.keys())
@@ -452,8 +434,6 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
     keys = (
         ("total_loss", "tot"),
         ("base_mse", "base_mse"),
-        ("teacher_loss_weighted", "teacher_loss"),
-        ("teacher_weight_mean", "teacher_w"),
         ("flow_matching_loss", "fm"),
         ("semantic_aux_loss_weighted", "sem_aux"),
         ("semantic_cycle_loss_weighted", "sem_cyc"),
@@ -493,12 +473,10 @@ def compute_loss(
     device,
     flow_target: str,
     supports_extra_losses: bool,
-    supports_teacher_mid_weight: bool,
     supports_source_ss_latents: bool,
     supports_source_images: bool,
     supports_residual_endpoint_controls: bool,
     needs_source_ss_latents: bool,
-    teacher_mid_weight: float,
     endpoint_loss_weight: float,
     symmetry_loss_weight: float,
     endpoint_loss_prob: float,
@@ -618,10 +596,6 @@ def compute_loss(
             "symmetry_loss_prob": effective_symmetry_loss_prob,
             **source_kwargs,
         }
-
-        if supports_teacher_mid_weight:
-            kwargs["teacher_mid_weight"] = teacher_mid_weight
-
         if (
             supports_residual_endpoint_controls
             and residual_endpoint_loss_weight is not None
@@ -1136,12 +1110,6 @@ def train(args):
     if args.resume_from and args.init_from:
         raise ValueError("Use either --resume_from or --init_from, not both.")
 
-    if not 0.0 <= args.teacher_mid_weight <= 1.0:
-        raise ValueError(
-            "--teacher_mid_weight must be in [0, 1], got "
-            f"{args.teacher_mid_weight}"
-        )
-
     for name in ("endpoint_loss_prob", "symmetry_loss_prob"):
         value = getattr(args, name)
         if value < 0.0 or value > 1.0:
@@ -1291,9 +1259,6 @@ def train(args):
         )
 
     supports_extra_losses = model_forward_supports_extra_losses(model)
-    supports_teacher_mid_weight = (
-        model_forward_supports_teacher_mid_weight(model)
-    )
     supports_source_ss_latents = model_forward_supports_source_ss_latents(model)
     supports_source_images = model_forward_supports_source_images(model)
     supports_residual_endpoint_controls = model_forward_supports_residual_endpoint_controls(model)
@@ -1479,7 +1444,7 @@ def train(args):
     if args.use_lora == 1:
         lora_lr = args.lr if args.lora_lr is None else args.lora_lr
         accelerator.print(f"LoRA LR: {lora_lr}")
-        accelerator.print(f"Flow adapter LR: {flow_lr}")
+        accelerator.print("Flow LR: unused when --use_lora=1")
     else:
         accelerator.print(f"Flow LR: {flow_lr}")
     accelerator.print(f"LR scheduler: {args.lr_scheduler}")
@@ -1497,12 +1462,6 @@ def train(args):
     accelerator.print(f"Weight decay: {args.weight_decay}")
     accelerator.print(f"Grad clip: {args.grad_clip}")
     accelerator.print(f"Checkpoint every: {args.checkpoint_every}")
-    accelerator.print(
-        f"Teacher midpoint weight: {args.teacher_mid_weight}"
-    )
-    accelerator.print(
-        "Teacher endpoint weight: 1.0"
-    )
     accelerator.print(f"Endpoint loss weight: {args.endpoint_loss_weight}")
     accelerator.print(f"Endpoint loss probability: {args.endpoint_loss_prob}")
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
@@ -1564,12 +1523,10 @@ def train(args):
                     device=device,
                     flow_target=args.flow_target,
                     supports_extra_losses=supports_extra_losses,
-                    supports_teacher_mid_weight=supports_teacher_mid_weight,
                     supports_source_ss_latents=supports_source_ss_latents,
                     supports_source_images=supports_source_images,
                     supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                     needs_source_ss_latents=requires_source_ss_latents,
-                    teacher_mid_weight=args.teacher_mid_weight,
                     endpoint_loss_weight=args.endpoint_loss_weight,
                     symmetry_loss_weight=args.symmetry_loss_weight,
                     endpoint_loss_prob=args.endpoint_loss_prob,
@@ -1656,12 +1613,10 @@ def train(args):
                             device=device,
                             flow_target=args.flow_target,
                             supports_extra_losses=supports_extra_losses,
-                            supports_teacher_mid_weight=supports_teacher_mid_weight,
                             supports_source_ss_latents=supports_source_ss_latents,
                             supports_source_images=supports_source_images,
                             supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                             needs_source_ss_latents=requires_source_ss_latents,
-                            teacher_mid_weight=args.teacher_mid_weight,
                             endpoint_loss_weight=args.endpoint_loss_weight if use_best_extra_losses else 0.0,
                             symmetry_loss_weight=args.symmetry_loss_weight if use_best_extra_losses else 0.0,
                             endpoint_loss_prob=args.endpoint_loss_prob if use_best_extra_losses else 0.0,
