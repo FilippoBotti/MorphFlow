@@ -22,6 +22,11 @@ from models.morph_flow import MorphFlow
 from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
 from modules.training_metrics import collect_reduced_forward_metrics
+from modules.trellis_prior_training import (
+    add_trellis_prior_args,
+    trellis_prior_forward_kwargs,
+    validate_trellis_prior_args,
+)
 
 
 def build_parser():
@@ -169,6 +174,7 @@ def build_parser():
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--val_examples", type=int, default=0)
 
+    add_trellis_prior_args(parser)
     return parser
 
 
@@ -455,6 +461,11 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         ("teacher_loss_weighted", "teacher_loss"),
         ("teacher_weight_mean", "teacher_w"),
         ("flow_matching_loss", "fm"),
+        ("trellis_prior_active", "prior_on"),
+        ("trellis_prior_weight", "prior_w"),
+        ("trellis_prior_loss_weighted", "prior_surrogate"),
+        ("trellis_prior_residual_rms", "prior_residual"),
+        ("trellis_prior_sample_rms", "prior_sample_rms"),
         ("semantic_aux_loss_weighted", "sem_aux"),
         ("semantic_cycle_loss_weighted", "sem_cyc"),
         ("semantic_usage_loss", "hub_raw"),
@@ -507,7 +518,10 @@ def compute_loss(
     residual_endpoint_loss_weight: Optional[float] = None,
     residual_endpoint_loss_prob: Optional[float] = None,
     force_configured_extra_losses_active: bool = False,
+    trellis_prior_kwargs: Optional[Dict[str, Any]] = None,
 ):
+    if trellis_prior_kwargs and flow_target != "ss":
+        raise ValueError("TRELLIS SS prior supervision requires flow_target='ss'")
     src1_feats = batch["src1_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
     src1_coords = batch["src1_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
 
@@ -589,7 +603,7 @@ def compute_loss(
                 residual_endpoint_loss_prob,
             )
 
-    source_kwargs = {}
+    source_kwargs = dict(trellis_prior_kwargs or {})
     if supports_source_ss_latents and (
         needs_source_ss_latents
         or (
@@ -1114,6 +1128,7 @@ def save_checkpoint(
 
 
 def train(args):
+    validate_trellis_prior_args(args)
     args.resume_from = resolve_existing_path(args.resume_from)
     args.init_from = resolve_existing_path(args.init_from)
     args.source_images_root = resolve_existing_dir(args.source_images_root)
@@ -1338,6 +1353,26 @@ def train(args):
             model, optimizer, loader, scheduler
         )
 
+    # A separate immutable supervisor, never part of the student's DDP module,
+    # optimizer or checkpoints. Load original weights even when resuming a student.
+    trellis_prior = None
+    if args.trellis_prior_weight > 0:
+        from models.trellis_ss_prior import TrellisSSPrior
+
+        prior_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}[mixed_precision]
+        if device.type != "cuda":
+            prior_dtype = torch.float32
+        with accelerator.main_process_first():
+            accelerator.print("Loading frozen original TRELLIS SS prior (native zero image conditioning)...")
+            trellis_prior = TrellisSSPrior.from_pretrained(
+                device=device,
+                dtype=prior_dtype,
+                sigma_min=accelerator.unwrap_model(model).sigma_min,
+                t_min=args.trellis_prior_t_min,
+                t_max=args.trellis_prior_t_max,
+                grad_clip=args.trellis_prior_grad_clip,
+            )
+
     if args.flow_target == "slat" and args.slat_condition_source == "dino":
         dino_owner = accelerator.unwrap_model(model)
         if accelerator.is_main_process:
@@ -1412,6 +1447,16 @@ def train(args):
     accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
     accelerator.print(f"Flow target: {args.flow_target}")
+    if trellis_prior is not None:
+        accelerator.print(
+            f"TRELLIS RFDS: weight={args.trellis_prior_weight}, every={args.trellis_prior_every} updates, "
+            f"warmup={args.trellis_prior_warmup_steps}, rollout={args.trellis_prior_rollout_steps}, "
+            f"grad_steps={args.trellis_prior_grad_steps} (0=all), max_items={args.trellis_prior_max_items}, "
+            f"checkpoint={bool(args.trellis_prior_checkpoint)}, "
+            f"tau=[{args.trellis_prior_t_min}, {args.trellis_prior_t_max}], "
+            f"residual_rms_clip={args.trellis_prior_grad_clip}"
+        )
+        accelerator.print("RFDS runs only in training. Best checkpoint remains selected by the existing validation loss.")
     if args.flow_target == "slat":
         accelerator.print(f"SLat condition source: {args.slat_condition_source}")
         if args.slat_condition_source == "dino":
@@ -1578,6 +1623,7 @@ def train(args):
                     residual_endpoint_loss_weight=args.residual_endpoint_weight,
                     residual_endpoint_loss_prob=args.residual_endpoint_prob,
                     force_configured_extra_losses_active=False,
+                    trellis_prior_kwargs=trellis_prior_forward_kwargs(args, trellis_prior, global_step),
                 )
 
             accelerator.backward(loss)
@@ -1605,6 +1651,8 @@ def train(args):
                     writer.add_scalar(f"train/{group.get('name', 'group')}_lr", group["lr"], global_step)
                 for metric_name, metric_value in forward_metrics.items():
                     writer.add_scalar(f"train/slat_{metric_name}", metric_value, global_step)
+                    if metric_name.startswith("trellis_prior_"):
+                        writer.add_scalar(f"train/{metric_name}", metric_value, global_step)
 
             if accelerator.is_local_main_process:
                 postfix = {

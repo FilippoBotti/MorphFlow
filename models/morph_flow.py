@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn as nn
 import torch.nn.functional as F
@@ -5,6 +7,8 @@ import torch.nn.functional as F
 from models import sparse_structure_flow
 from models import cond_encoder
 from models.semantic_token_matching import SemanticTokenMatchingMixin
+from models.trellis_ss_prior import TRELLIS_PRIOR_METRIC_NAMES
+from modules.flow_rollout import differentiable_ss_rollout, rollout_evaluation_mode
 
 
 TRELLIS_SLAT_MEAN = (
@@ -363,6 +367,69 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             return x_0.squeeze(1)
         return x_0
 
+    def sample_ss_for_prior(
+        self,
+        target_shape,
+        src_1_feats,
+        src_1_coords,
+        src_2_feats,
+        src_2_coords,
+        alpha,
+        *,
+        steps=8,
+        grad_steps=2,
+        max_items=1,
+        use_checkpoint=True,
+    ):
+        """Sample from independent Gaussian noise inside the training forward.
+
+        ``target_shape`` supplies only batch/latent dimensions and device; none
+        of its values enter sampling. The sparse prefix keeps batch IDs valid.
+        Conditioning is encoded once with gradients and without CFG dropout or
+        semantic auxiliary recording, preserving the ordinary FM diagnostics.
+        """
+        if int(max_items) != max_items or max_items < 0:
+            raise ValueError("trellis_prior_max_items must be an integer >= 0 (0 means full batch)")
+        count = target_shape.shape[0] if max_items == 0 else min(target_shape.shape[0], int(max_items))
+        src1_mask = src_1_coords[:, 0] < count
+        src2_mask = src_2_coords[:, 0] < count
+        alpha = alpha[:count]
+        # The main FM pass owns these records. Rollout conditioning must not
+        # append auxiliary losses or overwrite the last semantic statistics.
+        semantic_flags = {
+            name: getattr(self, name)
+            for name in (
+                "_semantic_match_record_aux",
+                "_semantic_match_record_usage",
+                "semantic_match_log_stats",
+            )
+        }
+        try:
+            for name in semantic_flags:
+                setattr(self, name, False)
+            with rollout_evaluation_mode(self):
+                condition = self._build_condition(
+                    src_1_feats[src1_mask],
+                    src_2_feats[src2_mask],
+                    src_1_coords[src1_mask],
+                    src_2_coords[src2_mask],
+                    alpha,
+                    apply_cfg_drop=False,
+                )
+        finally:
+            for name, value in semantic_flags.items():
+                setattr(self, name, value)
+        noise = torch.randn_like(target_shape[:count], dtype=torch.float32)
+        return differentiable_ss_rollout(
+            self.sparse_structure_flow,
+            noise,
+            condition,
+            alpha,
+            steps=steps,
+            grad_steps=grad_steps,
+            use_checkpoint=use_checkpoint,
+        )
+
     def flow_matching_loss(
         self,
         x_0,
@@ -526,7 +593,17 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         symmetry_loss_prob=1.0,
         src1_ss_latent=None,
         src2_ss_latent=None,
+        trellis_prior=None,
+        trellis_prior_weight=0.0,
+        trellis_prior_rollout_steps=8,
+        trellis_prior_grad_steps=2,
+        trellis_prior_max_items=1,
+        trellis_prior_checkpoint=True,
     ):
+        if not math.isfinite(float(trellis_prior_weight)) or trellis_prior_weight < 0.0:
+            raise ValueError("trellis_prior_weight must be finite and >= 0")
+        if trellis_prior_weight > 0.0 and trellis_prior is None:
+            raise ValueError("positive trellis_prior_weight requires a frozen TRELLIS prior")
         endpoint_active = (
             endpoint_loss_weight > 0.0
             and src1_ss_latent is not None
@@ -573,6 +650,39 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             )
             loss = loss + symmetry_loss_weight * symmetry_term
 
+        # The frozen teacher is a forward argument, never registered as part
+        # of the student, its optimizer, DDP module tree, or checkpoint.
+        prior_term = None
+        prior_sample = None
+        zero_metric = loss.detach().new_zeros(())
+        prior_metrics = {name: zero_metric for name in TRELLIS_PRIOR_METRIC_NAMES}
+        if trellis_prior_weight > 0.0:
+            prior_sample = self.sample_ss_for_prior(
+                self._prepare_ss_latent(x_0),
+                src_1_feats,
+                src_1_coords,
+                src_2_feats,
+                src_2_coords,
+                alpha,
+                steps=trellis_prior_rollout_steps,
+                grad_steps=trellis_prior_grad_steps,
+                max_items=trellis_prior_max_items,
+                use_checkpoint=trellis_prior_checkpoint,
+            )
+            prior_term, measured_prior_metrics = trellis_prior(prior_sample)
+            prior_metrics.update({name: value.detach() for name, value in measured_prior_metrics.items()})
+            loss = loss + trellis_prior_weight * prior_term
+
+        self.last_forward_metrics.update(prior_metrics)
+        self.last_forward_metrics.update(
+            {
+                "trellis_prior_active": loss.detach().new_tensor(float(prior_term is not None)),
+                "trellis_prior_weight": loss.detach().new_tensor(float(trellis_prior_weight)),
+                "trellis_prior_loss_weighted": (trellis_prior_weight * prior_term).detach() if prior_term is not None else zero_metric,
+                "trellis_prior_sample_rms": prior_sample.detach().float().square().mean().sqrt() if prior_sample is not None else zero_metric,
+            }
+        )
+
         zero_metric = loss.detach().new_zeros(())
         self.last_forward_metrics.update(
             {
@@ -588,5 +698,6 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         self.last_loss_terms = {
             "endpoint_active": endpoint_term is not None,
             "symmetry_active": symmetry_term is not None,
+            "trellis_prior_active": prior_term is not None,
         }
         return loss

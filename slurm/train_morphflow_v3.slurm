@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v3_ss_teacherSoft0p6_semStrong_T0p05_align0p35_hub0p01_lora5e-5
+#SBATCH --job-name=v3_ss_trellisPrior_teacherSoft0p6_semStrong_T0p05_align0p35_hub0p01
 #SBATCH --account=g_vbd
 #SBATCH --partition=gpu_vbd
 #SBATCH --qos=gpu_vbd
@@ -34,12 +34,25 @@ OUT_ROOT_HOST="$ARCHIVE_HOST/morphflow_runs"
 OUT_ROOT_IN="/archive/morphflow_runs"
 
 RUN_NAME="${RUN_NAME:-$SLURM_JOB_NAME}"
-# SLat: LoRA cross-attn + semantic matching + hubness regularization.
+# SS: LoRA cross-attn + semantic matching + hubness regularization.
 # Cycle OFF; usage weight=0.01 cap=4; flow alpha embedder frozen/off.
 SEMANTIC_CYCLE_LOSS_WEIGHT="${SEMANTIC_CYCLE_LOSS_WEIGHT:-0.0}"
 SEMANTIC_CYCLE_LOSS_PROB="${SEMANTIC_CYCLE_LOSS_PROB:-0.0}"
 SEMANTIC_USAGE_LOSS_WEIGHT="${SEMANTIC_USAGE_LOSS_WEIGHT:-0.01}"
 SEMANTIC_USAGE_CAP="${SEMANTIC_USAGE_CAP:-4.0}"
+# Frozen native TRELLIS SS prior on differentiable student rollouts.
+# Weight ramps linearly over optimizer steps; cadence counts training microbatches.
+# TRELLIS_PRIOR_WEIGHT=0 disables the extra model and rollout (baseline ablation).
+TRELLIS_PRIOR_WEIGHT="${TRELLIS_PRIOR_WEIGHT:-0.01}"
+TRELLIS_PRIOR_EVERY="${TRELLIS_PRIOR_EVERY:-4}"
+TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-1000}"
+TRELLIS_PRIOR_ROLLOUT_STEPS="${TRELLIS_PRIOR_ROLLOUT_STEPS:-8}"
+TRELLIS_PRIOR_GRAD_STEPS="${TRELLIS_PRIOR_GRAD_STEPS:-2}"
+TRELLIS_PRIOR_MAX_ITEMS="${TRELLIS_PRIOR_MAX_ITEMS:-1}"
+TRELLIS_PRIOR_CHECKPOINT="${TRELLIS_PRIOR_CHECKPOINT:-1}"
+TRELLIS_PRIOR_T_MIN="${TRELLIS_PRIOR_T_MIN:-0.05}"
+TRELLIS_PRIOR_T_MAX="${TRELLIS_PRIOR_T_MAX:-0.95}"
+TRELLIS_PRIOR_GRAD_CLIP="${TRELLIS_PRIOR_GRAD_CLIP:-0.0}"
 RUN_DIR_HOST="$OUT_ROOT_HOST/$RUN_NAME"
 LOG_DIR_HOST="$RUN_DIR_HOST/logs"
 
@@ -93,6 +106,9 @@ echo "RESUME_FROM=$RESUME_FROM"
 echo "SEMANTIC_CYCLE_LOSS_WEIGHT=$SEMANTIC_CYCLE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_LOSS_WEIGHT=$SEMANTIC_USAGE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_CAP=$SEMANTIC_USAGE_CAP"
+echo "TRELLIS_PRIOR_WEIGHT=$TRELLIS_PRIOR_WEIGHT EVERY=$TRELLIS_PRIOR_EVERY WARMUP_STEPS=$TRELLIS_PRIOR_WARMUP_STEPS"
+echo "TRELLIS_PRIOR_ROLLOUT_STEPS=$TRELLIS_PRIOR_ROLLOUT_STEPS GRAD_STEPS=$TRELLIS_PRIOR_GRAD_STEPS MAX_ITEMS=$TRELLIS_PRIOR_MAX_ITEMS CHECKPOINT=$TRELLIS_PRIOR_CHECKPOINT"
+echo "TRELLIS_PRIOR_T_RANGE=$TRELLIS_PRIOR_T_MIN,$TRELLIS_PRIOR_T_MAX GRAD_CLIP=$TRELLIS_PRIOR_GRAD_CLIP"
 
 export SINGULARITYENV_PROJECT_DIR="$PROJECT_DIR"
 export SINGULARITYENV_DATA_ROOT_IN="$DATA_ROOT_IN"
@@ -104,6 +120,17 @@ export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_WEIGHT="$SEMANTIC_CYCLE_LOSS_WEIGHT"
 export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_PROB="$SEMANTIC_CYCLE_LOSS_PROB"
 export SINGULARITYENV_SEMANTIC_USAGE_LOSS_WEIGHT="$SEMANTIC_USAGE_LOSS_WEIGHT"
 export SINGULARITYENV_SEMANTIC_USAGE_CAP="$SEMANTIC_USAGE_CAP"
+export SINGULARITYENV_TRELLIS_PRIOR_WEIGHT="$TRELLIS_PRIOR_WEIGHT"
+export SINGULARITYENV_TRELLIS_PRIOR_EVERY="$TRELLIS_PRIOR_EVERY"
+export SINGULARITYENV_TRELLIS_PRIOR_WARMUP_STEPS="$TRELLIS_PRIOR_WARMUP_STEPS"
+export SINGULARITYENV_TRELLIS_PRIOR_ROLLOUT_STEPS="$TRELLIS_PRIOR_ROLLOUT_STEPS"
+export SINGULARITYENV_TRELLIS_PRIOR_GRAD_STEPS="$TRELLIS_PRIOR_GRAD_STEPS"
+export SINGULARITYENV_TRELLIS_PRIOR_MAX_ITEMS="$TRELLIS_PRIOR_MAX_ITEMS"
+export SINGULARITYENV_TRELLIS_PRIOR_CHECKPOINT="$TRELLIS_PRIOR_CHECKPOINT"
+export SINGULARITYENV_TRELLIS_PRIOR_T_MIN="$TRELLIS_PRIOR_T_MIN"
+export SINGULARITYENV_TRELLIS_PRIOR_T_MAX="$TRELLIS_PRIOR_T_MAX"
+export SINGULARITYENV_TRELLIS_PRIOR_GRAD_CLIP="$TRELLIS_PRIOR_GRAD_CLIP"
+export SINGULARITYENV_HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 
 singularity exec --cleanenv --nv \
   --bind "$TRELLIS_BASE:/opt/trellis" \
@@ -134,6 +161,27 @@ cd "$PROJECT_DIR"
 python --version
 python -c 'import torch; print("torch=", torch.__version__, "cuda=", torch.version.cuda, "avail=", torch.cuda.is_available(), "bf16=", torch.cuda.is_bf16_supported())'
 nvidia-smi -L || true
+
+# Warm/check the shared cache once before launching the eight GPU processes.
+# The native prior assets are required on resumed runs as well.
+python - "$TRELLIS_PRIOR_WEIGHT" <<'PY'
+import math
+import os
+import sys
+
+weight = float(sys.argv[1])
+if not math.isfinite(weight) or weight < 0:
+    raise SystemExit("TRELLIS_PRIOR_WEIGHT must be finite and >= 0.")
+if weight > 0:
+    from huggingface_hub import hf_hub_download
+    for suffix in ("json", "safetensors"):
+        path = hf_hub_download(
+            repo_id="microsoft/TRELLIS-image-large",
+            filename=f"ckpts/ss_flow_img_dit_L_16l8_fp16.{suffix}",
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0").upper() in {"1", "ON", "YES", "TRUE"},
+        )
+        print(f"TRELLIS prior cache: {path}")
+PY
 
 accelerate launch \
   --multi-gpu \
@@ -178,6 +226,16 @@ accelerate launch \
   --trellis_model image_large \
   --flow_target ss \
   --teacher_mid_weight 0.60 \
+  --trellis_prior_weight "$TRELLIS_PRIOR_WEIGHT" \
+  --trellis_prior_every "$TRELLIS_PRIOR_EVERY" \
+  --trellis_prior_warmup_steps "$TRELLIS_PRIOR_WARMUP_STEPS" \
+  --trellis_prior_rollout_steps "$TRELLIS_PRIOR_ROLLOUT_STEPS" \
+  --trellis_prior_grad_steps "$TRELLIS_PRIOR_GRAD_STEPS" \
+  --trellis_prior_max_items "$TRELLIS_PRIOR_MAX_ITEMS" \
+  --trellis_prior_checkpoint "$TRELLIS_PRIOR_CHECKPOINT" \
+  --trellis_prior_t_min "$TRELLIS_PRIOR_T_MIN" \
+  --trellis_prior_t_max "$TRELLIS_PRIOR_T_MAX" \
+  --trellis_prior_grad_clip "$TRELLIS_PRIOR_GRAD_CLIP" \
   --slat_condition_source slat \
   --source_images_root "$FLUX_ROOT_IN" \
   --dino_model dinov2_vitl14_reg \

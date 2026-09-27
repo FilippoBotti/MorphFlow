@@ -39,7 +39,19 @@ source "$MF_ENV_FILE"
 export MF_PROJECT_DIR="${MF_PROJECT_DIR:-$MORPHFLOW_REPO}"
 export MF_DATA_ROOT="${MF_DATA_ROOT:-$FAST/$USER/datasets/morphing_dataset_v3}"
 export MF_OUT_ROOT="${MF_OUT_ROOT:-$WORK/$USER/outputs}"
-RUN_NAME="${RUN_NAME:-v3_slat_lora_cross_r32_tokenGate_semMatch_loralr1e-4_leonardo}"
+FLOW_TARGET="${FLOW_TARGET:-slat}"
+case "$FLOW_TARGET" in
+    ss)
+        DEFAULT_RUN_NAME=v3_ss_trellis_prior_leonardo
+        DEFAULT_TRELLIS_PRIOR_WEIGHT=0.01
+        ;;
+    slat)
+        DEFAULT_RUN_NAME=v3_slat_lora_cross_r32_tokenGate_semMatch_loralr1e-4_leonardo
+        DEFAULT_TRELLIS_PRIOR_WEIGHT=0.0
+        ;;
+    *) die "FLOW_TARGET deve essere ss o slat." ;;
+esac
+RUN_NAME="${RUN_NAME:-$DEFAULT_RUN_NAME}"
 [[ "$RUN_NAME" != */* && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die "RUN_NAME deve essere un nome, non un percorso."
 RUN_DIR="$MF_OUT_ROOT/$RUN_NAME"
 AUTO_RESUME="${AUTO_RESUME:-0}"
@@ -51,6 +63,17 @@ RESUME_FROM="${RESUME_FROM:-}"
 TRAIN_BS="${TRAIN_BS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-60}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+# Il prior e' disponibile solo per SS; SLat conserva il training precedente.
+TRELLIS_PRIOR_WEIGHT="${TRELLIS_PRIOR_WEIGHT:-$DEFAULT_TRELLIS_PRIOR_WEIGHT}"
+TRELLIS_PRIOR_EVERY="${TRELLIS_PRIOR_EVERY:-4}"
+TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-1000}"
+TRELLIS_PRIOR_ROLLOUT_STEPS="${TRELLIS_PRIOR_ROLLOUT_STEPS:-8}"
+TRELLIS_PRIOR_GRAD_STEPS="${TRELLIS_PRIOR_GRAD_STEPS:-2}"
+TRELLIS_PRIOR_MAX_ITEMS="${TRELLIS_PRIOR_MAX_ITEMS:-1}"
+TRELLIS_PRIOR_CHECKPOINT="${TRELLIS_PRIOR_CHECKPOINT:-1}"
+TRELLIS_PRIOR_T_MIN="${TRELLIS_PRIOR_T_MIN:-0.05}"
+TRELLIS_PRIOR_T_MAX="${TRELLIS_PRIOR_T_MAX:-0.95}"
+TRELLIS_PRIOR_GRAD_CLIP="${TRELLIS_PRIOR_GRAD_CLIP:-0.0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
@@ -94,29 +117,44 @@ PY
         die "La run contiene checkpoint: usare AUTO_RESUME=1, RESUME_FROM oppure un nuovo RUN_NAME."
     fi
 
-    # --prepare scarica SOLO i pesi SLat image_large necessari, una volta dal login.
-    # Negli altri modi la cache viene controllata senza accessi a Internet.
-    if [[ -z "$RESUME_FROM" ]]; then
-        if [[ "$MODE" == --prepare ]]; then
-            export HF_HUB_OFFLINE=0
-        fi
-        python - "$MODE" <<'PY'
+    # --prepare popola la cache dal login; gli altri modi restano offline.
+    # Il prior nativo va ricaricato anche quando lo student riparte da checkpoint.
+    if [[ "$MODE" == --prepare ]]; then
+        export HF_HUB_OFFLINE=0
+    fi
+    python - "$MODE" "$FLOW_TARGET" "$TRELLIS_PRIOR_WEIGHT" "$RESUME_FROM" <<'PY'
+import math
 import sys
 from huggingface_hub import hf_hub_download
-try:
-    path = hf_hub_download(
-        repo_id="microsoft/TRELLIS-image-large",
-        filename="ckpts/slat_flow_img_dit_L_64l8p2_fp16.safetensors",
-        local_files_only=sys.argv[1] != "--prepare",
-    )
-except Exception as exc:
-    raise SystemExit(
-        f"Pesi TRELLIS non disponibili: {exc}\n"
-        "Dal login node: bash slurm/train_morphflow_v3_leonardo.sbatch --prepare"
-    ) from exc
-print(f"TRELLIS weights: {path}")
+mode, flow_target, weight, resume = sys.argv[1:]
+weight = float(weight)
+if not math.isfinite(weight) or weight < 0:
+    raise SystemExit("TRELLIS_PRIOR_WEIGHT deve essere finito e >= 0.")
+if weight > 0 and flow_target != "ss":
+    raise SystemExit("Il prior TRELLIS richiede FLOW_TARGET=ss.")
+filenames = set()
+ss_weights = "ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors"
+if not resume:
+    filenames.add(ss_weights if flow_target == "ss" else
+                  "ckpts/slat_flow_img_dit_L_64l8p2_fp16.safetensors")
+if weight > 0:
+    filenames.add(ss_weights)
+    filenames.add("ckpts/ss_flow_img_dit_L_16l8_fp16.json")
+for filename in sorted(filenames):
+    try:
+        path = hf_hub_download(
+            repo_id="microsoft/TRELLIS-image-large",
+            filename=filename,
+            local_files_only=mode != "--prepare",
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Pesi TRELLIS non disponibili: {exc}\n"
+            f"Dal login node: FLOW_TARGET={flow_target} TRELLIS_PRIOR_WEIGHT={weight} "
+            "bash slurm/train_morphflow_v3_leonardo.sbatch --prepare"
+        ) from exc
+    print(f"TRELLIS weights: {path}")
 PY
-    fi
 fi
 
 export HF_HUB_OFFLINE=1
@@ -157,7 +195,17 @@ train_args=(
     --cond_residual_blocks_16 2
     --cfg_drop_prob 0.2
     --trellis_model image_large
-    --flow_target slat
+    --flow_target "$FLOW_TARGET"
+    --trellis_prior_weight "$TRELLIS_PRIOR_WEIGHT"
+    --trellis_prior_every "$TRELLIS_PRIOR_EVERY"
+    --trellis_prior_warmup_steps "$TRELLIS_PRIOR_WARMUP_STEPS"
+    --trellis_prior_rollout_steps "$TRELLIS_PRIOR_ROLLOUT_STEPS"
+    --trellis_prior_grad_steps "$TRELLIS_PRIOR_GRAD_STEPS"
+    --trellis_prior_max_items "$TRELLIS_PRIOR_MAX_ITEMS"
+    --trellis_prior_checkpoint "$TRELLIS_PRIOR_CHECKPOINT"
+    --trellis_prior_t_min "$TRELLIS_PRIOR_T_MIN"
+    --trellis_prior_t_max "$TRELLIS_PRIOR_T_MAX"
+    --trellis_prior_grad_clip "$TRELLIS_PRIOR_GRAD_CLIP"
     --slat_condition_source slat
     --dino_model dinov2_vitl14_reg
     --dino_dim 1024
@@ -216,7 +264,9 @@ if [[ "$MODE" == --prepare || "$MODE" == --check ]]; then
 import sys
 import torch
 from train import build_parser
+from modules.trellis_prior_training import validate_trellis_prior_args
 args = build_parser().parse_args(sys.argv[1:])
+validate_trellis_prior_args(args)
 print(f"Python: {sys.executable}; torch: {torch.__version__}; CUDA build: {torch.version.cuda}")
 print(f"Dataset: {args.root_dir}")
 print(f"Output: {args.out_dir}/{args.run_name}")
@@ -249,6 +299,7 @@ echo "JOB=$SLURM_JOB_ID MODE=$MODE NODES=$SLURM_JOB_NODELIST"
 echo "GPUs=$MF_NUM_PROCESSES (${MF_NODE_COUNT} x ${MF_GPUS_PER_NODE}) MASTER=$MASTER_ADDR:$MASTER_PORT"
 echo "DATASET=$MF_DATA_ROOT RUN_DIR=$RUN_DIR"
 echo "AUTO_RESUME=$AUTO_RESUME RESUME_FROM=${RESUME_FROM:-<none>}"
+echo "FLOW_TARGET=$FLOW_TARGET TRELLIS_PRIOR_WEIGHT=$TRELLIS_PRIOR_WEIGHT EVERY=$TRELLIS_PRIOR_EVERY WARMUP_STEPS=$TRELLIS_PRIOR_WARMUP_STEPS"
 echo "TRAIN_BS/GPU=$TRAIN_BS GLOBAL_BATCH=$((TRAIN_BS * MF_NUM_PROCESSES))"
 printf 'Training command:'; printf ' %q' "${train_args[@]}"; printf '\n'
 
