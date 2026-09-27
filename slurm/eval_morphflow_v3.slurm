@@ -5,8 +5,8 @@
 #SBATCH --qos=gpu_guest
 #SBATCH --nodes=1
 #SBATCH --nodelist=wn46
-#SBATCH --gres=gpu:a100_vbd:1
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:rtx6000_vbd:1
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=96G
 #SBATCH --time=04:00:00
 #SBATCH --output=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/final_dataset/eval-%x-%j.out
