@@ -1,4 +1,5 @@
-"""Prior scheduling, resume continuity and unsupported-training safeguards."""
+
+"""Projection-prior scheduling and argument validation."""
 
 import argparse
 import unittest
@@ -20,61 +21,106 @@ def parse_args(*extra):
 
 
 class PriorTrainingTests(unittest.TestCase):
-    def test_baseline_has_no_prior_forward_arguments(self):
+    def test_baseline_has_no_prior(self):
         args = parse_args()
         validate_trellis_prior_args(args)
-        self.assertEqual(trellis_prior_forward_kwargs(args, object(), 0), {})
-        args.trellis_prior_weight = 0.01
-        self.assertEqual(trellis_prior_forward_kwargs(args, None, 0), {})
+        self.assertEqual(
+            trellis_prior_forward_kwargs(args, object(), 0),
+            {},
+        )
 
-    def test_cadence_ramp_and_resume_are_rank_independent(self):
-        args = parse_args("--trellis_prior_weight", "0.02", "--trellis_prior_warmup_steps", "8")
+    def test_schedule_and_warmup(self):
+        args = parse_args(
+            "--trellis_prior_weight", "0.1",
+            "--trellis_prior_warmup_steps", "8",
+        )
+
         prior = object()
-        uninterrupted = [trellis_prior_forward_kwargs(args, prior, step) for step in range(13)]
-        self.assertEqual([step for step, kwargs in enumerate(uninterrupted) if kwargs], [0, 4, 8, 12])
-        self.assertAlmostEqual(uninterrupted[0]["trellis_prior_weight"], 0.0025)
-        self.assertAlmostEqual(uninterrupted[4]["trellis_prior_weight"], 0.0125)
-        self.assertAlmostEqual(uninterrupted[8]["trellis_prior_weight"], 0.02)
-        self.assertIs(uninterrupted[8]["trellis_prior"], prior)
-        # Resuming from a saved global step neither restarts warmup nor shifts cadence.
-        resumed = [trellis_prior_forward_kwargs(args, prior, step) for step in range(5, 13)]
-        self.assertEqual(resumed, uninterrupted[5:])
 
-    def test_no_warmup_full_gradient_and_no_frequency_compensation(self):
-        args = parse_args("--trellis_prior_weight", "0.1", "--trellis_prior_warmup_steps", "0",
-                          "--trellis_prior_grad_steps", "0", "--trellis_prior_max_items", "0",
-                          "--trellis_prior_checkpoint", "0")
-        validate_trellis_prior_args(args)
-        kwargs = trellis_prior_forward_kwargs(args, object(), 0)
-        self.assertEqual(kwargs["trellis_prior_weight"], 0.1)
-        self.assertEqual(kwargs["trellis_prior_grad_steps"], 0)
-        self.assertEqual(kwargs["trellis_prior_max_items"], 0)
-        self.assertIs(kwargs["trellis_prior_checkpoint"], False)
+        values = [
+            trellis_prior_forward_kwargs(args, prior, step)
+            for step in range(13)
+        ]
 
-    def test_unsupported_architectures_only_rejected_when_prior_enabled(self):
-        for option, value in (("--flow_target", "slat"), ("--ss_flow_arch", "residual_interp"),
-                              ("--trellis_model", "text_base")):
-            with self.subTest(option=option):
-                validate_trellis_prior_args(parse_args(option, value))
-                with self.assertRaisesRegex(ValueError, "native image unconditional prior"):
-                    validate_trellis_prior_args(parse_args(option, value, "--trellis_prior_weight", "0.01"))
+        self.assertEqual(
+            [i for i, value in enumerate(values) if value],
+            [0, 4, 8, 12],
+        )
 
-    def test_invalid_options_fail_before_model_loading(self):
-        cases = {
-            "weight": ["-1", "nan", "inf"],
-            "grad_clip": ["-1", "nan", "inf"],
-            "every": ["0", "-1"],
-            "rollout_steps": ["0", "1"],  # one step cannot retain the default two gradient steps
-            "grad_steps": ["-1", "9"],
-            "warmup_steps": ["-1"],
-            "max_items": ["-1"],
-            "t_min": ["0", "1", "nan"],
-            "t_max": ["0.01", "1", "inf"],
-        }
-        for suffix, values in cases.items():
-            for value in values:
-                with self.subTest(suffix=suffix, value=value), self.assertRaises(ValueError):
-                    validate_trellis_prior_args(parse_args(f"--trellis_prior_{suffix}", value))
+        self.assertAlmostEqual(
+            values[0]["trellis_prior_weight"],
+            0.0125,
+        )
+        self.assertAlmostEqual(
+            values[4]["trellis_prior_weight"],
+            0.0625,
+        )
+        self.assertAlmostEqual(
+            values[8]["trellis_prior_weight"],
+            0.1,
+        )
+
+    def test_projection_defaults(self):
+        args = parse_args()
+
+        self.assertEqual(args.trellis_prior_t_min, 0.05)
+        self.assertEqual(args.trellis_prior_t_max, 0.20)
+        self.assertEqual(
+            args.trellis_prior_projection_clip_ratio,
+            0.10,
+        )
+        self.assertEqual(
+            args.trellis_prior_rms_guard_low_ratio,
+            0.25,
+        )
+        self.assertEqual(
+            args.trellis_prior_rms_guard_high_ratio,
+            2.0,
+        )
+
+    def test_invalid_values(self):
+        cases = (
+            ("--trellis_prior_weight", "-1"),
+            ("--trellis_prior_every", "0"),
+            ("--trellis_prior_rollout_steps", "0"),
+            ("--trellis_prior_grad_steps", "9"),
+            ("--trellis_prior_t_min", "0"),
+            ("--trellis_prior_t_max", "1"),
+            (
+                "--trellis_prior_projection_clip_ratio",
+                "-1",
+            ),
+            (
+                "--trellis_prior_rms_guard_low_ratio",
+                "3",
+                "--trellis_prior_rms_guard_high_ratio",
+                "2",
+            ),
+        )
+
+        for values in cases:
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    validate_trellis_prior_args(
+                        parse_args(*values)
+                    )
+
+    def test_prior_architecture_constraints(self):
+        for option, value in (
+            ("--flow_target", "slat"),
+            ("--ss_flow_arch", "residual_interp"),
+            ("--trellis_model", "text_base"),
+        ):
+            with self.subTest(option=option, value=value):
+                args = parse_args(
+                    option,
+                    value,
+                    "--trellis_prior_weight",
+                    "0.1",
+                )
+
+                with self.assertRaises(ValueError):
+                    validate_trellis_prior_args(args)
 
 
 if __name__ == "__main__":

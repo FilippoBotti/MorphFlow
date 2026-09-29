@@ -464,13 +464,36 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         ("trellis_prior_active", "prior_on"),
         ("trellis_prior_weight", "prior_w"),
         ("trellis_prior_loss_weighted", "prior_surrogate"),
-        ("trellis_prior_residual_rms", "prior_residual"),
-        ("trellis_prior_gradient_rms", "prior_grad_rms"),
+        ("trellis_prior_projection_loss", "prior_proj"),
+        ("trellis_prior_projection_delta_rms", "prior_delta"),
+        (
+            "trellis_prior_projection_delta_clipped_rms",
+            "prior_delta_clip",
+        ),
+        (
+            "trellis_prior_projection_clip_fraction",
+            "prior_clip_frac",
+        ),
+        (
+            "trellis_prior_projection_x0_rms",
+            "prior_x0_rms",
+        ),
         ("trellis_prior_velocity_rms", "prior_vel_rms"),
-        ("trellis_prior_reference_velocity_rms", "prior_ref_rms"),
-        ("trellis_prior_velocity_reference_cosine", "prior_cos"),
-        ("trellis_prior_residual_to_reference_ratio", "prior_rel"),
         ("trellis_prior_t_mean", "prior_t"),
+        ("trellis_prior_guard_loss", "prior_guard"),
+        ("trellis_prior_guard_fraction", "prior_guard_frac"),
+        ("trellis_prior_guard_low", "prior_guard_low"),
+        ("trellis_prior_guard_high", "prior_guard_high"),
+        ("trellis_prior_endpoint_rms", "prior_endpoint_rms"),
+        (
+            "trellis_prior_sample_endpoint_rms_ratio",
+            "prior_z_ep_ratio",
+        ),
+        (
+            "trellis_prior_delta_endpoint_rms_ratio",
+            "prior_delta_ep_ratio",
+        ),
+        ("trellis_prior_src1_fraction", "prior_src1"),
         ("trellis_prior_sample_rms", "prior_sample_rms"),
         ("trellis_prior_sample_mean", "prior_sample_mean"),
         ("trellis_prior_sample_std", "prior_sample_std"),
@@ -644,8 +667,33 @@ def compute_loss(
             )
 
     source_kwargs = dict(trellis_prior_kwargs or {})
+
+    if trellis_prior_kwargs:
+        src1_image = get_optional_tensor(
+            batch,
+            "src1_image",
+            device,
+            dtype=torch.float32,
+        )
+        src2_image = get_optional_tensor(
+            batch,
+            "src2_image",
+            device,
+            dtype=torch.float32,
+        )
+
+        if src1_image is None or src2_image is None:
+            raise KeyError(
+                "TRELLIS projection prior is active but endpoint "
+                "images are missing from the batch"
+            )
+
+        source_kwargs["trellis_prior_src1_image"] = src1_image
+        source_kwargs["trellis_prior_src2_image"] = src2_image
+
     if supports_source_ss_latents and (
         needs_source_ss_latents
+        or bool(trellis_prior_kwargs)
         or (
             supports_extra_losses
             and use_extra_losses
@@ -1236,6 +1284,12 @@ def train(args):
     if args.slat_condition_source == "dino" and not args.source_images_root:
         raise ValueError("--slat_condition_source dino requires --source_images_root.")
 
+    if args.trellis_prior_weight > 0 and not args.source_images_root:
+        raise ValueError(
+            "--trellis_prior_weight > 0 requires --source_images_root "
+            "for endpoint-conditioned TRELLIS supervision."
+        )
+
     if args.resume_from and not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from checkpoint not found inside container: {args.resume_from}")
 
@@ -1273,7 +1327,13 @@ def train(args):
         split="train",
         verbose=accelerator.is_main_process,
         exclude_assets=excluded_assets,
-        load_source_images=args.flow_target == "slat" and args.slat_condition_source == "dino",
+        load_source_images=(
+            args.trellis_prior_weight > 0
+            or (
+                args.flow_target == "slat"
+                and args.slat_condition_source == "dino"
+            )
+        ),
         source_images_root=args.source_images_root,
         source_image_filename=args.source_image_filename,
         augment_source_swap=args.augment_source_swap == 1,
@@ -1403,14 +1463,30 @@ def train(args):
         if device.type != "cuda":
             prior_dtype = torch.float32
         with accelerator.main_process_first():
-            accelerator.print("Loading frozen original TRELLIS SS prior (native zero image conditioning)...")
+            accelerator.print(
+                "Loading frozen endpoint-conditioned TRELLIS "
+                "SS projection prior..."
+            )
+
             trellis_prior = TrellisSSPrior.from_pretrained(
                 device=device,
                 dtype=prior_dtype,
+                dino_model=args.dino_model,
                 sigma_min=accelerator.unwrap_model(model).sigma_min,
                 t_min=args.trellis_prior_t_min,
                 t_max=args.trellis_prior_t_max,
-                grad_clip=args.trellis_prior_grad_clip,
+                projection_clip_ratio=(
+                    args.trellis_prior_projection_clip_ratio
+                ),
+                rms_guard_weight=(
+                    args.trellis_prior_rms_guard_weight
+                ),
+                rms_guard_low_ratio=(
+                    args.trellis_prior_rms_guard_low_ratio
+                ),
+                rms_guard_high_ratio=(
+                    args.trellis_prior_rms_guard_high_ratio
+                ),
             )
 
     if args.flow_target == "slat" and args.slat_condition_source == "dino":
@@ -1489,14 +1565,32 @@ def train(args):
     accelerator.print(f"Flow target: {args.flow_target}")
     if trellis_prior is not None:
         accelerator.print(
-            f"TRELLIS RFDS: weight={args.trellis_prior_weight}, every={args.trellis_prior_every} updates, "
-            f"warmup={args.trellis_prior_warmup_steps}, rollout={args.trellis_prior_rollout_steps}, "
-            f"grad_steps={args.trellis_prior_grad_steps} (0=all), max_items={args.trellis_prior_max_items}, "
+            "TRELLIS projection prior: "
+            f"weight={args.trellis_prior_weight}, "
+            f"every={args.trellis_prior_every} updates, "
+            f"warmup={args.trellis_prior_warmup_steps}, "
+            f"rollout={args.trellis_prior_rollout_steps}, "
+            f"grad_steps={args.trellis_prior_grad_steps} (0=all), "
+            f"max_items={args.trellis_prior_max_items}, "
             f"checkpoint={bool(args.trellis_prior_checkpoint)}, "
             f"tau=[{args.trellis_prior_t_min}, {args.trellis_prior_t_max}], "
-            f"residual_rms_clip={args.trellis_prior_grad_clip}"
+            f"projection_clip_ratio={args.trellis_prior_projection_clip_ratio}, "
+            f"rms_guard_weight={args.trellis_prior_rms_guard_weight}, "
+            f"rms_guard_range=["
+            f"{args.trellis_prior_rms_guard_low_ratio}, "
+            f"{args.trellis_prior_rms_guard_high_ratio}]"
         )
-        accelerator.print("RFDS runs only in training. Best checkpoint remains selected by the existing validation loss.")
+        accelerator.print(
+            "TRELLIS conditioning: real endpoint image; "
+            "P(src1)=alpha, P(src2)=1-alpha; CFG disabled."
+        )
+        accelerator.print(
+            f"Prior source images root: {args.source_images_root}"
+        )
+        accelerator.print(
+            "Projection prior runs only during training. "
+            "Best checkpoint still uses the ordinary validation objective."
+        )
     if args.flow_target == "slat":
         accelerator.print(f"SLat condition source: {args.slat_condition_source}")
         if args.slat_condition_source == "dino":
@@ -1723,12 +1817,20 @@ def train(args):
                         f"step={global_step} "
                         f"w={forward_metrics.get('trellis_prior_weight', 0.0):.6g} "
                         f"loss_w={forward_metrics.get('trellis_prior_loss_weighted', 0.0):.6g} "
-                        f"res_rms={forward_metrics.get('trellis_prior_residual_rms', 0.0):.6g} "
-                        f"prior_grad_rms={forward_metrics.get('trellis_prior_gradient_rms', 0.0):.6g} "
+                        f"proj={forward_metrics.get('trellis_prior_projection_loss', 0.0):.6g} "
+                        f"delta={forward_metrics.get('trellis_prior_projection_delta_rms', 0.0):.6g} "
+                        f"delta_clip={forward_metrics.get('trellis_prior_projection_delta_clipped_rms', 0.0):.6g} "
+                        f"clip_frac={forward_metrics.get('trellis_prior_projection_clip_fraction', 0.0):.3f} "
+                        f"proj_x0_rms={forward_metrics.get('trellis_prior_projection_x0_rms', 0.0):.6g} "
                         f"vel_rms={forward_metrics.get('trellis_prior_velocity_rms', 0.0):.6g} "
-                        f"ref_rms={forward_metrics.get('trellis_prior_reference_velocity_rms', 0.0):.6g} "
-                        f"vel_ref_cos={forward_metrics.get('trellis_prior_velocity_reference_cosine', 0.0):.6g} "
-                        f"res_ref_ratio={forward_metrics.get('trellis_prior_residual_to_reference_ratio', 0.0):.6g} "
+                        f"guard={forward_metrics.get('trellis_prior_guard_loss', 0.0):.6g} "
+                        f"guard_frac={forward_metrics.get('trellis_prior_guard_fraction', 0.0):.3f} "
+                        f"guard_low={forward_metrics.get('trellis_prior_guard_low', 0.0):.6g} "
+                        f"guard_high={forward_metrics.get('trellis_prior_guard_high', 0.0):.6g} "
+                        f"endpoint_rms={forward_metrics.get('trellis_prior_endpoint_rms', 0.0):.6g} "
+                        f"z_ep_ratio={forward_metrics.get('trellis_prior_sample_endpoint_rms_ratio', 0.0):.4f} "
+                        f"delta_ep_ratio={forward_metrics.get('trellis_prior_delta_endpoint_rms_ratio', 0.0):.4f} "
+                        f"src1_frac={forward_metrics.get('trellis_prior_src1_fraction', 0.0):.3f} "
                         f"tau={forward_metrics.get('trellis_prior_t_mean', 0.0):.4f} "
                         f"z_mean={forward_metrics.get('trellis_prior_sample_mean', 0.0):.6g} "
                         f"z_std={forward_metrics.get('trellis_prior_sample_std', 0.0):.6g} "

@@ -74,7 +74,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         semantic_usage_cap=4.0,
     ):
         super().__init__()
-        
+
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
         self.cond_resample_tokens = int(cond_resample_tokens)
@@ -144,7 +144,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             cond_dim=128,
             alpha_dim=64,
             hidden_dim=512,
-            out_dim=model_channels, 
+            out_dim=model_channels,
         )
         if self.cond_token_norm in ("layernorm", "adaln_alpha"):
             self.cond_token_layer_norm = nn.LayerNorm(128)
@@ -191,18 +191,18 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             resolution=16,
             in_channels=8,
             out_channels=8,
-            model_channels=model_channels, 
-            cond_channels=model_channels, 
-            num_blocks=num_blocks,    
-            num_heads=num_heads,  
+            model_channels=model_channels,
+            cond_channels=model_channels,
+            num_blocks=num_blocks,
+            num_heads=num_heads,
             mlp_ratio=4,
             patch_size=1,
             pe_mode="ape",
             qk_rms_norm=True,
             use_fp16=False,
             use_checkpoint=use_checkpoint,
-            separate_cond=separate_cond,       
-            separate_cond_gate=separate_cond_gate, 
+            separate_cond=separate_cond,
+            separate_cond_gate=separate_cond_gate,
         )
         self.sigma_min = sigma_min
 
@@ -291,7 +291,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
 
     def get_v(self, x_0, noise):
         return (1 - self.sigma_min) * noise - x_0
-    
+
     def diffuse(self, x_0, t):
         noise = torch.randn_like(x_0)
 
@@ -305,7 +305,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             return torch.rand(batch_size, device=device, dtype=torch.float32)
         noise = torch.randn(batch_size, device=device, dtype=torch.float32)
         return torch.sigmoid(noise * self.t_logit_std + self.t_logit_mean)
-    
+
     def forward_flow(
         self,
         x_t,
@@ -599,6 +599,8 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         trellis_prior_grad_steps=2,
         trellis_prior_max_items=1,
         trellis_prior_checkpoint=True,
+        trellis_prior_src1_image=None,
+        trellis_prior_src2_image=None,
     ):
         if not math.isfinite(float(trellis_prior_weight)) or trellis_prior_weight < 0.0:
             raise ValueError("trellis_prior_weight must be finite and >= 0")
@@ -669,9 +671,51 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
                 max_items=trellis_prior_max_items,
                 use_checkpoint=trellis_prior_checkpoint,
             )
-            prior_term, measured_prior_metrics = trellis_prior(prior_sample)
-            prior_metrics.update({name: value.detach() for name, value in measured_prior_metrics.items()})
-            loss = loss + trellis_prior_weight * prior_term
+            if (
+                trellis_prior_src1_image is None
+                or trellis_prior_src2_image is None
+            ):
+                raise ValueError(
+                    "Endpoint-conditioned TRELLIS prior requires "
+                    "src1/src2 images"
+                )
+
+            if (
+                src1_ss_latent is None
+                or src2_ss_latent is None
+            ):
+                raise ValueError(
+                    "Endpoint-conditioned TRELLIS prior requires "
+                    "src1/src2 SS latents"
+                )
+
+            prior_count = prior_sample.shape[0]
+
+            prior_term, measured_prior_metrics = trellis_prior(
+                prior_sample,
+                src1_image=trellis_prior_src1_image[:prior_count],
+                src2_image=trellis_prior_src2_image[:prior_count],
+                alpha=alpha[:prior_count],
+                src1_ss_latent=self._prepare_ss_latent(
+                    src1_ss_latent
+                )[:prior_count],
+                src2_ss_latent=self._prepare_ss_latent(
+                    src2_ss_latent
+                )[:prior_count],
+            )
+
+            prior_metrics.update(
+                {
+                    name: value.detach()
+                    for name, value
+                    in measured_prior_metrics.items()
+                }
+            )
+
+            loss = (
+                loss
+                + trellis_prior_weight * prior_term
+            )
 
         self.last_forward_metrics.update(prior_metrics)
         self.last_forward_metrics.update(
