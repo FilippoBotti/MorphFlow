@@ -27,9 +27,6 @@ TRELLIS_PRIOR_METRIC_NAMES = (
     "trellis_prior_gradient_rms",
     "trellis_prior_t_mean",
     "trellis_prior_velocity_rms",
-    "trellis_prior_reference_velocity_rms",
-    "trellis_prior_velocity_reference_cosine",
-    "trellis_prior_residual_to_reference_ratio",
 )
 
 
@@ -203,8 +200,7 @@ Neither the prior, the noising operation, nor the residual is differentiated.
             velocity = self.flow(x_t, tau * 1000.0, native_null).float()
             if velocity.shape != z.shape:
                 raise ValueError("The TRELLIS prior velocity shape must match z")
-            reference_velocity = (1 - self.sigma_min) * noise - detached_z
-            residual = velocity - reference_velocity
+            residual = velocity - ((1 - self.sigma_min) * noise - detached_z)
             if not torch.isfinite(residual).all():
                 raise FloatingPointError("Non-finite TRELLIS RFDS residual; inspect student samples and prior precision")
             residual_rms = residual.square().mean().sqrt()
@@ -218,26 +214,11 @@ Neither the prior, the noising operation, nor the residual is differentiated.
         # The detached target supplies exactly the RFDS gradient, including its
         # sign, without a prior Jacobian or a (1-t) chain-rule factor.
         loss = 0.5 * F.mse_loss(z.float(), target, reduction="mean")
-        reference_rms = reference_velocity.square().mean().sqrt()
-        velocity_rms = velocity.square().mean().sqrt()
-
-        velocity_reference_cosine = F.cosine_similarity(
-            velocity.flatten(1),
-            reference_velocity.flatten(1),
-            dim=1,
-            eps=1e-8,
-        ).mean()
-
         metrics = {
             "trellis_prior_loss": loss.detach(),
             "trellis_prior_residual_rms": residual_rms,
             "trellis_prior_gradient_rms": gradient.square().mean().sqrt(),
             "trellis_prior_t_mean": tau.mean(),
-            "trellis_prior_velocity_rms": velocity_rms,
-            "trellis_prior_reference_velocity_rms": reference_rms,
-            "trellis_prior_velocity_reference_cosine": velocity_reference_cosine,
-            "trellis_prior_residual_to_reference_ratio": (
-                residual_rms / reference_rms.clamp_min(1e-8)
-            ),
+            "trellis_prior_velocity_rms": velocity.square().mean().sqrt(),
         }
         return loss, metrics
