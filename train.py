@@ -465,7 +465,19 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         ("trellis_prior_weight", "prior_w"),
         ("trellis_prior_loss_weighted", "prior_surrogate"),
         ("trellis_prior_residual_rms", "prior_residual"),
+        ("trellis_prior_gradient_rms", "prior_grad_rms"),
+        ("trellis_prior_velocity_rms", "prior_vel_rms"),
+        ("trellis_prior_reference_velocity_rms", "prior_ref_rms"),
+        ("trellis_prior_velocity_reference_cosine", "prior_cos"),
+        ("trellis_prior_residual_to_reference_ratio", "prior_rel"),
+        ("trellis_prior_t_mean", "prior_t"),
         ("trellis_prior_sample_rms", "prior_sample_rms"),
+        ("trellis_prior_sample_mean", "prior_sample_mean"),
+        ("trellis_prior_sample_std", "prior_sample_std"),
+        ("trellis_prior_sample_min", "prior_sample_min"),
+        ("trellis_prior_sample_max", "prior_sample_max"),
+        ("grad_norm_preclip", "grad_pre"),
+        ("grad_norm_postclip", "grad_post"),
         ("semantic_aux_loss_weighted", "sem_aux"),
         ("semantic_cycle_loss_weighted", "sem_cyc"),
         ("semantic_usage_loss", "hub_raw"),
@@ -496,6 +508,34 @@ def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
         if key in metrics
     ]
     return " " + " ".join(parts) if parts else ""
+
+
+def optimizer_grad_norms(optimizer):
+    """Return total L2 grad norm and per-optimizer-group grad norms."""
+    total_sq = 0.0
+    group_norms = {}
+
+    for group_idx, group in enumerate(optimizer.param_groups):
+        group_sq = 0.0
+
+        for param in group["params"]:
+            grad = param.grad
+            if grad is None:
+                continue
+
+            grad = grad.detach()
+
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+
+            value = float(grad.float().norm(2).item())
+            group_sq += value * value
+            total_sq += value * value
+
+        name = str(group.get("name", f"group_{group_idx}"))
+        group_norms[name] = group_sq ** 0.5
+
+    return total_sq ** 0.5, group_norms
 
 
 def compute_loss(
@@ -1585,6 +1625,11 @@ def train(args):
 
     model.train()
 
+    # Independent counter so prior diagnostics do not alias with log_every.
+    # With prior_every=4 and log_every=20 the normal console lines otherwise
+    # systematically land on prior_off updates.
+    prior_debug_counter = 0
+
     for epoch in range(start_epoch, args.train_epochs + 1):
         running_loss = 0.0
 
@@ -1628,8 +1673,16 @@ def train(args):
 
             accelerator.backward(loss)
 
+            grad_norm_preclip, group_grad_norms_preclip = optimizer_grad_norms(
+                optimizer
+            )
+
             if args.grad_clip and args.grad_clip > 0.0:
                 accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            grad_norm_postclip, group_grad_norms_postclip = optimizer_grad_norms(
+                optimizer
+            )
 
             optimizer.step()
             if scheduler is not None and args.lr_scheduler == "cosine":
@@ -1640,15 +1693,88 @@ def train(args):
             loss_value = float(reduced_loss.item())
             forward_metrics = collect_reduced_forward_metrics(accelerator, model)
 
+            forward_metrics["grad_norm_preclip"] = grad_norm_preclip
+            forward_metrics["grad_norm_postclip"] = grad_norm_postclip
+
             running_loss += loss_value
             global_step += 1
             avg_loss = running_loss / batch_idx
+
+            prior_active = (
+                forward_metrics.get("trellis_prior_active", 0.0) > 0.5
+            )
+
+            if prior_active:
+                prior_debug_counter += 1
+
+                # Print first active application, then every log_every PRIOR
+                # applications, independently from ordinary batch logging.
+                if (
+                    prior_debug_counter == 1
+                    or prior_debug_counter % max(1, args.log_every) == 0
+                ):
+                    group_pre = " ".join(
+                        f"{name}={value:.4f}"
+                        for name, value in group_grad_norms_preclip.items()
+                    )
+
+                    accelerator.print(
+                        "[PRIOR] "
+                        f"step={global_step} "
+                        f"w={forward_metrics.get('trellis_prior_weight', 0.0):.6g} "
+                        f"loss_w={forward_metrics.get('trellis_prior_loss_weighted', 0.0):.6g} "
+                        f"res_rms={forward_metrics.get('trellis_prior_residual_rms', 0.0):.6g} "
+                        f"prior_grad_rms={forward_metrics.get('trellis_prior_gradient_rms', 0.0):.6g} "
+                        f"vel_rms={forward_metrics.get('trellis_prior_velocity_rms', 0.0):.6g} "
+                        f"ref_rms={forward_metrics.get('trellis_prior_reference_velocity_rms', 0.0):.6g} "
+                        f"vel_ref_cos={forward_metrics.get('trellis_prior_velocity_reference_cosine', 0.0):.6g} "
+                        f"res_ref_ratio={forward_metrics.get('trellis_prior_residual_to_reference_ratio', 0.0):.6g} "
+                        f"tau={forward_metrics.get('trellis_prior_t_mean', 0.0):.4f} "
+                        f"z_mean={forward_metrics.get('trellis_prior_sample_mean', 0.0):.6g} "
+                        f"z_std={forward_metrics.get('trellis_prior_sample_std', 0.0):.6g} "
+                        f"z_rms={forward_metrics.get('trellis_prior_sample_rms', 0.0):.6g} "
+                        f"z_min={forward_metrics.get('trellis_prior_sample_min', 0.0):.6g} "
+                        f"z_max={forward_metrics.get('trellis_prior_sample_max', 0.0):.6g} "
+                        f"grad_pre={grad_norm_preclip:.6g} "
+                        f"grad_post={grad_norm_postclip:.6g} "
+                        f"groups_pre=[{group_pre}]"
+                    )
 
             if writer is not None:
                 writer.add_scalar("train/loss_step", loss_value, global_step)
                 writer.add_scalar("train/loss_avg_epoch_running", avg_loss, global_step)
                 for group in optimizer.param_groups:
-                    writer.add_scalar(f"train/{group.get('name', 'group')}_lr", group["lr"], global_step)
+                    writer.add_scalar(
+                        f"train/{group.get('name', 'group')}_lr",
+                        group["lr"],
+                        global_step,
+                    )
+
+                writer.add_scalar(
+                    "train/grad_norm/preclip_total",
+                    grad_norm_preclip,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/grad_norm/postclip_total",
+                    grad_norm_postclip,
+                    global_step,
+                )
+
+                for name, value in group_grad_norms_preclip.items():
+                    writer.add_scalar(
+                        f"train/grad_norm/preclip_{name}",
+                        value,
+                        global_step,
+                    )
+
+                for name, value in group_grad_norms_postclip.items():
+                    writer.add_scalar(
+                        f"train/grad_norm/postclip_{name}",
+                        value,
+                        global_step,
+                    )
+
                 for metric_name, metric_value in forward_metrics.items():
                     writer.add_scalar(f"train/slat_{metric_name}", metric_value, global_step)
                     if metric_name.startswith("trellis_prior_"):

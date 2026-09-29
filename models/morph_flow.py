@@ -679,7 +679,26 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
                 "trellis_prior_active": loss.detach().new_tensor(float(prior_term is not None)),
                 "trellis_prior_weight": loss.detach().new_tensor(float(trellis_prior_weight)),
                 "trellis_prior_loss_weighted": (trellis_prior_weight * prior_term).detach() if prior_term is not None else zero_metric,
-                "trellis_prior_sample_rms": prior_sample.detach().float().square().mean().sqrt() if prior_sample is not None else zero_metric,
+                "trellis_prior_sample_rms": (
+                    prior_sample.detach().float().square().mean().sqrt()
+                    if prior_sample is not None else zero_metric
+                ),
+                "trellis_prior_sample_mean": (
+                    prior_sample.detach().float().mean()
+                    if prior_sample is not None else zero_metric
+                ),
+                "trellis_prior_sample_std": (
+                    prior_sample.detach().float().std(unbiased=False)
+                    if prior_sample is not None else zero_metric
+                ),
+                "trellis_prior_sample_min": (
+                    prior_sample.detach().float().min()
+                    if prior_sample is not None else zero_metric
+                ),
+                "trellis_prior_sample_max": (
+                    prior_sample.detach().float().max()
+                    if prior_sample is not None else zero_metric
+                ),
             }
         )
 

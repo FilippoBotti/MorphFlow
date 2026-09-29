@@ -840,8 +840,67 @@ def main():
             row["latent_mse"] = float(F.mse_loss(pred_ss.float(), target_ss.float()).item())
             row["latent_l1"] = float(F.l1_loss(pred_ss.float(), target_ss.float()).item())
 
-            target_logits = ss_logits(ss_decoder, target_ss, device, args.mixed_precision)
-            pred_logits = ss_logits(ss_decoder, pred_ss, device, args.mixed_precision)
+            target_logits = ss_logits(
+                ss_decoder, target_ss, device, args.mixed_precision
+            )
+            pred_logits = ss_logits(
+                ss_decoder, pred_ss, device, args.mixed_precision
+            )
+
+            pred_ss_f = pred_ss.detach().float()
+            target_ss_f = target_ss.detach().float()
+
+            row["pred_ss_mean"] = float(pred_ss_f.mean().item())
+            row["pred_ss_std"] = float(pred_ss_f.std(unbiased=False).item())
+            row["pred_ss_rms"] = float(
+                pred_ss_f.square().mean().sqrt().item()
+            )
+            row["pred_ss_min"] = float(pred_ss_f.min().item())
+            row["pred_ss_max"] = float(pred_ss_f.max().item())
+
+            row["target_ss_mean"] = float(target_ss_f.mean().item())
+            row["target_ss_std"] = float(
+                target_ss_f.std(unbiased=False).item()
+            )
+            row["target_ss_rms"] = float(
+                target_ss_f.square().mean().sqrt().item()
+            )
+            row["target_ss_min"] = float(target_ss_f.min().item())
+            row["target_ss_max"] = float(target_ss_f.max().item())
+
+            pred_logits_f = pred_logits.detach().float()
+            target_logits_f = target_logits.detach().float()
+
+            row["pred_logit_min"] = float(pred_logits_f.min().item())
+            row["pred_logit_mean"] = float(pred_logits_f.mean().item())
+            row["pred_logit_std"] = float(
+                pred_logits_f.std(unbiased=False).item()
+            )
+            row["pred_logit_max"] = float(pred_logits_f.max().item())
+
+            row["target_logit_min"] = float(target_logits_f.min().item())
+            row["target_logit_mean"] = float(target_logits_f.mean().item())
+            row["target_logit_std"] = float(
+                target_logits_f.std(unbiased=False).item()
+            )
+            row["target_logit_max"] = float(target_logits_f.max().item())
+
+            pred_occ = pred_logits_f > 0
+            target_occ = target_logits_f > 0
+
+            row["pred_occupancy_ratio"] = float(
+                pred_occ.float().mean().item()
+            )
+            row["target_occupancy_ratio"] = float(
+                target_occ.float().mean().item()
+            )
+
+            pred_occupied = int(pred_occ.sum().item())
+            pred_total = int(pred_occ.numel())
+
+            row["pred_empty"] = int(pred_occupied == 0)
+            row["pred_full"] = int(pred_occupied == pred_total)
+
             row["voxel_iou"] = voxel_iou(pred_logits, target_logits)
             row["target_voxel"] = save_voxel_glb(
                 ss_decoder,
@@ -975,6 +1034,17 @@ def main():
         "latent_l1",
         "voxel_iou",
         "pred_ss_points",
+        "pred_ss_mean",
+        "pred_ss_std",
+        "pred_ss_rms",
+        "pred_logit_min",
+        "pred_logit_mean",
+        "pred_logit_std",
+        "pred_logit_max",
+        "pred_occupancy_ratio",
+        "target_occupancy_ratio",
+        "pred_empty",
+        "pred_full",
         "pred_final_points",
         "slat_feat_mse",
         "slat_feat_l1",
