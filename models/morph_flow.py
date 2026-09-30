@@ -601,6 +601,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         trellis_prior_checkpoint=True,
         trellis_prior_src1_image=None,
         trellis_prior_src2_image=None,
+        trellis_prior_return_loss_terms=False,
     ):
         if not math.isfinite(float(trellis_prior_weight)) or trellis_prior_weight < 0.0:
             raise ValueError("trellis_prior_weight must be finite and >= 0")
@@ -654,6 +655,8 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
 
         # The frozen teacher is a forward argument, never registered as part
         # of the student, its optimizer, DDP module tree, or checkpoint.
+        prior_base_loss = loss
+        prior_live_terms = None
         prior_term = None
         prior_sample = None
         zero_metric = loss.detach().new_zeros(())
@@ -691,18 +694,11 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
 
             prior_count = prior_sample.shape[0]
 
-            prior_term, measured_prior_metrics = trellis_prior(
-                prior_sample,
-                src1_image=trellis_prior_src1_image[:prior_count],
-                src2_image=trellis_prior_src2_image[:prior_count],
-                alpha=alpha[:prior_count],
-                src1_ss_latent=self._prepare_ss_latent(
-                    src1_ss_latent
-                )[:prior_count],
-                src2_ss_latent=self._prepare_ss_latent(
-                    src2_ss_latent
-                )[:prior_count],
-            )
+            prior_result = trellis_prior(prior_sample, src1_image=trellis_prior_src1_image[:prior_count], src2_image=trellis_prior_src2_image[:prior_count], alpha=alpha[:prior_count], src1_ss_latent=self._prepare_ss_latent(src1_ss_latent)[:prior_count], src2_ss_latent=self._prepare_ss_latent(src2_ss_latent)[:prior_count], return_loss_terms=trellis_prior_return_loss_terms)
+            if trellis_prior_return_loss_terms:
+                prior_term, measured_prior_metrics, prior_live_terms = prior_result
+            else:
+                prior_term, measured_prior_metrics = prior_result
 
             prior_metrics.update(
                 {
@@ -763,4 +759,12 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             "symmetry_active": symmetry_term is not None,
             "trellis_prior_active": prior_term is not None,
         }
+        if trellis_prior_return_loss_terms:
+            if prior_live_terms is None:
+                raise RuntimeError("Split loss requested without an active prior")
+            return {
+                "fm": prior_base_loss,
+                "projection": prior_live_terms["projection"],
+                "guard": prior_live_terms["guard"],
+            }
         return loss

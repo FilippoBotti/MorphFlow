@@ -1,4 +1,12 @@
 import argparse
+from contextlib import nullcontext
+import time
+from modules.prior_gradient_balance import (
+    BalanceConfig, PriorGradientBalancer, add_balance_args,
+    validate_balance_args, validate_balance_runtime, balanced_prior_kwargs,
+    concise_metric_summary, prior_console, write_step_metrics,
+    append_prior_json, parse_phase_eval_steps, optimizer_grad_norms_batched,
+)
 import fnmatch
 import inspect
 import json
@@ -175,6 +183,7 @@ def build_parser():
     parser.add_argument("--val_examples", type=int, default=0)
 
     add_trellis_prior_args(parser)
+    add_balance_args(parser)
     return parser
 
 
@@ -452,113 +461,13 @@ def get_optional_tensor(batch: Dict[str, Any], key: str, device, dtype=torch.flo
     return value.to(device=device, dtype=dtype, non_blocking=True)
 
 
-def format_slat_metric_summary(metrics: Dict[str, float]) -> str:
-    if not metrics:
-        return ""
-    keys = (
-        ("total_loss", "tot"),
-        ("base_mse", "base_mse"),
-        ("teacher_loss_weighted", "teacher_loss"),
-        ("teacher_weight_mean", "teacher_w"),
-        ("flow_matching_loss", "fm"),
-        ("trellis_prior_active", "prior_on"),
-        ("trellis_prior_weight", "prior_w"),
-        ("trellis_prior_loss_weighted", "prior_surrogate"),
-        ("trellis_prior_projection_loss", "prior_proj"),
-        ("trellis_prior_projection_delta_rms", "prior_delta"),
-        (
-            "trellis_prior_projection_delta_clipped_rms",
-            "prior_delta_clip",
-        ),
-        (
-            "trellis_prior_projection_clip_fraction",
-            "prior_clip_frac",
-        ),
-        (
-            "trellis_prior_projection_x0_rms",
-            "prior_x0_rms",
-        ),
-        ("trellis_prior_velocity_rms", "prior_vel_rms"),
-        ("trellis_prior_t_mean", "prior_t"),
-        ("trellis_prior_guard_loss", "prior_guard"),
-        ("trellis_prior_guard_fraction", "prior_guard_frac"),
-        ("trellis_prior_guard_low", "prior_guard_low"),
-        ("trellis_prior_guard_high", "prior_guard_high"),
-        ("trellis_prior_endpoint_rms", "prior_endpoint_rms"),
-        (
-            "trellis_prior_sample_endpoint_rms_ratio",
-            "prior_z_ep_ratio",
-        ),
-        (
-            "trellis_prior_delta_endpoint_rms_ratio",
-            "prior_delta_ep_ratio",
-        ),
-        ("trellis_prior_src1_fraction", "prior_src1"),
-        ("trellis_prior_sample_rms", "prior_sample_rms"),
-        ("trellis_prior_sample_mean", "prior_sample_mean"),
-        ("trellis_prior_sample_std", "prior_sample_std"),
-        ("trellis_prior_sample_min", "prior_sample_min"),
-        ("trellis_prior_sample_max", "prior_sample_max"),
-        ("grad_norm_preclip", "grad_pre"),
-        ("grad_norm_postclip", "grad_post"),
-        ("semantic_aux_loss_weighted", "sem_aux"),
-        ("semantic_cycle_loss_weighted", "sem_cyc"),
-        ("semantic_usage_loss", "hub_raw"),
-        ("semantic_usage_loss_weighted", "hub"),
-        ("endpoint_loss", "end_raw"),
-        ("endpoint_loss_weighted", "end"),
-        ("symmetry_loss", "sym_raw"),
-        ("symmetry_loss_weighted", "sym"),
-        ("residual_endpoint_loss", "res_end_raw"),
-        ("residual_endpoint_loss_weighted", "res_end"),
-        ("endpoint_active", "end_on"),
-        ("symmetry_active", "sym_on"),
-        ("residual_endpoint_active", "res_end_on"),
-        ("relative_improvement", "slat_rel"),
-        ("pred_target_cosine", "slat_cos"),
-        ("semantic_align_lambda", "sem_lam"),
-        ("semantic_entropy_12", "sem_H12"),
-        ("semantic_entropy_21", "sem_H21"),
-        ("semantic_usage_12_max", "usage12_max"),
-        ("semantic_usage_21_max", "usage21_max"),
-        ("pred_std", "pred_std"),
-        ("target_std", "target_std"),
-        ("mse_zero", "mse_zero"),
-    )
-    parts = [
-        f"{label}={metrics[key]:.6f}"
-        for key, label in keys
-        if key in metrics
-    ]
-    return " " + " ".join(parts) if parts else ""
+def format_slat_metric_summary(metrics):
+    # No zero-filled prior fields, duplicate total/FM values or inactive losses.
+    return concise_metric_summary(metrics)
 
 
 def optimizer_grad_norms(optimizer):
-    """Return total L2 grad norm and per-optimizer-group grad norms."""
-    total_sq = 0.0
-    group_norms = {}
-
-    for group_idx, group in enumerate(optimizer.param_groups):
-        group_sq = 0.0
-
-        for param in group["params"]:
-            grad = param.grad
-            if grad is None:
-                continue
-
-            grad = grad.detach()
-
-            if grad.is_sparse:
-                grad = grad.coalesce().values()
-
-            value = float(grad.float().norm(2).item())
-            group_sq += value * value
-            total_sq += value * value
-
-        name = str(group.get("name", f"group_{group_idx}"))
-        group_norms[name] = group_sq ** 0.5
-
-    return total_sq ** 0.5, group_norms
+    return optimizer_grad_norms_batched(optimizer)
 
 
 def compute_loss(
@@ -1180,6 +1089,8 @@ def save_checkpoint(
     final: bool = False,
     best: bool = False,
     last: bool = False,
+    prior_balancer=None,
+    evaluation_only=False,
 ):
     if not accelerator.is_main_process:
         return
@@ -1205,6 +1116,10 @@ def save_checkpoint(
         "flow_target": args.flow_target,
         "sigma_min": accelerator.unwrap_model(model).sigma_min,
         "args": vars(args),
+        "trellis_prior_balance_state": (
+            prior_balancer.state_dict() if prior_balancer is not None else None
+        ),
+        "evaluation_only": bool(evaluation_only),
         "train_loss": train_loss,
         "val_loss": val_loss,
         "best_val_loss": best_val_loss,
@@ -1217,6 +1132,7 @@ def save_checkpoint(
 
 def train(args):
     validate_trellis_prior_args(args)
+    validate_balance_args(args)
     args.resume_from = resolve_existing_path(args.resume_from)
     args.init_from = resolve_existing_path(args.init_from)
     args.source_images_root = resolve_existing_dir(args.source_images_root)
@@ -1397,6 +1313,11 @@ def train(args):
 
     if args.resume_from:
         resume_ckpt = load_checkpoint_cpu(args.resume_from)
+        if resume_ckpt.get("evaluation_only", False):
+            raise ValueError(
+                "This is an evaluation-only mid-epoch snapshot. Resume from an "
+                "epoch-end best/last/periodic checkpoint instead."
+            )
         load_model_state(
             model=model,
             ckpt=resume_ckpt,
@@ -1534,6 +1455,50 @@ def train(args):
         best_val_loss = float(resume_ckpt.get("best_val_loss", float("inf")))
         best_epoch = int(resume_ckpt.get("best_epoch", 0))
 
+    prior_balancer = None
+    phase_eval_steps = set()
+    if args.trellis_prior_grad_balance:
+        if resume_ckpt is None or not optimizer_restored:
+            raise RuntimeError(
+                "The strong-prior phase must resume an existing student and "
+                "restore its optimizer. Use --resume_from and --resume_optimizer 1."
+            )
+        validate_balance_runtime(accelerator, model)
+        prior_balancer = PriorGradientBalancer(
+            optimizer, BalanceConfig.from_args(args), global_step,
+            process_group=getattr(model, "process_group", None),
+        )
+        saved_balance = resume_ckpt.get("trellis_prior_balance_state")
+        if saved_balance and not args.trellis_prior_reset_phase:
+            prior_balancer.load_state_dict(saved_balance)
+            accelerator.print("Restored prior balance EMA and phase counter.")
+        else:
+            # Model/optimizer/scheduler are restored; ONLY prior phase and the
+            # best-FM selection for the new output directory start afresh.
+            best_val_loss, best_epoch = float("inf"), 0
+            accelerator.print(
+                f"New measured-prior phase: start_step={global_step}, "
+                f"ratio_target={args.trellis_prior_ratio_target}, "
+                f"relative_warmup={args.trellis_prior_phase_warmup_steps}, "
+                f"guard_scale={args.trellis_prior_guard_scale}"
+            )
+        phase_eval_steps = parse_phase_eval_steps(args.trellis_prior_phase_eval_steps)
+        accelerator.print(
+            "Gradient balance: global FP32 mean gradients; "
+            "FM includes weighted teacher FM plus configured semantic usage. "
+            "Guard is NOT included in projection calibration."
+        )
+        accelerator.print(
+            f"One FP32 gradient buffer: {4*prior_balancer.numel/(1024**3):.3f} GiB; "
+            "2 component buffers normally, 3 when the guard is active, "
+            "plus parameter gradients and existing DDP buckets."
+        )
+        accelerator.print(
+            "Restored actual learning rates: " + ", ".join(
+                f"{g.get('name', i)}={g['lr']:.6g}" for i, g in enumerate(optimizer.param_groups)
+            )
+        )
+
     if args.lr_scheduler == "plateau" and not optimizer_restored and global_step >= warmup_steps:
         restore_base_lrs(optimizer)
 
@@ -1563,7 +1528,7 @@ def train(args):
     accelerator.print(f"Gradient checkpointing: {args.use_checkpoint == 1}")
     accelerator.print(f"TRELLIS model: {args.trellis_model}")
     accelerator.print(f"Flow target: {args.flow_target}")
-    if trellis_prior is not None:
+    if trellis_prior is not None and prior_balancer is None:
         accelerator.print(
             "TRELLIS projection prior: "
             f"weight={args.trellis_prior_weight}, "
@@ -1741,31 +1706,47 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            with accelerator.autocast():
-                loss = compute_loss(
-                    model=model,
-                    batch=batch,
-                    device=device,
-                    flow_target=args.flow_target,
-                    supports_extra_losses=supports_extra_losses,
-                    supports_teacher_mid_weight=supports_teacher_mid_weight,
-                    supports_source_ss_latents=supports_source_ss_latents,
-                    supports_source_images=supports_source_images,
-                    supports_residual_endpoint_controls=supports_residual_endpoint_controls,
-                    needs_source_ss_latents=requires_source_ss_latents,
-                    teacher_mid_weight=args.teacher_mid_weight,
-                    endpoint_loss_weight=args.endpoint_loss_weight,
-                    symmetry_loss_weight=args.symmetry_loss_weight,
-                    endpoint_loss_prob=args.endpoint_loss_prob,
-                    symmetry_loss_prob=args.symmetry_loss_prob,
-                    use_extra_losses=True,
-                    residual_endpoint_loss_weight=args.residual_endpoint_weight,
-                    residual_endpoint_loss_prob=args.residual_endpoint_prob,
-                    force_configured_extra_losses_active=False,
-                    trellis_prior_kwargs=trellis_prior_forward_kwargs(args, trellis_prior, global_step),
-                )
-
-            accelerator.backward(loss)
+            step_started = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+            prior_kwargs = balanced_prior_kwargs(
+                args, trellis_prior, global_step, prior_balancer,
+                trellis_prior_forward_kwargs,
+            )
+            split_active = bool(prior_kwargs.get("trellis_prior_return_loss_terms", False))
+            balance_metrics = {}
+            sync_context = accelerator.no_sync(model) if split_active else nullcontext()
+            # no_sync must enclose BOTH forward and every split backward.
+            with sync_context:
+                with accelerator.autocast():
+                    loss = compute_loss(
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        flow_target=args.flow_target,
+                        supports_extra_losses=supports_extra_losses,
+                        supports_teacher_mid_weight=supports_teacher_mid_weight,
+                        supports_source_ss_latents=supports_source_ss_latents,
+                        supports_source_images=supports_source_images,
+                        supports_residual_endpoint_controls=supports_residual_endpoint_controls,
+                        needs_source_ss_latents=requires_source_ss_latents,
+                        teacher_mid_weight=args.teacher_mid_weight,
+                        endpoint_loss_weight=args.endpoint_loss_weight,
+                        symmetry_loss_weight=args.symmetry_loss_weight,
+                        endpoint_loss_prob=args.endpoint_loss_prob,
+                        symmetry_loss_prob=args.symmetry_loss_prob,
+                        use_extra_losses=True,
+                        residual_endpoint_loss_weight=args.residual_endpoint_weight,
+                        residual_endpoint_loss_prob=args.residual_endpoint_prob,
+                        force_configured_extra_losses_active=False,
+                        trellis_prior_kwargs=prior_kwargs,
+                    )
+                if split_active:
+                    loss, balance_metrics = prior_balancer.backward_parts(
+                        loss, accelerator, model, global_step,
+                    )
+                else:
+                    accelerator.backward(loss)
 
             grad_norm_preclip, group_grad_norms_preclip = optimizer_grad_norms(
                 optimizer
@@ -1787,6 +1768,15 @@ def train(args):
             loss_value = float(reduced_loss.item())
             forward_metrics = collect_reduced_forward_metrics(accelerator, model)
 
+            forward_metrics.update(balance_metrics)
+            # Values here are actual post-calibration objective values, not the
+            # nominal temporary weight used inside MorphFlow.forward.
+            forward_metrics["total_loss"] = loss_value
+            forward_metrics["perf/step_seconds_rank0"] = time.perf_counter() - step_started
+            if torch.cuda.is_available():
+                forward_metrics["perf/peak_allocated_gib_rank0"] = (
+                    torch.cuda.max_memory_allocated(device) / (1024**3)
+                )
             forward_metrics["grad_norm_preclip"] = grad_norm_preclip
             forward_metrics["grad_norm_postclip"] = grad_norm_postclip
 
@@ -1800,47 +1790,13 @@ def train(args):
 
             if prior_active:
                 prior_debug_counter += 1
-
-                # Print first active application, then every log_every PRIOR
-                # applications, independently from ordinary batch logging.
-                if (
-                    prior_debug_counter == 1
-                    or prior_debug_counter % max(1, args.log_every) == 0
-                ):
-                    group_pre = " ".join(
-                        f"{name}={value:.4f}"
-                        for name, value in group_grad_norms_preclip.items()
+                if accelerator.is_main_process:
+                    append_prior_json(
+                        os.path.join(logs_dir, "prior_diagnostics.jsonl"),
+                        forward_metrics, global_step, epoch,
                     )
-
-                    accelerator.print(
-                        "[PRIOR] "
-                        f"step={global_step} "
-                        f"w={forward_metrics.get('trellis_prior_weight', 0.0):.6g} "
-                        f"loss_w={forward_metrics.get('trellis_prior_loss_weighted', 0.0):.6g} "
-                        f"proj={forward_metrics.get('trellis_prior_projection_loss', 0.0):.6g} "
-                        f"delta={forward_metrics.get('trellis_prior_projection_delta_rms', 0.0):.6g} "
-                        f"delta_clip={forward_metrics.get('trellis_prior_projection_delta_clipped_rms', 0.0):.6g} "
-                        f"clip_frac={forward_metrics.get('trellis_prior_projection_clip_fraction', 0.0):.3f} "
-                        f"proj_x0_rms={forward_metrics.get('trellis_prior_projection_x0_rms', 0.0):.6g} "
-                        f"vel_rms={forward_metrics.get('trellis_prior_velocity_rms', 0.0):.6g} "
-                        f"guard={forward_metrics.get('trellis_prior_guard_loss', 0.0):.6g} "
-                        f"guard_frac={forward_metrics.get('trellis_prior_guard_fraction', 0.0):.3f} "
-                        f"guard_low={forward_metrics.get('trellis_prior_guard_low', 0.0):.6g} "
-                        f"guard_high={forward_metrics.get('trellis_prior_guard_high', 0.0):.6g} "
-                        f"endpoint_rms={forward_metrics.get('trellis_prior_endpoint_rms', 0.0):.6g} "
-                        f"z_ep_ratio={forward_metrics.get('trellis_prior_sample_endpoint_rms_ratio', 0.0):.4f} "
-                        f"delta_ep_ratio={forward_metrics.get('trellis_prior_delta_endpoint_rms_ratio', 0.0):.4f} "
-                        f"src1_frac={forward_metrics.get('trellis_prior_src1_fraction', 0.0):.3f} "
-                        f"tau={forward_metrics.get('trellis_prior_t_mean', 0.0):.4f} "
-                        f"z_mean={forward_metrics.get('trellis_prior_sample_mean', 0.0):.6g} "
-                        f"z_std={forward_metrics.get('trellis_prior_sample_std', 0.0):.6g} "
-                        f"z_rms={forward_metrics.get('trellis_prior_sample_rms', 0.0):.6g} "
-                        f"z_min={forward_metrics.get('trellis_prior_sample_min', 0.0):.6g} "
-                        f"z_max={forward_metrics.get('trellis_prior_sample_max', 0.0):.6g} "
-                        f"grad_pre={grad_norm_preclip:.6g} "
-                        f"grad_post={grad_norm_postclip:.6g} "
-                        f"groups_pre=[{group_pre}]"
-                    )
+                if prior_debug_counter == 1 or prior_debug_counter % args.trellis_prior_log_every == 0:
+                    accelerator.print(prior_console(forward_metrics, global_step))
 
             if writer is not None:
                 writer.add_scalar("train/loss_step", loss_value, global_step)
@@ -1877,10 +1833,7 @@ def train(args):
                         global_step,
                     )
 
-                for metric_name, metric_value in forward_metrics.items():
-                    writer.add_scalar(f"train/slat_{metric_name}", metric_value, global_step)
-                    if metric_name.startswith("trellis_prior_"):
-                        writer.add_scalar(f"train/{metric_name}", metric_value, global_step)
+                write_step_metrics(writer, forward_metrics, global_step, prior_active)
 
             if accelerator.is_local_main_process:
                 postfix = {
@@ -1888,7 +1841,7 @@ def train(args):
                     "avg": f"{avg_loss:.6f}",
                     "step": global_step,
                 }
-                if forward_metrics:
+                if args.flow_target == "slat" and forward_metrics:
                     postfix["slat_rel"] = f"{forward_metrics.get('relative_improvement', 0.0):.4f}"
                     postfix["slat_cos"] = f"{forward_metrics.get('pred_target_cosine', 0.0):.4f}"
                 progress_bar.set_postfix(**postfix)
@@ -1902,6 +1855,17 @@ def train(args):
                     f"loss={loss_value:.6f} avg_loss={avg_loss:.6f}"
                     f"{slat_metric_summary}"
                 )
+
+            if prior_balancer is not None and global_step - prior_balancer.phase_start in phase_eval_steps:
+                accelerator.wait_for_everyone()
+                save_checkpoint(
+                    accelerator=accelerator, model=model, optimizer=optimizer,
+                    scheduler=scheduler, args=args, ckpt_dir=ckpt_dir,
+                    epoch=epoch, global_step=global_step, train_loss=avg_loss,
+                    val_loss=None, best_val_loss=best_val_loss, best_epoch=best_epoch,
+                    prior_balancer=prior_balancer, evaluation_only=True,
+                )
+                accelerator.wait_for_everyone()
 
         epoch_avg = running_loss / max(1, len(loader))
         accelerator.print(f"Epoch {epoch} completed. avg_loss={epoch_avg:.6f}")
@@ -2010,6 +1974,7 @@ def train(args):
                     best_val_loss=best_val_loss,
                     best_epoch=best_epoch,
                     best=True,
+                    prior_balancer=prior_balancer,
                 )
             else:
                 accelerator.print(
@@ -2032,6 +1997,7 @@ def train(args):
             best_val_loss=best_val_loss,
             best_epoch=best_epoch,
             last=True,
+            prior_balancer=prior_balancer,
         )
 
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
@@ -2050,6 +2016,7 @@ def train(args):
                 val_loss=val_avg,
                 best_val_loss=best_val_loss,
                 best_epoch=best_epoch,
+                prior_balancer=prior_balancer,
             )
 
         if writer is not None:
@@ -2057,7 +2024,8 @@ def train(args):
             if val_avg is not None:
                 writer.add_scalar("val/loss_epoch", val_avg, epoch)
                 for metric_name, metric_value in val_forward_metric_avgs.items():
-                    writer.add_scalar(f"val/slat_{metric_name}", metric_value, epoch)
+                    if not metric_name.startswith("trellis_prior_"):
+                        writer.add_scalar(f"val/fm/{metric_name}", metric_value, epoch)
             writer.flush()
 
         accelerator.wait_for_everyone()

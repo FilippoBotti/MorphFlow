@@ -330,6 +330,7 @@ class TrellisSSPrior(nn.Module):
         src2_ss_latent,
         tau=None,
         noise=None,
+        return_loss_terms=False,
     ):
         z = self._prepare_ss(z)
 
@@ -769,4 +770,9 @@ class TrellisSSPrior(nn.Module):
                 choose_src1.float().mean().detach(),
         }
 
+        if return_loss_terms:
+            return loss, metrics, {
+                "projection": projection_loss,
+                "guard": self.rms_guard_weight * guard_loss,
+            }
         return loss, metrics
