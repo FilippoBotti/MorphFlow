@@ -73,6 +73,13 @@ def add_trellis_prior_args(parser):
         ),
     )
     group.add_argument(
+        "--trellis_prior_tangent_projection",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Remove projection component parallel to current student latent.",
+    )
+    group.add_argument(
         "--trellis_prior_rms_guard_weight",
         type=float,
         default=1.0,

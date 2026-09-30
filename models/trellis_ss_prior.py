@@ -27,6 +27,9 @@ TRELLIS_PRIOR_METRIC_NAMES = (
     "trellis_prior_loss",
     "trellis_prior_projection_loss",
     "trellis_prior_projection_delta_rms",
+    "trellis_prior_projection_tangent_delta_rms",
+    "trellis_prior_projection_radial_fraction",
+    "trellis_prior_projection_raw_cosine_z",
     "trellis_prior_projection_delta_clipped_rms",
     "trellis_prior_projection_clip_fraction",
     "trellis_prior_projection_x0_rms",
@@ -116,6 +119,7 @@ class TrellisSSPrior(nn.Module):
         t_min=0.05,
         t_max=0.20,
         projection_clip_ratio=0.10,
+        tangent_projection=False,
         rms_guard_weight=1.0,
         rms_guard_low_ratio=0.25,
         rms_guard_high_ratio=2.0,
@@ -156,6 +160,7 @@ class TrellisSSPrior(nn.Module):
         self.t_max = float(t_max)
 
         self.projection_clip_ratio = float(projection_clip_ratio)
+        self.tangent_projection = bool(tangent_projection)
 
         self.rms_guard_weight = float(rms_guard_weight)
         self.rms_guard_low_ratio = float(rms_guard_low_ratio)
@@ -318,6 +323,24 @@ class TrellisSSPrior(nn.Module):
             )
 
         return rms
+
+    @staticmethod
+    def _split_radial_tangent(delta, z, batch_size):
+        """Split delta into radial (parallel to z) and tangent components."""
+        delta_f = delta.float().reshape(batch_size, -1)
+        z_f = z.float().reshape(batch_size, -1)
+        dot = (delta_f * z_f).sum(dim=1)
+        z_sq = z_f.square().sum(dim=1).clamp_min(1e-12)
+        coeff = dot / z_sq
+        shape = (batch_size,) + (1,) * (delta.ndim - 1)
+        radial = z.float() * coeff.reshape(shape)
+        tangent = delta.float() - radial
+        radial_rms = radial.reshape(batch_size, -1).square().mean(dim=1).clamp_min(1e-12).sqrt()
+        raw_rms = delta_f.square().mean(dim=1).clamp_min(1e-12).sqrt()
+        radial_fraction = radial_rms / raw_rms.clamp_min(1e-12)
+        delta_norm = delta_f.square().sum(dim=1).clamp_min(1e-12).sqrt()
+        raw_cosine_z = dot / (delta_norm * z_sq.sqrt()).clamp_min(1e-12)
+        return tangent.contiguous(), radial_fraction, raw_cosine_z
 
     def forward(
         self,
@@ -546,6 +569,22 @@ class TrellisSSPrior(nn.Module):
                 batch_size,
             )
 
+            tangent_delta, radial_fraction_per_item, raw_cosine_z_per_item = self._split_radial_tangent(
+                raw_delta,
+                detached_z,
+                batch_size,
+            )
+            tangent_delta_rms_per_item = self._rms_per_item(
+                tangent_delta,
+                batch_size,
+            )
+            if self.tangent_projection:
+                projection_delta = tangent_delta
+                projection_delta_rms_per_item = tangent_delta_rms_per_item
+            else:
+                projection_delta = raw_delta
+                projection_delta_rms_per_item = raw_delta_rms_per_item
+
             endpoint_rms = self._rms_per_item(
                 selected_endpoint_ss,
                 batch_size,
@@ -574,7 +613,7 @@ class TrellisSSPrior(nn.Module):
 
                 delta_scale = (
                     max_delta_rms
-                    / raw_delta_rms_per_item.clamp_min(1e-12)
+                    / projection_delta_rms_per_item.clamp_min(1e-12)
                 ).clamp(max=1.0)
 
                 if tuple(max_delta_rms.shape) != (batch_size,):
@@ -598,7 +637,7 @@ class TrellisSSPrior(nn.Module):
                 )
 
                 delta = (
-                    raw_delta
+                    projection_delta
                     * delta_scale.reshape(
                         broadcast_shape
                     )
@@ -609,7 +648,7 @@ class TrellisSSPrior(nn.Module):
                 ).float().mean()
 
             else:
-                delta = raw_delta
+                delta = projection_delta
                 clip_fraction = detached_z.new_zeros(())
 
             if delta.shape != raw_delta.shape:
@@ -729,6 +768,15 @@ class TrellisSSPrior(nn.Module):
 
             "trellis_prior_projection_delta_rms":
                 raw_delta_rms_per_item.mean().detach(),
+
+            "trellis_prior_projection_tangent_delta_rms":
+                tangent_delta_rms_per_item.mean().detach(),
+
+            "trellis_prior_projection_radial_fraction":
+                radial_fraction_per_item.mean().detach(),
+
+            "trellis_prior_projection_raw_cosine_z":
+                raw_cosine_z_per_item.mean().detach(),
 
             "trellis_prior_projection_delta_clipped_rms":
                 clipped_delta_rms_per_item.mean().detach(),

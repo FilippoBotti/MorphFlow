@@ -14,7 +14,7 @@ import time
 import torch
 import torch.distributed as dist
 
-PATCH_VERSION = "mf-prior-balance-v1"
+PATCH_VERSION = "mf-prior-balance-v2"
 
 
 def add_balance_args(parser):
@@ -22,6 +22,7 @@ def add_balance_args(parser):
     g.add_argument("--trellis_prior_grad_balance", type=int, choices=[0, 1], default=0)
     g.add_argument("--trellis_prior_ratio_target", type=float, default=0.5)
     g.add_argument("--trellis_prior_ratio_max", type=float, default=1.0)
+    g.add_argument("--trellis_prior_group_ratio_max", type=float, default=1.0)
     g.add_argument("--trellis_prior_balance_ema", type=float, default=0.95)
     g.add_argument("--trellis_prior_lambda_min", type=float, default=0.01)
     g.add_argument("--trellis_prior_lambda_max", type=float, default=100.0)
@@ -41,6 +42,7 @@ def validate_balance_args(args):
     if not getattr(args, "trellis_prior_grad_balance", 0):
         return
     finite_positive = ("trellis_prior_ratio_target", "trellis_prior_ratio_max",
+                       "trellis_prior_group_ratio_max",
                        "trellis_prior_lambda_min", "trellis_prior_lambda_max")
     for name in finite_positive:
         value = float(getattr(args, name))
@@ -98,6 +100,7 @@ def validate_balance_runtime(accelerator, model):
 class BalanceConfig:
     target: float = 0.5
     max_ratio: float = 1.0
+    group_max_ratio: float = 1.0
     ema: float = 0.95
     min_weight: float = 0.01
     max_weight: float = 100.0
@@ -111,6 +114,7 @@ class BalanceConfig:
     def from_args(cls, args):
         return cls(target=args.trellis_prior_ratio_target,
                    max_ratio=args.trellis_prior_ratio_max,
+                   group_max_ratio=args.trellis_prior_group_ratio_max,
                    ema=args.trellis_prior_balance_ema,
                    min_weight=args.trellis_prior_lambda_min,
                    max_weight=args.trellis_prior_lambda_max,
@@ -296,9 +300,21 @@ class PriorGradientBalancer:
             raise ValueError("global_step precedes new phase start")
         ramp = min(1.0, phase_step / max(1, self.config.warmup_steps))
         nominal = (1 - ramp) * self.config.start_weight + ramp * estimate_bounded
-        # Cap instantaneous projection norm, not just an EMA estimate.
+        # Cap instantaneous projection globally and per optimizer group.
         cap = self.config.max_ratio * nf / np_
-        weight = min(nominal, cap)
+        group_cap = float("inf")
+        for _name, start, end in self.groups:
+            nf_g = self._norm(gf[start:end])
+            np_g = self._norm(gp[start:end])
+            if np_g > self.config.min_norm:
+                if nf_g <= self.config.min_norm:
+                    group_cap = 0.0
+                else:
+                    group_cap = min(
+                        group_cap,
+                        self.config.group_max_ratio * nf_g / np_g,
+                    )
+        weight = min(nominal, cap, group_cap)
         report = self._metrics_for_vectors(gf, gp, gg, weight)
         for name, start, end in self.groups:
             report.update(self._metrics_for_vectors(
@@ -326,6 +342,7 @@ class PriorGradientBalancer:
             "balance/ramp": ramp,
             "balance/lambda_max_hit": float(estimate >= self.config.max_weight),
             "balance/ratio_cap_hit": float(nominal > cap),
+            "balance/group_ratio_cap_hit": float(nominal > group_cap),
             "balance/weak_streak": float(self.weak_streak),
         })
         gf.add_(gp, alpha=weight)
@@ -399,6 +416,10 @@ def prior_console(metrics, step):
             ("grad_norm_preclip", "grad_pre"), ("grad_norm_postclip", "grad_post"),
             ("balance/lambda_max_hit", "lambda_capped"),
             ("balance/ratio_cap_hit", "ratio_capped"),
+            ("balance/group_ratio_cap_hit", "group_capped"),
+            ("trellis_prior_projection_tangent_delta_rms", "delta_tan"),
+            ("trellis_prior_projection_radial_fraction", "radial_frac"),
+            ("trellis_prior_projection_raw_cosine_z", "cos_dz"),
             ("perf/peak_allocated_gib_rank0", "peak_GiB_r0"),
             ("perf/step_seconds_rank0", "step_s_r0"))
     line = "[PRIOR] step=%d" % step

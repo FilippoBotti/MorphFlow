@@ -1399,6 +1399,9 @@ def train(args):
                 projection_clip_ratio=(
                     args.trellis_prior_projection_clip_ratio
                 ),
+                tangent_projection=bool(
+                    args.trellis_prior_tangent_projection
+                ),
                 rms_guard_weight=(
                     args.trellis_prior_rms_guard_weight
                 ),
