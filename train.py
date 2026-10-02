@@ -492,8 +492,8 @@ def compute_loss(
     force_configured_extra_losses_active: bool = False,
     trellis_prior_kwargs: Optional[Dict[str, Any]] = None,
 ):
-    if trellis_prior_kwargs and flow_target != "ss":
-        raise ValueError("TRELLIS SS prior supervision requires flow_target='ss'")
+    if trellis_prior_kwargs and flow_target not in ("ss","slat"):
+        raise ValueError("TRELLIS prior supports ss or slat")
     src1_feats = batch["src1_feats"].to(device=device, dtype=torch.float32, non_blocking=True)
     src1_coords = batch["src1_coords"].to(device=device, dtype=torch.int32, non_blocking=True)
 
@@ -519,7 +519,11 @@ def compute_loss(
                 symmetry_loss_prob,
             )
 
-        model_kwargs = {}
+        model_kwargs = dict(trellis_prior_kwargs or {})
+        if trellis_prior_kwargs:
+            i1=get_optional_tensor(batch,"src1_image",device,dtype=torch.float32); i2=get_optional_tensor(batch,"src2_image",device,dtype=torch.float32)
+            if i1 is None or i2 is None: raise KeyError("TRELLIS prior active but endpoint images missing")
+            model_kwargs["trellis_prior_src1_image"]=i1; model_kwargs["trellis_prior_src2_image"]=i2
 
         if supports_source_images:
             model_kwargs["src1_image"] = batch["src1_image"].to(
@@ -1378,49 +1382,16 @@ def train(args):
     # optimizer or checkpoints. Load original weights even when resuming a student.
     trellis_prior = None
     if args.trellis_prior_weight > 0:
-        from models.trellis_ss_prior import TrellisSSPrior
-
-        prior_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}[mixed_precision]
-        if device.type != "cuda":
-            prior_dtype = torch.float32
+        prior_dtype={"bf16":torch.bfloat16,"fp16":torch.float16,"no":torch.float32}[mixed_precision]
+        if device.type != "cuda": prior_dtype=torch.float32
         with accelerator.main_process_first():
-            accelerator.print(
-                "Loading frozen endpoint-conditioned TRELLIS "
-                "SS projection prior..."
-            )
-
-            trellis_prior = TrellisSSPrior.from_pretrained(
-                device=device,
-                dtype=prior_dtype,
-                dino_model=args.dino_model,
-                sigma_min=accelerator.unwrap_model(model).sigma_min,
-                t_min=args.trellis_prior_t_min,
-                t_max=args.trellis_prior_t_max,
-                projection_clip_ratio=(
-                    args.trellis_prior_projection_clip_ratio
-                ),
-                tangent_projection=bool(
-                    args.trellis_prior_tangent_projection
-                ),
-                scale_anchor_weight=(
-                    args.trellis_prior_scale_anchor_weight
-                ),
-                scale_anchor_low_ratio=(
-                    args.trellis_prior_scale_anchor_low_ratio
-                ),
-                scale_anchor_high_ratio=(
-                    args.trellis_prior_scale_anchor_high_ratio
-                ),
-                rms_guard_weight=(
-                    args.trellis_prior_rms_guard_weight
-                ),
-                rms_guard_low_ratio=(
-                    args.trellis_prior_rms_guard_low_ratio
-                ),
-                rms_guard_high_ratio=(
-                    args.trellis_prior_rms_guard_high_ratio
-                ),
-            )
+            if args.flow_target=="ss":
+                from models.trellis_ss_prior import TrellisSSPrior
+                trellis_prior=TrellisSSPrior.from_pretrained(device=device,dtype=prior_dtype,dino_model=args.dino_model,sigma_min=accelerator.unwrap_model(model).sigma_min,t_min=args.trellis_prior_t_min,t_max=args.trellis_prior_t_max,projection_clip_ratio=args.trellis_prior_projection_clip_ratio,tangent_projection=bool(args.trellis_prior_tangent_projection),scale_anchor_weight=args.trellis_prior_scale_anchor_weight,scale_anchor_low_ratio=args.trellis_prior_scale_anchor_low_ratio,scale_anchor_high_ratio=args.trellis_prior_scale_anchor_high_ratio,rms_guard_weight=args.trellis_prior_rms_guard_weight,rms_guard_low_ratio=args.trellis_prior_rms_guard_low_ratio,rms_guard_high_ratio=args.trellis_prior_rms_guard_high_ratio)
+            else:
+                from models.trellis_slat_prior import TrellisSLatPrior
+                accelerator.print("Loading frozen endpoint-conditioned TRELLIS SLat projection prior...")
+                trellis_prior=TrellisSLatPrior.from_pretrained(device=device,dino_model=args.dino_model,sigma_min=accelerator.unwrap_model(model).sigma_min,t_min=args.trellis_prior_t_min,t_max=args.trellis_prior_t_max,projection_clip_ratio=args.trellis_prior_projection_clip_ratio,tangent_projection=bool(args.trellis_prior_tangent_projection),stat_anchor_weight=args.trellis_prior_slat_stat_weight,stat_std_low_ratio=args.trellis_prior_slat_std_low_ratio,stat_std_high_ratio=args.trellis_prior_slat_std_high_ratio,stat_mean_tolerance=args.trellis_prior_slat_mean_tolerance,rms_guard_weight=args.trellis_prior_rms_guard_weight,rms_guard_low_ratio=args.trellis_prior_rms_guard_low_ratio,rms_guard_high_ratio=args.trellis_prior_rms_guard_high_ratio)
 
     if args.flow_target == "slat" and args.slat_condition_source == "dino":
         dino_owner = accelerator.unwrap_model(model)
@@ -1470,9 +1441,17 @@ def train(args):
     prior_balancer = None
     phase_eval_steps = set()
     if args.trellis_prior_grad_balance:
-        if resume_ckpt is None or not optimizer_restored:
+        if args.flow_target == "slat" and init_ckpt is not None:
+            if not args.trellis_prior_reset_phase:
+                raise ValueError(
+                    "SLat --init_from prior phase requires --trellis_prior_reset_phase 1"
+                )
+            accelerator.print(
+                "SLat measured-prior phase: model-only init; optimizer/scheduler start fresh."
+            )
+        elif resume_ckpt is None or not optimizer_restored:
             raise RuntimeError(
-                "The strong-prior phase must resume an existing student and "
+                "The SS strong-prior phase must resume an existing student and "
                 "restore its optimizer. Use --resume_from and --resume_optimizer 1."
             )
         validate_balance_runtime(accelerator, model)
@@ -1480,7 +1459,10 @@ def train(args):
             optimizer, BalanceConfig.from_args(args), global_step,
             process_group=getattr(model, "process_group", None),
         )
-        saved_balance = resume_ckpt.get("trellis_prior_balance_state")
+        saved_balance = (
+            resume_ckpt.get("trellis_prior_balance_state")
+            if resume_ckpt is not None else None
+        )
         if saved_balance and not args.trellis_prior_reset_phase:
             prior_balancer.load_state_dict(saved_balance)
             accelerator.print("Restored prior balance EMA and phase counter.")

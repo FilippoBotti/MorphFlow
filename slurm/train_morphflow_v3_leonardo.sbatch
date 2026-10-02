@@ -57,6 +57,8 @@ RUN_NAME="${RUN_NAME:-$DEFAULT_RUN_NAME}"
 RUN_DIR="$MF_OUT_ROOT/$RUN_NAME"
 AUTO_RESUME="${AUTO_RESUME:-0}"
 RESUME_FROM="${RESUME_FROM:-}"
+INIT_FROM="${INIT_FROM:-}"
+[[ -z "$RESUME_FROM" || -z "$INIT_FROM" ]] || die "Usare RESUME_FROM oppure INIT_FROM, non entrambi."
 [[ "$AUTO_RESUME" == 0 || "$AUTO_RESUME" == 1 ]] || die "AUTO_RESUME deve essere 0 o 1."
 
 # Parametri dell'allegato r32/semMatch, applicati al flow SLat.
@@ -64,7 +66,7 @@ RESUME_FROM="${RESUME_FROM:-}"
 TRAIN_BS="${TRAIN_BS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-60}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-# Il prior e' disponibile solo per SS; SLat conserva il training precedente.
+# Prior TRELLIS locale disponibile per SS e SLat.
 TRELLIS_PRIOR_WEIGHT="${TRELLIS_PRIOR_WEIGHT:-$DEFAULT_TRELLIS_PRIOR_WEIGHT}"
 TRELLIS_PRIOR_EVERY="${TRELLIS_PRIOR_EVERY:-4}"
 TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-1000}"
@@ -98,7 +100,7 @@ if [[ "$MODE" != --comm-check ]]; then
         [[ -d "$MF_DATA_ROOT/$item" ]] || die "Directory non trovata: $MF_DATA_ROOT/$item"
     done
 
-    if [[ "$AUTO_RESUME" == 1 && -z "$RESUME_FROM" ]]; then
+    if [[ "$AUTO_RESUME" == 1 && -z "$RESUME_FROM" && -z "$INIT_FROM" ]]; then
         RESUME_FROM="$(python - "$RUN_DIR/checkpoints" <<'PY'
 import sys
 from pathlib import Path
@@ -134,16 +136,17 @@ mode, flow_target, weight, resume = sys.argv[1:]
 weight = float(weight)
 if not math.isfinite(weight) or weight < 0:
     raise SystemExit("TRELLIS_PRIOR_WEIGHT deve essere finito e >= 0.")
-if weight > 0 and flow_target != "ss":
-    raise SystemExit("Il prior TRELLIS richiede FLOW_TARGET=ss.")
 filenames = set()
-ss_weights = "ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors"
+base = (
+    "ckpts/ss_flow_img_dit_L_16l8_fp16"
+    if flow_target == "ss"
+    else "ckpts/slat_flow_img_dit_L_64l8p2_fp16"
+)
 if not resume:
-    filenames.add(ss_weights if flow_target == "ss" else
-                  "ckpts/slat_flow_img_dit_L_64l8p2_fp16.safetensors")
+    filenames.add(base + ".safetensors")
 if weight > 0:
-    filenames.add(ss_weights)
-    filenames.add("ckpts/ss_flow_img_dit_L_16l8_fp16.json")
+    filenames.add(base + ".safetensors")
+    filenames.add(base + ".json")
 for filename in sorted(filenames):
     try:
         path = hf_hub_download(
@@ -210,9 +213,30 @@ train_args=(
     --trellis_prior_t_min "$TRELLIS_PRIOR_T_MIN"
     --trellis_prior_t_max "$TRELLIS_PRIOR_T_MAX"
     --trellis_prior_projection_clip_ratio "$TRELLIS_PRIOR_PROJECTION_CLIP_RATIO"
+    --trellis_prior_tangent_projection "${TRELLIS_PRIOR_TANGENT_PROJECTION:-0}" \
+    --trellis_prior_slat_stat_weight "${TRELLIS_PRIOR_SLAT_STAT_WEIGHT:-1.0}" \
+    --trellis_prior_slat_std_low_ratio "${TRELLIS_PRIOR_SLAT_STD_LOW_RATIO:-0.65}" \
+    --trellis_prior_slat_std_high_ratio "${TRELLIS_PRIOR_SLAT_STD_HIGH_RATIO:-1.50}" \
+    --trellis_prior_slat_mean_tolerance "${TRELLIS_PRIOR_SLAT_MEAN_TOLERANCE:-0.50}" \
     --trellis_prior_rms_guard_weight "$TRELLIS_PRIOR_RMS_GUARD_WEIGHT"
     --trellis_prior_rms_guard_low_ratio "$TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO"
     --trellis_prior_rms_guard_high_ratio "$TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO"
+    --trellis_prior_grad_balance "${TRELLIS_PRIOR_GRAD_BALANCE:-0}" \
+    --trellis_prior_ratio_target "${TRELLIS_PRIOR_RATIO_TARGET:-0.15}" \
+    --trellis_prior_ratio_max "${TRELLIS_PRIOR_RATIO_MAX:-0.30}" \
+    --trellis_prior_group_ratio_max "${TRELLIS_PRIOR_GROUP_RATIO_MAX:-0.40}" \
+    --trellis_prior_scale_ratio_max "${TRELLIS_PRIOR_SCALE_RATIO_MAX:-0.15}" \
+    --trellis_prior_guard_ratio_max "${TRELLIS_PRIOR_GUARD_RATIO_MAX:-0.20}" \
+    --trellis_prior_balance_ema "${TRELLIS_PRIOR_BALANCE_EMA:-0.99}" \
+    --trellis_prior_lambda_min "${TRELLIS_PRIOR_LAMBDA_MIN:-0.01}" \
+    --trellis_prior_lambda_max "${TRELLIS_PRIOR_LAMBDA_MAX:-100.0}" \
+    --trellis_prior_phase_start_weight "${TRELLIS_PRIOR_PHASE_START_WEIGHT:-0.05}" \
+    --trellis_prior_phase_warmup_steps "${TRELLIS_PRIOR_PHASE_WARMUP_STEPS:-500}" \
+    --trellis_prior_guard_scale "${TRELLIS_PRIOR_GUARD_SCALE:-0.10}" \
+    --trellis_prior_reset_phase "${TRELLIS_PRIOR_RESET_PHASE:-1}" \
+    --trellis_prior_weak_patience "${TRELLIS_PRIOR_WEAK_PATIENCE:-25}" \
+    --trellis_prior_log_every "${TRELLIS_PRIOR_LOG_EVERY:-20}" \
+    --trellis_prior_phase_eval_steps "${TRELLIS_PRIOR_PHASE_EVAL_STEPS:-500,1500,3000}" \
     --slat_condition_source slat
     --source_images_root "$MF_SOURCE_IMAGES_ROOT"
     --dino_model dinov2_vitl14_reg
@@ -239,7 +263,7 @@ train_args=(
     --semantic_match_alpha_weight 1
     --semantic_match_detach_scores 0
     --semantic_match_exclude_style_tokens 1
-    --semantic_cycle_loss_weight 0.01
+    --semantic_cycle_loss_weight 0.0
     --semantic_cycle_loss_prob 0.25
     --semantic_cycle_detach_targets 1
     --semantic_cycle_alpha_weight 1
@@ -253,7 +277,7 @@ train_args=(
     --freeze_modules none
     --use_lora 1
     --train_flow_alpha_gate 1
-    --train_flow_alpha_embedder 1
+    --train_flow_alpha_embedder 0
     --use_ema 0
     --mixed_precision bf16
     --allow_tf32 1
@@ -264,6 +288,8 @@ train_args=(
 # Non serve --source_images_root: SLat con slat_condition_source=slat usa i latenti.
 if [[ -n "$RESUME_FROM" ]]; then
     train_args+=(--resume_from "$RESUME_FROM" --resume_strict 1 --resume_optimizer 1)
+elif [[ -n "$INIT_FROM" ]]; then
+    train_args+=(--init_from "$INIT_FROM" --init_strict 1)
 fi
 
 if [[ "$MODE" == --prepare || "$MODE" == --check ]]; then
@@ -306,7 +332,7 @@ fi
 echo "JOB=$SLURM_JOB_ID MODE=$MODE NODES=$SLURM_JOB_NODELIST"
 echo "GPUs=$MF_NUM_PROCESSES (${MF_NODE_COUNT} x ${MF_GPUS_PER_NODE}) MASTER=$MASTER_ADDR:$MASTER_PORT"
 echo "DATASET=$MF_DATA_ROOT RUN_DIR=$RUN_DIR"
-echo "AUTO_RESUME=$AUTO_RESUME RESUME_FROM=${RESUME_FROM:-<none>}"
+echo "AUTO_RESUME=$AUTO_RESUME RESUME_FROM=${RESUME_FROM:-<none>} INIT_FROM=${INIT_FROM:-<none>}"
 echo "FLOW_TARGET=$FLOW_TARGET TRELLIS_PRIOR_WEIGHT=$TRELLIS_PRIOR_WEIGHT EVERY=$TRELLIS_PRIOR_EVERY WARMUP_STEPS=$TRELLIS_PRIOR_WARMUP_STEPS"
 echo "TRAIN_BS/GPU=$TRAIN_BS GLOBAL_BATCH=$((TRAIN_BS * MF_NUM_PROCESSES))"
 printf 'Training command:'; printf ' %q' "${train_args[@]}"; printf '\n'

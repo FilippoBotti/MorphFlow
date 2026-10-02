@@ -68,34 +68,28 @@ fi
 
 AUTO_RESUME="${AUTO_RESUME:-0}"
 RESUME_FROM="${RESUME_FROM:-}"
+INIT_FROM="${INIT_FROM:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/v3_slat_lora_cross_r32_tokenGate_semMatch_T0p01_align0p10_hub_w0p01_cap4_lr5e-5_noAlphaEmb/checkpoints/morphflow_best.pt}"
 RESUME_ARG=""
 
 if [ "$AUTO_RESUME" = "1" ] && [ -z "$RESUME_FROM" ]; then
-  # morphflow_last.pt viene sovrascritto alla fine di ogni epoca completata.
   if [ -f "$RUN_DIR_HOST/checkpoints/morphflow_last.pt" ]; then
     RESUME_FROM="$RUN_DIR_HOST/checkpoints/morphflow_last.pt"
-  else
-    # Compatibilità con run precedenti che non hanno morphflow_last.pt.
-    latest_ckpt="$(
-      find "$RUN_DIR_HOST/checkpoints"         -maxdepth 1         -type f         \(           -name 'morphflow_epoch_*.pt'           -o -name 'morphflow_best.pt'           -o -name 'morphflow_final_*.pt'         \)         -printf '%T@ %p\n' 2>/dev/null |
-      sort -nr |
-      head -n 1 |
-      cut -d' ' -f2-
-    )"
-
-    if [ -n "$latest_ckpt" ]; then
-      RESUME_FROM="$latest_ckpt"
-    fi
+    INIT_FROM=""
   fi
 fi
 
-if [ -n "$RESUME_FROM" ] && [[ "$RESUME_FROM" == "$ARCHIVE_HOST"* ]]; then
-  RESUME_FROM="/archive${RESUME_FROM#$ARCHIVE_HOST}"
-fi
-
 if [ -n "$RESUME_FROM" ]; then
+  if [[ "$RESUME_FROM" == "$ARCHIVE_HOST"* ]]; then
+    RESUME_FROM="/archive${RESUME_FROM#$ARCHIVE_HOST}"
+  fi
   RESUME_ARG="--resume_from $RESUME_FROM --resume_strict 1 --resume_optimizer 1"
+  INIT_FROM="<resume>"
 else
+  test -f "$INIT_FROM" || { echo "ERROR: INIT_FROM not found: $INIT_FROM"; exit 1; }
+  if [[ "$INIT_FROM" == "$ARCHIVE_HOST"* ]]; then
+    INIT_FROM="/archive${INIT_FROM#$ARCHIVE_HOST}"
+  fi
+  RESUME_ARG="--init_from $INIT_FROM --init_strict 1"
   RESUME_FROM="<none>"
 fi
 
@@ -106,6 +100,7 @@ echo "RUN_DIR_HOST=$RUN_DIR_HOST"
 echo "DATA_ROOT_HOST=$DATA_ROOT_HOST"
 echo "AUTO_RESUME=$AUTO_RESUME"
 echo "RESUME_FROM=$RESUME_FROM"
+echo "INIT_FROM=$INIT_FROM"
 echo "SEMANTIC_CYCLE_LOSS_WEIGHT=$SEMANTIC_CYCLE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_LOSS_WEIGHT=$SEMANTIC_USAGE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_CAP=$SEMANTIC_USAGE_CAP"
@@ -185,7 +180,7 @@ if weight > 0:
     for suffix in ("json", "safetensors"):
         path = hf_hub_download(
             repo_id="microsoft/TRELLIS-image-large",
-            filename=f"ckpts/ss_flow_img_dit_L_16l8_fp16.{suffix}",
+            filename=f"ckpts/slat_flow_img_dit_L_64l8p2_fp16.{suffix}",
             local_files_only=os.environ.get("HF_HUB_OFFLINE", "0").upper() in {"1", "ON", "YES", "TRUE"},
         )
         print(f"TRELLIS prior cache: {path}")
@@ -203,15 +198,15 @@ accelerate launch \
   --val_metadata metadata_val.json \
   --out_dir "$OUT_ROOT_IN" \
   --run_name "$RUN_NAME" \
-  --train_bs 2 \
+  --train_bs 1 \
   --val_bs 1 \
-  --train_epochs 25 \
-  --lr 1e-4 \
-  --cond_lr 1e-4 \
+  --train_epochs 5 \
+  --lr 5e-5 \
+  --cond_lr 5e-5 \
   --flow_lr 5e-5 \
   --lora_lr 5e-5 \
   --weight_decay 1e-4 \
-  --warmup_steps 10000 \
+  --warmup_steps 500 \
   --plateau_factor 0.5 \
   --plateau_patience 5 \
   --grad_clip 1.0 \
@@ -232,8 +227,8 @@ accelerate launch \
   --cond_residual_blocks_16 2 \
   --cfg_drop_prob 0.2 \
   --trellis_model image_large \
-  --flow_target ss \
-  --teacher_mid_weight 0.60 \
+  --flow_target slat \
+  --teacher_mid_weight 1.0 \
   --trellis_prior_weight "$TRELLIS_PRIOR_WEIGHT" \
   --trellis_prior_every "$TRELLIS_PRIOR_EVERY" \
   --trellis_prior_warmup_steps "$TRELLIS_PRIOR_WARMUP_STEPS" \
@@ -244,9 +239,30 @@ accelerate launch \
   --trellis_prior_t_min "$TRELLIS_PRIOR_T_MIN" \
   --trellis_prior_t_max "$TRELLIS_PRIOR_T_MAX" \
   --trellis_prior_projection_clip_ratio "$TRELLIS_PRIOR_PROJECTION_CLIP_RATIO" \
+  --trellis_prior_tangent_projection 0 \
+  --trellis_prior_slat_stat_weight 1.0 \
+  --trellis_prior_slat_std_low_ratio 0.65 \
+  --trellis_prior_slat_std_high_ratio 1.50 \
+  --trellis_prior_slat_mean_tolerance 0.50 \
   --trellis_prior_rms_guard_weight "$TRELLIS_PRIOR_RMS_GUARD_WEIGHT" \
   --trellis_prior_rms_guard_low_ratio "$TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO" \
   --trellis_prior_rms_guard_high_ratio "$TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO" \
+  --trellis_prior_grad_balance 1 \
+  --trellis_prior_ratio_target 0.15 \
+  --trellis_prior_ratio_max 0.30 \
+  --trellis_prior_group_ratio_max 0.40 \
+  --trellis_prior_scale_ratio_max 0.15 \
+  --trellis_prior_guard_ratio_max 0.20 \
+  --trellis_prior_balance_ema 0.99 \
+  --trellis_prior_lambda_min 0.01 \
+  --trellis_prior_lambda_max 100.0 \
+  --trellis_prior_phase_start_weight 0.05 \
+  --trellis_prior_phase_warmup_steps 500 \
+  --trellis_prior_guard_scale 0.10 \
+  --trellis_prior_reset_phase 1 \
+  --trellis_prior_weak_patience 25 \
+  --trellis_prior_log_every 20 \
+  --trellis_prior_phase_eval_steps 500,1500,3000 \
   --slat_condition_source slat \
   --source_images_root "$FLUX_ROOT_IN" \
   --dino_model dinov2_vitl14_reg \
@@ -267,8 +283,8 @@ accelerate launch \
   --endpoint_loss_prob 0.0 \
   --symmetry_loss_prob 0.0 \
   --use_semantic_token_matching 1 \
-  --semantic_match_max_align 0.35 \
-  --semantic_match_temperature 0.05 \
+  --semantic_match_max_align 0.10 \
+  --semantic_match_temperature 0.01 \
   --semantic_match_dim 128 \
   --semantic_match_alpha_weight 1 \
   --semantic_match_detach_scores 0 \

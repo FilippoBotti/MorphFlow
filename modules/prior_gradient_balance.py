@@ -67,9 +67,9 @@ def validate_balance_args(args):
     if args.trellis_prior_phase_warmup_steps < 0 or args.trellis_prior_log_every < 1:
         raise ValueError("Phase warmup must be >=0 and prior log interval >=1")
     parse_phase_eval_steps(args.trellis_prior_phase_eval_steps)
-    if (args.flow_target != "ss" or args.ss_flow_arch != "standard"
-            or args.trellis_prior_weight <= 0):
-        raise ValueError("Gradient balancing requires standard SS and prior_weight > 0")
+    if args.trellis_prior_weight <= 0: raise ValueError("Gradient balancing requires prior_weight > 0")
+    if args.flow_target == "ss" and args.ss_flow_arch != "standard": raise ValueError("SS balancing requires standard SS")
+    if args.flow_target not in ("ss","slat"): raise ValueError("balancing supports ss or slat")
     if args.endpoint_loss_weight != 0 or args.symmetry_loss_weight != 0:
         raise ValueError("This experiment requires endpoint/symmetry losses disabled")
     if args.semantic_cycle_loss_weight != 0:

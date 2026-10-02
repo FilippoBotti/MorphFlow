@@ -97,6 +97,10 @@ def add_trellis_prior_args(parser):
         default=1.25,
         help="Upper dead-zone ratio relative to interpolated endpoint RMS.",
     )
+    group.add_argument("--trellis_prior_slat_stat_weight",type=float,default=1.0)
+    group.add_argument("--trellis_prior_slat_std_low_ratio",type=float,default=0.65)
+    group.add_argument("--trellis_prior_slat_std_high_ratio",type=float,default=1.50)
+    group.add_argument("--trellis_prior_slat_mean_tolerance",type=float,default=0.50)
     group.add_argument(
         "--trellis_prior_rms_guard_weight",
         type=float,
@@ -122,6 +126,8 @@ def validate_trellis_prior_args(args):
         "trellis_prior_weight",
         "trellis_prior_projection_clip_ratio",
         "trellis_prior_scale_anchor_weight",
+        "trellis_prior_slat_stat_weight",
+        "trellis_prior_slat_mean_tolerance",
         "trellis_prior_rms_guard_weight",
         "trellis_prior_rms_guard_low_ratio",
         "trellis_prior_rms_guard_high_ratio",
@@ -181,16 +187,10 @@ def validate_trellis_prior_args(args):
             "RMS guard low ratio must be smaller than high ratio"
         )
 
-    if args.trellis_prior_weight > 0 and (
-        args.flow_target != "ss"
-        or args.ss_flow_arch != "standard"
-        or args.trellis_model != "image_large"
-    ):
-        raise ValueError(
-            "--trellis_prior_weight > 0 requires "
-            "--flow_target ss --ss_flow_arch standard "
-            "--trellis_model image_large"
-        )
+    if args.trellis_prior_weight > 0:
+        if args.trellis_model != "image_large": raise ValueError("TRELLIS prior requires image_large")
+        if args.flow_target == "ss" and args.ss_flow_arch != "standard": raise ValueError("SS prior requires standard SS")
+        if args.flow_target not in ("ss","slat"): raise ValueError("prior supports ss or slat")
 
 
 def trellis_prior_forward_kwargs(args, prior, global_step):

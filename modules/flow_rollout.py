@@ -95,3 +95,40 @@ def differentiable_ss_rollout(
         else:
             x_t = x_t - dt * velocity(*inputs)
     return x_t
+
+
+def differentiable_slat_rollout(flow, noise, condition, alpha, *, steps=8, grad_steps=2, use_checkpoint=True):
+    """SLat rollout on fixed sparse coords with a differentiable suffix."""
+    if int(steps) != steps or steps < 1:
+        raise ValueError("rollout steps must be an integer >= 1")
+    if int(grad_steps) != grad_steps or not 0 <= grad_steps <= steps:
+        raise ValueError("rollout grad_steps must be in [0, steps]")
+    steps, grad_steps = int(steps), int(grad_steps)
+    tuple_condition = isinstance(condition, tuple)
+    tensors = condition if tuple_condition else (condition,)
+    template = noise
+    batch_size = int(noise.shape[0])
+    def velocity(feats, timestep, alpha_value, *condition_tensors):
+        cond = tuple(condition_tensors) if tuple_condition else condition_tensors[0]
+        x_sparse = template.replace(feats)
+        with rollout_evaluation_mode(flow, disable_checkpointing=True), torch.autocast(
+            device_type=feats.device.type,
+            enabled=torch.is_autocast_enabled(feats.device.type),
+            dtype=torch.get_autocast_dtype(feats.device.type),
+            cache_enabled=False,
+        ):
+            return flow(x_sparse, timestep * 1000.0, cond, alpha=alpha_value).feats.float()
+    feats = noise.feats.detach().float()
+    times = torch.linspace(1.0, 0.0, steps + 1, device=feats.device, dtype=torch.float32)
+    first_grad_step = 0 if grad_steps == 0 else steps - grad_steps
+    for step in range(steps):
+        timestep = times[step].expand(batch_size)
+        dt = times[step] - times[step + 1]
+        inputs = (feats, timestep, alpha, *tensors)
+        if step < first_grad_step:
+            with torch.no_grad(): feats = feats - dt * velocity(*inputs)
+        elif use_checkpoint and torch.is_grad_enabled():
+            feats = feats - dt * checkpoint(velocity, *inputs, use_reentrant=False)
+        else:
+            feats = feats - dt * velocity(*inputs)
+    return template.replace(feats)

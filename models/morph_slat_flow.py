@@ -4,6 +4,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from modules.flow_rollout import differentiable_slat_rollout, rollout_evaluation_mode
+from models.trellis_slat_prior import TRELLIS_PRIOR_METRIC_NAMES
+
 from models import cond_encoder
 from models import structured_latent_flow
 from models.semantic_token_matching import SemanticTokenMatchingMixin
@@ -488,6 +491,21 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
         return dict(forward_flow_kwargs)
 
 
+    def sample_slat_for_prior(self,target_x0,src_1_feats,src_1_coords,src_2_feats,src_2_coords,alpha,*,steps=8,grad_steps=2,max_items=1,use_checkpoint=True):
+        total=int(target_x0.shape[0]); count=total if max_items==0 else min(total,int(max_items))
+        template=sp.sparse_cat([target_x0[i] for i in range(count)],dim=0)
+        m1=src_1_coords[:,0]<count; m2=src_2_coords[:,0]<count; ap=alpha[:count]
+        flags={n:getattr(self,n) for n in ("_semantic_match_record_aux","_semantic_match_record_usage","semantic_match_log_stats")}
+        try:
+            for n in flags: setattr(self,n,False)
+            with rollout_evaluation_mode(self):
+                cond=self._build_condition(src_1_feats[m1],src_1_coords[m1],src_2_feats[m2],src_2_coords[m2],ap,apply_cfg_drop=False)
+        finally:
+            for n,v in flags.items(): setattr(self,n,v)
+        noise=template.replace(torch.randn_like(template.feats,dtype=torch.float32))
+        return differentiable_slat_rollout(self.slat_flow,noise,cond,ap,steps=steps,grad_steps=grad_steps,use_checkpoint=use_checkpoint)
+
+
     def endpoint_loss(
         self,
         src_1_feats: torch.Tensor,
@@ -569,105 +587,35 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
 
         return self.batch_mean_mse(pred_forward, pred_swapped)
 
-    def forward(
-        self,
-        target_feats: torch.Tensor,
-        target_coords: torch.Tensor,
-        src_1_feats: torch.Tensor,
-        src_1_coords: torch.Tensor,
-        src_2_feats: torch.Tensor,
-        src_2_coords: torch.Tensor,
-        alpha: torch.Tensor,
-        endpoint_loss_weight: float = 0.0,
-        symmetry_loss_weight: float = 0.0,
-        endpoint_loss_prob: float = 0.25,
-        symmetry_loss_prob: float = 1.0,
-        **forward_flow_kwargs,
-    ) -> torch.Tensor:
-        x_0 = self.make_slat(target_feats, target_coords)
-        x_0 = self.normalize_slat(x_0)
-
-        endpoint_active = (
-            endpoint_loss_weight > 0.0
-            and torch.rand((), device=x_0.device).item() < endpoint_loss_prob
-        )
-        symmetry_active = (
-            symmetry_loss_weight > 0.0
-            and torch.rand((), device=x_0.device).item() < symmetry_loss_prob
-        )
-
-        batch_size = x_0.shape[0]
-        t = self.sample_t(batch_size, x_0.device)
-        x_t, noise = self.diffuse(x_0, t)
-        velocity = self.get_v(x_0, noise)
-
+    def forward(self,target_feats,target_coords,src_1_feats,src_1_coords,src_2_feats,src_2_coords,alpha,endpoint_loss_weight=0.0,symmetry_loss_weight=0.0,endpoint_loss_prob=0.25,symmetry_loss_prob=1.0,trellis_prior=None,trellis_prior_weight=0.0,trellis_prior_rollout_steps=8,trellis_prior_grad_steps=2,trellis_prior_max_items=1,trellis_prior_checkpoint=True,trellis_prior_src1_image=None,trellis_prior_src2_image=None,trellis_prior_return_loss_terms=False,**forward_flow_kwargs):
+        if trellis_prior_weight>0 and trellis_prior is None: raise ValueError("positive prior weight requires TRELLIS prior")
+        x_0=self.normalize_slat(self.make_slat(target_feats,target_coords))
+        endpoint_active=endpoint_loss_weight>0 and torch.rand((),device=x_0.device).item()<endpoint_loss_prob
+        symmetry_active=symmetry_loss_weight>0 and torch.rand((),device=x_0.device).item()<symmetry_loss_prob
+        B=x_0.shape[0]; t=self.sample_t(B,x_0.device); x_t,noise=self.diffuse(x_0,t); velocity=self.get_v(x_0,noise)
         self._begin_semantic_match_record(x_0.device)
-        pred = self.forward_flow(
-            x_t,
-            t,
-            src_1_feats,
-            src_2_feats,
-            src_1_coords,
-            src_2_coords,
-            alpha,
-            apply_cfg_drop=not symmetry_active,
-            **forward_flow_kwargs,
-        )
-
-        base_loss = self.batch_mean_mse(pred, velocity)
-        semantic_aux = self._semantic_match_aux_loss(x_0.device, base_loss.dtype)
-        semantic_metrics = self._semantic_match_metrics()
-        loss = base_loss + semantic_aux
-
-        endpoint_term = None
+        pred=self.forward_flow(x_t,t,src_1_feats,src_2_feats,src_1_coords,src_2_coords,alpha,apply_cfg_drop=not symmetry_active,**forward_flow_kwargs)
+        base=self.batch_mean_mse(pred,velocity); sem=self._semantic_match_aux_loss(x_0.device,base.dtype); sem_metrics=self._semantic_match_metrics(); loss=base+sem
+        ep=None
         if endpoint_active:
-            endpoint_term = self.endpoint_loss(
-                src_1_feats,
-                src_1_coords,
-                src_2_feats,
-                src_2_coords,
-                **forward_flow_kwargs,
-            )
-            loss = loss + endpoint_loss_weight * endpoint_term
-
-        symmetry_term = None
+            ep=self.endpoint_loss(src_1_feats,src_1_coords,src_2_feats,src_2_coords,**forward_flow_kwargs); loss=loss+endpoint_loss_weight*ep
+        sy=None
         if symmetry_active:
-            symmetry_term = self.symmetry_loss(
-                x_t,
-                t,
-                src_1_feats,
-                src_1_coords,
-                src_2_feats,
-                src_2_coords,
-                alpha,
-                pred_forward=pred,
-                **forward_flow_kwargs,
-            )
-            loss = loss + symmetry_loss_weight * symmetry_term
-
-        self._update_forward_metrics(pred, velocity, loss)
-        self.last_forward_metrics.update(semantic_metrics)
-        zero_metric = loss.detach().new_zeros(())
-        self.last_forward_metrics.update(
-            {
-                "base_mse": base_loss.detach(),
-                "flow_matching_loss": (base_loss + semantic_aux).detach(),
-                "semantic_aux_loss_weighted": semantic_aux.detach(),
-                "endpoint_loss": endpoint_term.detach() if endpoint_term is not None else zero_metric,
-                "endpoint_loss_weighted": (endpoint_loss_weight * endpoint_term).detach() if endpoint_term is not None else zero_metric,
-                "symmetry_loss": symmetry_term.detach() if symmetry_term is not None else zero_metric,
-                "symmetry_loss_weighted": (symmetry_loss_weight * symmetry_term).detach() if symmetry_term is not None else zero_metric,
-                "endpoint_active": loss.detach().new_tensor(1.0 if endpoint_term is not None else 0.0),
-                "symmetry_active": loss.detach().new_tensor(1.0 if symmetry_term is not None else 0.0),
-                "total_loss": loss.detach(),
-            }
-        )
-        self.last_loss_terms = {
-            "endpoint_active": endpoint_term is not None,
-            "symmetry_active": symmetry_term is not None,
-        }
-
-        if hasattr(self, "null_cond") and self.null_cond.requires_grad:
-            loss = loss + 0.0 * self.null_cond.sum()
-
+            sy=self.symmetry_loss(x_t,t,src_1_feats,src_1_coords,src_2_feats,src_2_coords,alpha,pred_forward=pred,**forward_flow_kwargs); loss=loss+symmetry_loss_weight*sy
+        prior_base=loss; pt=None; live=None; sample=None; zero=loss.detach().new_zeros(()); pm={n:zero for n in TRELLIS_PRIOR_METRIC_NAMES}
+        if trellis_prior_weight>0:
+            if trellis_prior_src1_image is None or trellis_prior_src2_image is None: raise ValueError("SLat prior requires endpoint images")
+            sample=self.sample_slat_for_prior(x_0,src_1_feats,src_1_coords,src_2_feats,src_2_coords,alpha,steps=trellis_prior_rollout_steps,grad_steps=trellis_prior_grad_steps,max_items=trellis_prior_max_items,use_checkpoint=trellis_prior_checkpoint)
+            s1=self.normalize_slat(self.make_slat(src_1_feats,src_1_coords)); s2=self.normalize_slat(self.make_slat(src_2_feats,src_2_coords)); n=int(sample.shape[0])
+            result=trellis_prior(sample,src1_image=trellis_prior_src1_image[:n],src2_image=trellis_prior_src2_image[:n],alpha=alpha[:n],src1_slat=s1,src2_slat=s2,return_loss_terms=trellis_prior_return_loss_terms)
+            if trellis_prior_return_loss_terms: pt,mm,live=result
+            else: pt,mm=result
+            pm.update({k:v.detach() for k,v in mm.items()}); loss=loss+trellis_prior_weight*pt
+        self._update_forward_metrics(pred,velocity,prior_base); self.last_forward_metrics.update(sem_metrics); self.last_forward_metrics.update(pm)
+        self.last_forward_metrics.update({"base_mse":base.detach(),"flow_matching_loss":(base+sem).detach(),"semantic_aux_loss_weighted":sem.detach(),"endpoint_loss":ep.detach() if ep is not None else zero,"endpoint_loss_weighted":endpoint_loss_weight*ep.detach() if ep is not None else zero,"symmetry_loss":sy.detach() if sy is not None else zero,"symmetry_loss_weighted":symmetry_loss_weight*sy.detach() if sy is not None else zero,"endpoint_active":loss.detach().new_tensor(float(ep is not None)),"symmetry_active":loss.detach().new_tensor(float(sy is not None)),"trellis_prior_active":loss.detach().new_tensor(float(pt is not None)),"trellis_prior_weight":loss.detach().new_tensor(float(trellis_prior_weight)),"trellis_prior_loss_weighted":trellis_prior_weight*pt.detach() if pt is not None else zero,"trellis_prior_sample_rms":sample.feats.detach().float().square().mean().sqrt() if sample is not None else zero,"total_loss":loss.detach()})
+        self.last_loss_terms={"endpoint_active":ep is not None,"symmetry_active":sy is not None,"trellis_prior_active":pt is not None}
+        if hasattr(self,"null_cond") and self.null_cond.requires_grad: loss=loss+0.0*self.null_cond.sum()
+        if trellis_prior_return_loss_terms:
+            if live is None: raise RuntimeError("split SLat prior requested without active prior")
+            return {"fm":prior_base,"projection":live["projection"],"scale":live["scale"],"guard":live["guard"]}
         return loss
