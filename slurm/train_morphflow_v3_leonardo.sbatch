@@ -119,6 +119,9 @@ PY
     if [[ -n "$RESUME_FROM" ]]; then
         [[ -r "$RESUME_FROM" ]] || die "Checkpoint non trovato: $RESUME_FROM (usare un percorso assoluto Leonardo)."
         RESUME_FROM="$(realpath "$RESUME_FROM")"
+    elif [[ -n "$INIT_FROM" ]]; then
+        [[ -r "$INIT_FROM" ]] || die "Checkpoint INIT_FROM non trovato: $INIT_FROM"
+        INIT_FROM="$(realpath "$INIT_FROM")"
     elif compgen -G "$RUN_DIR/checkpoints/morphflow_*.pt" >/dev/null; then
         die "La run contiene checkpoint: usare AUTO_RESUME=1, RESUME_FROM oppure un nuovo RUN_NAME."
     fi
@@ -176,12 +179,12 @@ train_args=(
     --train_bs "$TRAIN_BS"
     --val_bs 1
     --train_epochs "$TRAIN_EPOCHS"
-    --lr 1e-4
-    --cond_lr 1e-4
-    --flow_lr 1e-4
-    --lora_lr 1e-4
+    --lr 5e-5
+    --cond_lr 5e-5
+    --flow_lr 5e-5
+    --lora_lr 5e-5
     --weight_decay 1e-4
-    --warmup_steps 20000
+    --warmup_steps 500
     --plateau_factor 0.5
     --plateau_patience 5
     --grad_clip 1.0
@@ -257,16 +260,18 @@ train_args=(
     --endpoint_loss_prob 0.0
     --symmetry_loss_prob 0.0
     --use_semantic_token_matching 1
-    --semantic_match_max_align 0.25
-    --semantic_match_temperature 0.1
+    --semantic_match_max_align 0.10
+    --semantic_match_temperature 0.01
     --semantic_match_dim 128
     --semantic_match_alpha_weight 1
     --semantic_match_detach_scores 0
     --semantic_match_exclude_style_tokens 1
     --semantic_cycle_loss_weight 0.0
-    --semantic_cycle_loss_prob 0.25
+    --semantic_cycle_loss_prob 0.0
     --semantic_cycle_detach_targets 1
     --semantic_cycle_alpha_weight 1
+    --semantic_usage_loss_weight 0.01
+    --semantic_usage_cap 4.0
     --semantic_match_log_stats 1
     --separate_cond 1
     --separate_cond_gate token
