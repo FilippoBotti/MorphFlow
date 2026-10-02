@@ -3,7 +3,7 @@
 #SBATCH --account=IscrC_MORPHFL
 #SBATCH --partition=boost_usr_prod
 #SBATCH --qos=normal
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:4
@@ -39,15 +39,15 @@ source "$MF_ENV_FILE"
 export MF_PROJECT_DIR="${MF_PROJECT_DIR:-$MORPHFLOW_REPO}"
 export MF_DATA_ROOT="${MF_DATA_ROOT:-$FAST/$USER/datasets/morphing_dataset_v3}"
 export MF_OUT_ROOT="${MF_OUT_ROOT:-$WORK/$USER/outputs}"
-export MF_SOURCE_IMAGES_ROOT="${MF_SOURCE_IMAGES_ROOT:-}"
+export MF_SOURCE_IMAGES_ROOT="${MF_SOURCE_IMAGES_ROOT:-$FAST/$USER/datasets/flux_outputs}"
 FLOW_TARGET="${FLOW_TARGET:-slat}"
 case "$FLOW_TARGET" in
     ss)
         DEFAULT_RUN_NAME=v3_ss_trellis_prior_leonardo
-        DEFAULT_TRELLIS_PRIOR_WEIGHT=0.01
+        DEFAULT_TRELLIS_PRIOR_WEIGHT=1.01
         ;;
     slat)
-        DEFAULT_RUN_NAME=v3_slat_lora_cross_r32_tokenGate_semMatch_loralr1e-4_leonardo
+        DEFAULT_RUN_NAME=v3_slat_trellisPrior_r015_stat015_bs1_fromBest_leonardo
         DEFAULT_TRELLIS_PRIOR_WEIGHT=0.0
         ;;
     *) die "FLOW_TARGET deve essere ss o slat." ;;
@@ -57,29 +57,29 @@ RUN_NAME="${RUN_NAME:-$DEFAULT_RUN_NAME}"
 RUN_DIR="$MF_OUT_ROOT/$RUN_NAME"
 AUTO_RESUME="${AUTO_RESUME:-0}"
 RESUME_FROM="${RESUME_FROM:-}"
-INIT_FROM="${INIT_FROM:-}"
+INIT_FROM="${INIT_FROM:-$WORK/$USER/checkpoints/slat_from_hpc/morphflow_best.pt}"
 [[ -z "$RESUME_FROM" || -z "$INIT_FROM" ]] || die "Usare RESUME_FROM oppure INIT_FROM, non entrambi."
 [[ "$AUTO_RESUME" == 0 || "$AUTO_RESUME" == 1 ]] || die "AUTO_RESUME deve essere 0 o 1."
 
 # Parametri dell'allegato r32/semMatch, applicati al flow SLat.
 # Con 4 nodi e train_bs=2: 16 GPU, batch globale 32.
-TRAIN_BS="${TRAIN_BS:-2}"
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-60}"
+TRAIN_BS="${TRAIN_BS:-1}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-5}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 # Prior TRELLIS locale disponibile per SS e SLat.
 TRELLIS_PRIOR_WEIGHT="${TRELLIS_PRIOR_WEIGHT:-$DEFAULT_TRELLIS_PRIOR_WEIGHT}"
 TRELLIS_PRIOR_EVERY="${TRELLIS_PRIOR_EVERY:-4}"
-TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-1000}"
+TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-0}"
 TRELLIS_PRIOR_ROLLOUT_STEPS="${TRELLIS_PRIOR_ROLLOUT_STEPS:-8}"
 TRELLIS_PRIOR_GRAD_STEPS="${TRELLIS_PRIOR_GRAD_STEPS:-2}"
 TRELLIS_PRIOR_MAX_ITEMS="${TRELLIS_PRIOR_MAX_ITEMS:-1}"
 TRELLIS_PRIOR_CHECKPOINT="${TRELLIS_PRIOR_CHECKPOINT:-1}"
 TRELLIS_PRIOR_T_MIN="${TRELLIS_PRIOR_T_MIN:-0.05}"
 TRELLIS_PRIOR_T_MAX="${TRELLIS_PRIOR_T_MAX:-0.20}"
-TRELLIS_PRIOR_PROJECTION_CLIP_RATIO="${TRELLIS_PRIOR_PROJECTION_CLIP_RATIO:-0.10}"
+TRELLIS_PRIOR_PROJECTION_CLIP_RATIO="${TRELLIS_PRIOR_PROJECTION_CLIP_RATIO:-0.08}"
 TRELLIS_PRIOR_RMS_GUARD_WEIGHT="${TRELLIS_PRIOR_RMS_GUARD_WEIGHT:-1.0}"
-TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO="${TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO:-0.25}"
-TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO="${TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO:-2.0}"
+TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO="${TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO:-0.40}"
+TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO="${TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO:-2.50}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
@@ -224,7 +224,7 @@ train_args=(
     --trellis_prior_rms_guard_weight "$TRELLIS_PRIOR_RMS_GUARD_WEIGHT"
     --trellis_prior_rms_guard_low_ratio "$TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO"
     --trellis_prior_rms_guard_high_ratio "$TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO"
-    --trellis_prior_grad_balance "${TRELLIS_PRIOR_GRAD_BALANCE:-0}" \
+    --trellis_prior_grad_balance "${TRELLIS_PRIOR_GRAD_BALANCE:-1}" \
     --trellis_prior_ratio_target "${TRELLIS_PRIOR_RATIO_TARGET:-0.15}" \
     --trellis_prior_ratio_max "${TRELLIS_PRIOR_RATIO_MAX:-0.30}" \
     --trellis_prior_group_ratio_max "${TRELLIS_PRIOR_GROUP_RATIO_MAX:-0.40}" \
@@ -288,7 +288,8 @@ train_args=(
     --allow_tf32 1
     --use_checkpoint 0
     --augment_source_swap 1
-    --checkpoint_every 2
+    --checkpoint_every 1
+    --checkpoint_half_epoch 1
 )
 # Non serve --source_images_root: SLat con slat_condition_source=slat usa i latenti.
 if [[ -n "$RESUME_FROM" ]]; then

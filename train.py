@@ -66,6 +66,8 @@ def build_parser():
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_max_items", type=int, default=200)
     parser.add_argument("--checkpoint_every", type=int, default=10, help="Save a regular epoch checkpoint every N epochs. Use 0 to disable.")
+    parser.add_argument("--checkpoint_half_epoch", type=int, choices=[0, 1], default=0,
+                        help="Save an evaluation-only snapshot halfway through each epoch.")
 
     # Learning rates
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -1854,6 +1856,33 @@ def train(args):
                     f"loss={loss_value:.6f} avg_loss={avg_loss:.6f}"
                     f"{slat_metric_summary}"
                 )
+
+            if (
+                args.checkpoint_half_epoch
+                and batch_idx == max(1, len(loader) // 2)
+            ):
+                accelerator.print(
+                    f"Saving mid-epoch checkpoint: epoch={epoch} "
+                    f"batch={batch_idx}/{len(loader)} step={global_step}."
+                )
+                accelerator.wait_for_everyone()
+                save_checkpoint(
+                    accelerator=accelerator,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    ckpt_dir=ckpt_dir,
+                    epoch=epoch,
+                    global_step=global_step,
+                    train_loss=avg_loss,
+                    val_loss=None,
+                    best_val_loss=best_val_loss,
+                    best_epoch=best_epoch,
+                    prior_balancer=prior_balancer,
+                    evaluation_only=True,
+                )
+                accelerator.wait_for_everyone()
 
             if prior_balancer is not None and global_step - prior_balancer.phase_start in phase_eval_steps:
                 accelerator.wait_for_everyone()
