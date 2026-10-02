@@ -14,7 +14,7 @@ import time
 import torch
 import torch.distributed as dist
 
-PATCH_VERSION = "mf-prior-balance-v2"
+PATCH_VERSION = "mf-prior-balance-v3"
 
 
 def add_balance_args(parser):
@@ -23,6 +23,8 @@ def add_balance_args(parser):
     g.add_argument("--trellis_prior_ratio_target", type=float, default=0.5)
     g.add_argument("--trellis_prior_ratio_max", type=float, default=1.0)
     g.add_argument("--trellis_prior_group_ratio_max", type=float, default=1.0)
+    g.add_argument("--trellis_prior_scale_ratio_max", type=float, default=0.20)
+    g.add_argument("--trellis_prior_guard_ratio_max", type=float, default=0.25)
     g.add_argument("--trellis_prior_balance_ema", type=float, default=0.95)
     g.add_argument("--trellis_prior_lambda_min", type=float, default=0.01)
     g.add_argument("--trellis_prior_lambda_max", type=float, default=100.0)
@@ -43,6 +45,8 @@ def validate_balance_args(args):
         return
     finite_positive = ("trellis_prior_ratio_target", "trellis_prior_ratio_max",
                        "trellis_prior_group_ratio_max",
+                       "trellis_prior_scale_ratio_max",
+                       "trellis_prior_guard_ratio_max",
                        "trellis_prior_lambda_min", "trellis_prior_lambda_max")
     for name in finite_positive:
         value = float(getattr(args, name))
@@ -101,6 +105,8 @@ class BalanceConfig:
     target: float = 0.5
     max_ratio: float = 1.0
     group_max_ratio: float = 1.0
+    scale_ratio_max: float = 0.20
+    guard_ratio_max: float = 0.25
     ema: float = 0.95
     min_weight: float = 0.01
     max_weight: float = 100.0
@@ -115,6 +121,8 @@ class BalanceConfig:
         return cls(target=args.trellis_prior_ratio_target,
                    max_ratio=args.trellis_prior_ratio_max,
                    group_max_ratio=args.trellis_prior_group_ratio_max,
+                   scale_ratio_max=args.trellis_prior_scale_ratio_max,
+                   guard_ratio_max=args.trellis_prior_guard_ratio_max,
                    ema=args.trellis_prior_balance_ema,
                    min_weight=args.trellis_prior_lambda_min,
                    max_weight=args.trellis_prior_lambda_max,
@@ -236,7 +244,7 @@ class PriorGradientBalancer:
     def _norm(x):
         return float(torch.linalg.vector_norm(x).item())
 
-    def _metrics_for_vectors(self, gf, gp, gg, weight, suffix=""):
+    def _metrics_for_vectors(self, gf, gp, gg, weight, guard_weight, suffix=""):
         nf, np_ = self._norm(gf), self._norm(gp)
         ng = 0.0 if gg is None else self._norm(gg)
         dot = float(torch.dot(gf, gp).item())
@@ -249,19 +257,18 @@ class PriorGradientBalancer:
             "balance/ratio_projection_fm" + suffix: weight * np_ / max(nf, eps),
             "balance/cos_projection_fm" + suffix: cosine,
             "balance/cos_valid" + suffix: float(nf > eps and np_ > eps),
-            "balance/g_guard_weighted" + suffix: self.config.guard_scale * ng,
-            "balance/ratio_guard_fm" + suffix: self.config.guard_scale * ng / max(nf, eps),
+            "balance/g_guard_weighted" + suffix: guard_weight * ng,
+            "balance/ratio_guard_fm" + suffix: guard_weight * ng / max(nf, eps),
         }
 
     def backward_parts(self, parts, accelerator, model, global_step):
-        """Return detached local objective and GLOBAL gradient diagnostics.
-
-        Call inside accelerator.no_sync(model), covering its forward too.
-        FM and rollout have separate forwards; retain_graph on FM also supports
-        shared-subgraph unit tests. Projection and guard share the rollout.
-        """
-        if set(parts) != {"fm", "projection", "guard"}:
-            raise ValueError("Expected live scalar losses: fm, projection, guard")
+        """Balance FM, TRELLIS shape, proactive scale, and emergency guard."""
+        parts = dict(parts)
+        if "scale" not in parts:
+            parts["scale"] = parts["projection"] * 0.0
+        expected = {"fm", "projection", "scale", "guard"}
+        if set(parts) != expected:
+            raise ValueError("Expected live scalar losses: fm, projection, scale, guard")
         if hasattr(model, "require_backward_grad_sync") and model.require_backward_grad_sync:
             raise RuntimeError("Forward and split backwards MUST be inside no_sync")
         if getattr(accelerator, "scaler", None) is not None:
@@ -269,38 +276,68 @@ class PriorGradientBalancer:
         for name, value in parts.items():
             if value.ndim != 0 or not value.requires_grad:
                 raise ValueError("%s must be a scalar attached to the student graph" % name)
-        local_values = torch.stack([parts[n].detach().float() for n in ("fm", "projection", "guard")])
+
+        order = ("fm", "projection", "scale", "guard")
+        local_values = torch.stack([parts[n].detach().float() for n in order])
         self._finite_everywhere(local_values, "loss")
-        guard_flag = (local_values[2].abs() > 0).to(torch.int32).reshape(1)
+
+        scale_flag = (local_values[2].abs() > 0).to(torch.int32).reshape(1)
+        guard_flag = (local_values[3].abs() > 0).to(torch.int32).reshape(1)
+        self._all_reduce(scale_flag, dist.ReduceOp.MAX)
         self._all_reduce(guard_flag, dist.ReduceOp.MAX)
+        scale_on = bool(scale_flag.item())
         guard_on = bool(guard_flag.item()) and self.config.guard_scale > 0
 
         gf, used = self._capture_global_gradient(parts["fm"], accelerator, True)
-        gp, used_p = self._capture_global_gradient(parts["projection"], accelerator, guard_on)
+        gp, used_p = self._capture_global_gradient(
+            parts["projection"], accelerator, scale_on or guard_on
+        )
         used.copy_(torch.maximum(used, used_p))
+
+        gs = None
+        if scale_on:
+            gs, used_s = self._capture_global_gradient(
+                parts["scale"], accelerator, guard_on
+            )
+            used.copy_(torch.maximum(used, used_s))
+
         gg = None
         if guard_on:
-            gg, used_g = self._capture_global_gradient(parts["guard"], accelerator, False)
+            gg, used_g = self._capture_global_gradient(
+                parts["guard"], accelerator, False
+            )
             used.copy_(torch.maximum(used, used_g))
+
         nf, np_ = self._norm(gf), self._norm(gp)
         if nf <= self.config.min_norm or np_ <= self.config.min_norm:
-            raise RuntimeError("Cannot calibrate: gFM=%.3e gProjection=%.3e. Check gradient connectivity." % (nf, np_))
+            raise RuntimeError(
+                "Cannot calibrate: gFM=%.3e gProjection=%.3e. Check gradient connectivity."
+                % (nf, np_)
+            )
 
         ideal = self.config.target * nf / np_
         log_ideal = math.log(ideal)
         if self.ema_log_weight is None:
             self.ema_log_weight = log_ideal
         else:
-            self.ema_log_weight = (self.config.ema * self.ema_log_weight
-                                   + (1 - self.config.ema) * log_ideal)
+            self.ema_log_weight = (
+                self.config.ema * self.ema_log_weight
+                + (1 - self.config.ema) * log_ideal
+            )
         estimate = math.exp(self.ema_log_weight)
-        estimate_bounded = min(self.config.max_weight, max(self.config.min_weight, estimate))
+        estimate_bounded = min(
+            self.config.max_weight, max(self.config.min_weight, estimate)
+        )
         phase_step = int(global_step) + 1 - self.phase_start
         if phase_step <= 0:
             raise ValueError("global_step precedes new phase start")
         ramp = min(1.0, phase_step / max(1, self.config.warmup_steps))
-        nominal = (1 - ramp) * self.config.start_weight + ramp * estimate_bounded
-        # Cap instantaneous projection globally and per optimizer group.
+        nominal = (
+            (1 - ramp) * self.config.start_weight
+            + ramp * estimate_bounded
+        )
+
+        # Shape prior: global cap plus cap for every optimizer parameter group.
         cap = self.config.max_ratio * nf / np_
         group_cap = float("inf")
         for _name, start, end in self.groups:
@@ -315,24 +352,77 @@ class PriorGradientBalancer:
                         self.config.group_max_ratio * nf_g / np_g,
                     )
         weight = min(nominal, cap, group_cap)
-        report = self._metrics_for_vectors(gf, gp, gg, weight)
+
+        # Scale anchor: preserve the natural vanishing gradient near the dead-zone.
+        # The configured anchor weight lives inside parts["scale"]; this multiplier
+        # only reduces it when its parameter-gradient norm would exceed the cap.
+        ns = 0.0 if gs is None else self._norm(gs)
+        scale_multiplier = 0.0 if gs is None else 1.0
+        scale_cap = float("inf")
+        if gs is not None and ns > self.config.min_norm:
+            scale_cap = self.config.scale_ratio_max * nf / ns
+            scale_multiplier = min(1.0, scale_cap)
+
+        # Emergency guard: also hard-cap its parameter-gradient contribution.
+        ng = 0.0 if gg is None else self._norm(gg)
+        guard_weight = 0.0 if gg is None else self.config.guard_scale
+        guard_cap = float("inf")
+        if gg is not None and ng > self.config.min_norm:
+            guard_cap = self.config.guard_ratio_max * nf / ng
+            guard_weight = min(self.config.guard_scale, guard_cap)
+
+        report = self._metrics_for_vectors(
+            gf, gp, gg, weight, guard_weight
+        )
+        eps = self.config.min_norm
+        report.update({
+            "balance/g_scale_raw": ns,
+            "balance/g_scale_weighted": scale_multiplier * ns,
+            "balance/ratio_scale_fm": scale_multiplier * ns / max(nf, eps),
+            "balance/scale_multiplier": scale_multiplier,
+            "balance/scale_ratio_cap_hit": float(
+                gs is not None and scale_multiplier < 0.999999
+            ),
+            "balance/guard_weight": guard_weight,
+            "balance/guard_ratio_cap_hit": float(
+                gg is not None and guard_weight + 1e-12 < self.config.guard_scale
+            ),
+        })
+
         for name, start, end in self.groups:
             report.update(self._metrics_for_vectors(
-                gf[start:end], gp[start:end], None if gg is None else gg[start:end],
-                weight, "/" + name))
+                gf[start:end],
+                gp[start:end],
+                None if gg is None else gg[start:end],
+                weight,
+                guard_weight,
+                "/" + name,
+            ))
+            if gs is not None:
+                nf_g = self._norm(gf[start:end])
+                ns_g = self._norm(gs[start:end])
+                report["balance/ratio_scale_fm/" + name] = (
+                    scale_multiplier * ns_g / max(nf_g, eps)
+                )
+
         self.active_count += 1
         ratio = report["balance/ratio_projection_fm"]
-        weak = phase_step >= self.config.warmup_steps and ratio < 0.3
+        weak_threshold = 0.5 * self.config.target
+        weak = (
+            phase_step >= self.config.warmup_steps
+            and ratio < weak_threshold
+        )
         self.weak_streak = self.weak_streak + 1 if weak else 0
         if self.weak_streak >= self.config.weak_patience:
             raise RuntimeError(
                 "Projection remains too weak after phase warmup: "
-                "R_P_F=%.4g, lambda=%.4g, lambda_ideal=%.4g, "
+                "R_P_F=%.4g threshold=%.4g lambda=%.4g lambda_ideal=%.4g, "
                 "lambda_max=%.4g for %d consecutive active updates. "
-                "No optimizer step was taken for this batch. Inspect diagnostics "
-                "before changing the maximum coefficient." % (
-                    ratio, weight, ideal, self.config.max_weight, self.weak_streak)
+                "No optimizer step was taken for this batch."
+                % (ratio, weak_threshold, weight, ideal, self.config.max_weight,
+                   self.weak_streak)
             )
+
         report.update({
             "balance/phase_step": float(phase_step),
             "balance/lambda": weight,
@@ -343,16 +433,20 @@ class PriorGradientBalancer:
             "balance/lambda_max_hit": float(estimate >= self.config.max_weight),
             "balance/ratio_cap_hit": float(nominal > cap),
             "balance/group_ratio_cap_hit": float(nominal > group_cap),
+            "balance/weak_threshold": weak_threshold,
             "balance/weak_streak": float(self.weak_streak),
         })
+
         gf.add_(gp, alpha=weight)
+        if gs is not None:
+            gf.add_(gs, alpha=scale_multiplier)
         if gg is not None:
-            gf.add_(gg, alpha=self.config.guard_scale)
+            gf.add_(gg, alpha=guard_weight)
         self._finite_everywhere(gf, "combined gradient")
         report["balance/joint_to_fm"] = self._norm(gf) / nf
+
         flags = used.cpu().tolist()
         for p, (start, end), flag in zip(self.params, self.slices, flags):
-            # Preserve grad=None for globally unused parameters (AdamW semantics).
             p.grad = gf[start:end].view_as(p).clone() if flag else None
 
         mean_values = local_values.clone()
@@ -361,12 +455,20 @@ class PriorGradientBalancer:
         report.update({
             "trellis_prior_weight": weight,
             "trellis_prior_projection_loss_weighted": weight * float(mean_values[1]),
-            "trellis_prior_guard_loss_weighted": self.config.guard_scale * float(mean_values[2]),
-            "trellis_prior_loss_weighted": (weight * float(mean_values[1])
-                                            + self.config.guard_scale * float(mean_values[2])),
+            "trellis_prior_scale_loss_weighted": scale_multiplier * float(mean_values[2]),
+            "trellis_prior_guard_loss_weighted": guard_weight * float(mean_values[3]),
+            "trellis_prior_loss_weighted": (
+                weight * float(mean_values[1])
+                + scale_multiplier * float(mean_values[2])
+                + guard_weight * float(mean_values[3])
+            ),
         })
-        # Only for logging; gradients have already been installed above.
-        objective = local_values[0] + weight * local_values[1] + self.config.guard_scale * local_values[2]
+        objective = (
+            local_values[0]
+            + weight * local_values[1]
+            + scale_multiplier * local_values[2]
+            + guard_weight * local_values[3]
+        )
         return objective, report
 
 
@@ -403,10 +505,14 @@ def prior_console(metrics, step):
             ("balance/ratio_target", "R_target"),
             ("balance/cos_projection_fm", "cos_P_F"),
             ("balance/ratio_guard_fm", "R_G_F"),
+            ("balance/ratio_scale_fm", "R_S_F"),
             ("balance/joint_to_fm", "R_joint_F"),
             ("trellis_prior_projection_loss_weighted", "P_w"),
+            ("trellis_prior_scale_loss_weighted", "S_w"),
             ("trellis_prior_guard_loss_weighted", "G_w"),
             ("trellis_prior_sample_endpoint_rms_ratio", "z_ep"),
+            ("trellis_prior_scale_ratio", "z_ref"),
+            ("trellis_prior_scale_active_fraction", "scale_frac"),
             ("trellis_prior_sample_rms", "z_rms"),
             ("trellis_prior_guard_fraction", "guard_frac"),
             ("trellis_prior_projection_delta_rms", "delta_raw"),
@@ -417,6 +523,10 @@ def prior_console(metrics, step):
             ("balance/lambda_max_hit", "lambda_capped"),
             ("balance/ratio_cap_hit", "ratio_capped"),
             ("balance/group_ratio_cap_hit", "group_capped"),
+            ("balance/scale_ratio_cap_hit", "scale_capped"),
+            ("balance/guard_ratio_cap_hit", "guard_capped"),
+            ("balance/scale_multiplier", "scale_mul"),
+            ("balance/guard_weight", "guard_mul"),
             ("trellis_prior_projection_tangent_delta_rms", "delta_tan"),
             ("trellis_prior_projection_radial_fraction", "radial_frac"),
             ("trellis_prior_projection_raw_cosine_z", "cos_dz"),
@@ -430,7 +540,13 @@ def prior_console(metrics, step):
         rk = "balance/ratio_projection_fm/" + group
         ck = "balance/cos_projection_fm/" + group
         if rk in metrics:
-            line += " %s[R=%.4g,cos=%.4g]" % (group, metrics[rk], metrics[ck])
+            sk = "balance/ratio_scale_fm/" + group
+            if sk in metrics:
+                line += " %s[R=%.4g,S=%.4g,cos=%.4g]" % (
+                    group, metrics[rk], metrics[sk], metrics[ck]
+                )
+            else:
+                line += " %s[R=%.4g,cos=%.4g]" % (group, metrics[rk], metrics[ck])
     if metrics.get("balance/weak_streak", 0) > 0:
         line += " WARNING=PROJECTION_STILL_WEAK"
     return line

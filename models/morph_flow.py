@@ -765,6 +765,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
             return {
                 "fm": prior_base_loss,
                 "projection": prior_live_terms["projection"],
+                "scale": prior_live_terms["scale"],
                 "guard": prior_live_terms["guard"],
             }
         return loss

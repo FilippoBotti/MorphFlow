@@ -35,6 +35,10 @@ TRELLIS_PRIOR_METRIC_NAMES = (
     "trellis_prior_projection_x0_rms",
     "trellis_prior_velocity_rms",
     "trellis_prior_t_mean",
+    "trellis_prior_scale_loss",
+    "trellis_prior_scale_active_fraction",
+    "trellis_prior_scale_reference_rms",
+    "trellis_prior_scale_ratio",
     "trellis_prior_guard_loss",
     "trellis_prior_guard_fraction",
     "trellis_prior_guard_low",
@@ -120,6 +124,9 @@ class TrellisSSPrior(nn.Module):
         t_max=0.20,
         projection_clip_ratio=0.10,
         tangent_projection=False,
+        scale_anchor_weight=0.0,
+        scale_anchor_low_ratio=0.75,
+        scale_anchor_high_ratio=1.25,
         rms_guard_weight=1.0,
         rms_guard_low_ratio=0.25,
         rms_guard_high_ratio=2.0,
@@ -140,12 +147,20 @@ class TrellisSSPrior(nn.Module):
 
         for name, value in (
             ("projection_clip_ratio", projection_clip_ratio),
+            ("scale_anchor_weight", scale_anchor_weight),
+            ("scale_anchor_low_ratio", scale_anchor_low_ratio),
+            ("scale_anchor_high_ratio", scale_anchor_high_ratio),
             ("rms_guard_weight", rms_guard_weight),
             ("rms_guard_low_ratio", rms_guard_low_ratio),
             ("rms_guard_high_ratio", rms_guard_high_ratio),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and >= 0")
+
+        if not (0 < scale_anchor_low_ratio < 1.0 < scale_anchor_high_ratio):
+            raise ValueError(
+                "scale anchor ratios must satisfy 0 < low < 1 < high"
+            )
 
         if rms_guard_low_ratio >= rms_guard_high_ratio:
             raise ValueError(
@@ -161,6 +176,9 @@ class TrellisSSPrior(nn.Module):
 
         self.projection_clip_ratio = float(projection_clip_ratio)
         self.tangent_projection = bool(tangent_projection)
+        self.scale_anchor_weight = float(scale_anchor_weight)
+        self.scale_anchor_low_ratio = float(scale_anchor_low_ratio)
+        self.scale_anchor_high_ratio = float(scale_anchor_high_ratio)
 
         self.rms_guard_weight = float(rms_guard_weight)
         self.rms_guard_low_ratio = float(rms_guard_low_ratio)
@@ -679,6 +697,14 @@ class TrellisSSPrior(nn.Module):
                 batch_size,
             )
 
+            # Reference scale follows the morph endpoints but does not prescribe
+            # geometry. alpha=1 -> src1, alpha=0 -> src2. Log interpolation is
+            # symmetric for multiplicative scale changes.
+            scale_reference_rms = torch.exp(
+                alpha * torch.log(src1_rms.clamp_min(1e-8))
+                + (1.0 - alpha) * torch.log(src2_rms.clamp_min(1e-8))
+            )
+
             # Deliberately loose anti-collapse interval.
             # No geometry is imposed inside this range.
             guard_low = (
@@ -715,6 +741,33 @@ class TrellisSSPrior(nn.Module):
                 "z_rms_per_item must have shape [B], got "
                 f"{tuple(z_rms_per_item.shape)}"
             )
+
+        # Proactive scale anchor with a wide dead-zone. It is zero inside
+        # [low_ratio, high_ratio] relative to the endpoint log-RMS reference.
+        scale_ratio_per_item = (
+            z_rms_per_item
+            / scale_reference_rms.clamp_min(1e-8)
+        )
+        scale_log_ratio = torch.log(
+            scale_ratio_per_item.clamp_min(1e-8)
+        )
+        scale_low_log = math.log(self.scale_anchor_low_ratio)
+        scale_high_log = math.log(self.scale_anchor_high_ratio)
+        scale_low_violation = F.relu(
+            scale_log_ratio.new_tensor(scale_low_log) - scale_log_ratio
+        )
+        scale_high_violation = F.relu(
+            scale_log_ratio - scale_log_ratio.new_tensor(scale_high_log)
+        )
+        scale_loss = (
+            scale_low_violation.square()
+            + scale_high_violation.square()
+        ).mean()
+        scale_active = (
+            (scale_low_violation > 0)
+            | (scale_high_violation > 0)
+        )
+        scale_active_fraction = scale_active.float().mean()
 
         low_violation = F.relu(
             guard_low
@@ -756,6 +809,7 @@ class TrellisSSPrior(nn.Module):
 
         loss = (
             projection_loss
+            + self.scale_anchor_weight * scale_loss
             + self.rms_guard_weight * guard_loss
         )
 
@@ -793,6 +847,18 @@ class TrellisSSPrior(nn.Module):
             "trellis_prior_t_mean":
                 tau.mean().detach(),
 
+            "trellis_prior_scale_loss":
+                scale_loss.detach(),
+
+            "trellis_prior_scale_active_fraction":
+                scale_active_fraction.detach(),
+
+            "trellis_prior_scale_reference_rms":
+                scale_reference_rms.mean().detach(),
+
+            "trellis_prior_scale_ratio":
+                scale_ratio_per_item.mean().detach(),
+
             "trellis_prior_guard_loss":
                 guard_loss.detach(),
 
@@ -821,6 +887,7 @@ class TrellisSSPrior(nn.Module):
         if return_loss_terms:
             return loss, metrics, {
                 "projection": projection_loss,
+                "scale": self.scale_anchor_weight * scale_loss,
                 "guard": self.rms_guard_weight * guard_loss,
             }
         return loss, metrics

@@ -77,7 +77,7 @@ class BalanceTests(unittest.TestCase):
         loss, metrics = bal.backward_parts(parts, FakeAccelerator(), net, 70000)
         ref_parts = reference(x, target, active_guard=True)
         (ref_parts['fm'] + metrics['trellis_prior_weight'] * ref_parts['projection']
-         + 0.1 * ref_parts['guard']).backward()
+         + metrics['balance/guard_weight'] * ref_parts['guard']).backward()
         self.assertGreater(metrics['balance/ratio_guard_fm'], 0)
         self.assertAlmostEqual(metrics['balance/ratio_projection_fm'], 0.5, places=6)
         for p, r in zip(net.parameters(), reference.parameters()):

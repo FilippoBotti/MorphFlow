@@ -80,6 +80,24 @@ def add_trellis_prior_args(parser):
         help="Remove projection component parallel to current student latent.",
     )
     group.add_argument(
+        "--trellis_prior_scale_anchor_weight",
+        type=float,
+        default=0.0,
+        help="Base weight of endpoint-relative log-RMS scale anchor.",
+    )
+    group.add_argument(
+        "--trellis_prior_scale_anchor_low_ratio",
+        type=float,
+        default=0.75,
+        help="Lower dead-zone ratio relative to interpolated endpoint RMS.",
+    )
+    group.add_argument(
+        "--trellis_prior_scale_anchor_high_ratio",
+        type=float,
+        default=1.25,
+        help="Upper dead-zone ratio relative to interpolated endpoint RMS.",
+    )
+    group.add_argument(
         "--trellis_prior_rms_guard_weight",
         type=float,
         default=1.0,
@@ -103,6 +121,7 @@ def validate_trellis_prior_args(args):
     for name in (
         "trellis_prior_weight",
         "trellis_prior_projection_clip_ratio",
+        "trellis_prior_scale_anchor_weight",
         "trellis_prior_rms_guard_weight",
         "trellis_prior_rms_guard_low_ratio",
         "trellis_prior_rms_guard_high_ratio",
@@ -141,6 +160,17 @@ def validate_trellis_prior_args(args):
         raise ValueError(
             "Prior timesteps must satisfy "
             "0 < --trellis_prior_t_min < --trellis_prior_t_max < 1"
+        )
+
+    if not (
+        math.isfinite(args.trellis_prior_scale_anchor_low_ratio)
+        and math.isfinite(args.trellis_prior_scale_anchor_high_ratio)
+        and 0 < args.trellis_prior_scale_anchor_low_ratio
+        < 1.0
+        < args.trellis_prior_scale_anchor_high_ratio
+    ):
+        raise ValueError(
+            "Scale anchor ratios must satisfy 0 < low < 1 < high"
         )
 
     if (

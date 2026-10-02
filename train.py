@@ -1402,6 +1402,15 @@ def train(args):
                 tangent_projection=bool(
                     args.trellis_prior_tangent_projection
                 ),
+                scale_anchor_weight=(
+                    args.trellis_prior_scale_anchor_weight
+                ),
+                scale_anchor_low_ratio=(
+                    args.trellis_prior_scale_anchor_low_ratio
+                ),
+                scale_anchor_high_ratio=(
+                    args.trellis_prior_scale_anchor_high_ratio
+                ),
                 rms_guard_weight=(
                     args.trellis_prior_rms_guard_weight
                 ),
@@ -1483,7 +1492,12 @@ def train(args):
                 f"New measured-prior phase: start_step={global_step}, "
                 f"ratio_target={args.trellis_prior_ratio_target}, "
                 f"relative_warmup={args.trellis_prior_phase_warmup_steps}, "
-                f"guard_scale={args.trellis_prior_guard_scale}"
+                f"scale_anchor={args.trellis_prior_scale_anchor_weight} "
+                f"deadzone=[{args.trellis_prior_scale_anchor_low_ratio},"
+                f"{args.trellis_prior_scale_anchor_high_ratio}], "
+                f"scale_cap={args.trellis_prior_scale_ratio_max}, "
+                f"guard_scale={args.trellis_prior_guard_scale}, "
+                f"guard_cap={args.trellis_prior_guard_ratio_max}"
             )
         phase_eval_steps = parse_phase_eval_steps(args.trellis_prior_phase_eval_steps)
         accelerator.print(
