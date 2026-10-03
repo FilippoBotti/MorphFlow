@@ -5,11 +5,10 @@
 #SBATCH --qos=gpu_vbd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --nodelist=wn49
-#SBATCH --gres=gpu:l40s_vbd:6
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=256G
-#SBATCH --time=7-00:00:00
+#SBATCH --gres=gpu:rtx6000_vbd:4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=48:00:00
 #SBATCH --output=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/reports/threeway-%x-%j.out
 #SBATCH --error=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/reports/threeway-%x-%j.err
 
@@ -41,7 +40,7 @@ STEPS="${STEPS:-50}"
 SLAT_STEPS="${SLAT_STEPS:-50}"
 CFG_SCALE="${CFG_SCALE:-3.0}"
 SLAT_CFG_SCALE="${SLAT_CFG_SCALE:-3.0}"
-MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 
 TEXTURE_SIZE="${TEXTURE_SIZE:-1024}"
 SIMPLIFY="${SIMPLIFY:-0.95}"
@@ -77,7 +76,7 @@ if (( CPU_THREADS_PER_WORKER < 1 )); then CPU_THREADS_PER_WORKER=1; fi
 
 # Use compute-node-local temporary storage for TFSA spill and transient caches.
 # Never remove SLURM_TMPDIR itself; only our private subdirectory.
-NODE_LOCAL_PARENT="${SLURM_TMPDIR:-/tmp/${USER}/slurm-${SLURM_JOB_ID:-$$}}"
+NODE_LOCAL_PARENT="${NODE_LOCAL_PARENT:-/dev/shm/${USER}/slurm-${SLURM_JOB_ID:-$$}}"
 NODE_LOCAL_TMP_BASE="${NODE_LOCAL_TMP_BASE:-$NODE_LOCAL_PARENT/morph-benchmark-threeway}"
 mkdir -p "$NODE_LOCAL_TMP_BASE"
 cleanup_node_tmp() { rm -rf "$NODE_LOCAL_TMP_BASE" 2>/dev/null || true; }
@@ -107,8 +106,8 @@ SOURCE_IMAGES_NAME="${SOURCE_IMAGES_NAME:-flux_outputs}"
 METADATA="${METADATA:-metadata_test.json}"
 SOURCE_IMAGE_FILENAME="${SOURCE_IMAGE_FILENAME:-}"
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/v3_ss_tangentScaleAnchor_r030_s020_g025_ep14/checkpoints/morphflow_last.pt}"
-SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/v3_slat_lora_cross_r32_tokenGate_semMatch_T0p01_align0p10_hub_w0p01_cap4_lr5e-5_noAlphaEmb/checkpoints/morphflow_best.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:?Set CHECKPOINT_PATH=/absolute/path/to/ss_checkpoint.pt}"
+SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:?Set SLAT_CHECKPOINT_PATH=/absolute/path/to/slat_checkpoint.pt}"
 
 RUN_NAME="${RUN_NAME:-threeway_uniform_n${N}_k${K}_seed${SEED}_v${NUM_VIEWS}}"
 RUN_ROOT="$BENCH_ROOT/threeway-runs/$RUN_NAME"
@@ -320,6 +319,7 @@ run_sharded() {
     echo "GPU_TOKENS=${GPU_TOKENS[*]}"
     echo "CPU_THREADS_PER_WORKER=$CPU_THREADS_PER_WORKER"
     echo "NODE_LOCAL_TMP_BASE=$NODE_LOCAL_TMP_BASE"
+    echo "HOST_SHM=$(df -h /dev/shm 2>/dev/null | tail -n 1 || true)"
     echo "MORPHANY_TFSA_CACHE_MODE=$MORPHANY_TFSA_CACHE_MODE"
     echo "MORPHANY_TFSA_RAM_GB_PER_WORKER=$MORPHANY_TFSA_RAM_GB_PER_WORKER"
     echo "MORPHANY_TFSA_MIN_NODE_FREE_GB=$MORPHANY_TFSA_MIN_NODE_FREE_GB"

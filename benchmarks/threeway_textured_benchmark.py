@@ -699,6 +699,62 @@ def morphany_cache_ready(path: Path) -> bool:
     return all((path / name).is_file() for name in ("coords_zs_init.pt", "slat_init.pt", "coords.pt"))
 
 
+def directory_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            try:
+                total += int(item.stat().st_size)
+            except OSError:
+                pass
+    return total
+
+
+def prune_morphany_file_cache(path: Path, keep_morphing_idx: int) -> int:
+    """Keep only the upstream MorphAny3D TFSA state needed by the next alpha.
+
+    The official implementation stores SS/SLat TFSA tensors as files whose names
+    contain ``morphing<idx>``.  After alpha i has finished, only morphing i is
+    required by alpha i+1, so older states can be deleted without changing the
+    algorithm.  Returns the number of bytes removed.
+    """
+    removed = 0
+    keep = int(keep_morphing_idx)
+    if not path.exists():
+        return 0
+    for item in list(path.glob("*morphing*.pt")):
+        match = re.search(r"morphing(\d+)", item.name)
+        if match is None or int(match.group(1)) == keep:
+            continue
+        try:
+            size = int(item.stat().st_size)
+        except OSError:
+            size = 0
+        try:
+            item.unlink()
+            removed += size
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def copy_directory_files(src: Path, dst: Path) -> int:
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for item in src.iterdir():
+        if not item.is_file():
+            continue
+        target = dst / item.name
+        shutil.copy2(item, target)
+        try:
+            copied += int(target.stat().st_size)
+        except OSError:
+            pass
+    return copied
+
+
 def command_morphany3d(args: argparse.Namespace) -> None:
     import torch
     from PIL import Image
@@ -855,9 +911,20 @@ def command_morphany3d(args: argparse.Namespace) -> None:
             work_dir.mkdir(parents=True, exist_ok=True)
             cache_prep_seconds = time.perf_counter() - prep_start
 
-            if args.tfsa_cache_mode == "hybrid":
-                spill_dir = (local_pair / "tfsa-spill") if local_pair is not None else (work_dir / "tfsa-spill")
-                tfsa_cache = HybridTFSACache(int(args.tfsa_ram_gb * (1024 ** 3)), spill_dir)
+            # Upstream MorphAny3D uses torch.save/torch.load directly for TFSA.
+            # Keep those exact file semantics, but place the working set on the
+            # node tmpfs (/runtime-tmp -> host /dev/shm) and prune obsolete alpha
+            # states after every step.  If the retained state exceeds the RAM
+            # budget or node MemAvailable crosses the guard threshold, migrate
+            # the retained state to shared scratch and continue there.
+            tfsa_cache = None  # kept for compatibility with older timing schema
+            active_work_dir = work_dir
+            scratch_work_dir = cache_root / pair["pair_dir"] / "work_fallback"
+            using_ram_file_cache = local_pair is not None
+            tfsa_peak_ram_bytes = 0
+            tfsa_peak_spill_bytes = 0
+            tfsa_spill_written_bytes = 0
+            tfsa_pruned_bytes = 0
 
             for step_idx, alpha in enumerate(plan["alphas"]):
                 step_out = pair_out / alpha_dir(alpha)
@@ -871,7 +938,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                     "morphing_num": int(plan["k_intermediate"]) + 2,
                     "src_load_cache_path": str(load_src_cache),
                     "tar_load_cache_path": str(load_tar_cache),
-                    "save_cache_path": str(work_dir),
+                    "save_cache_path": str(active_work_dir),
                     "init_morphing_flag": False,
                     "ss_mca_flag": True,
                     "slat_mca_flag": True,
@@ -883,9 +950,6 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                     "tfsa_cache_idx": int(step_idx),
                     "tfsa_alpha": 0.8,
                 }
-                if tfsa_cache is not None:
-                    params["tfsa_cache"] = tfsa_cache
-
                 available = node_mem_available_bytes()
                 if available:
                     if min_node_available == 0:
@@ -893,17 +957,23 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                     else:
                         min_node_available = min(min_node_available, available)
                 if (
-                    tfsa_cache is not None
-                    and tfsa_cache.max_ram_bytes > 0
+                    using_ram_file_cache
                     and available > 0
                     and available < int(args.tfsa_min_node_free_gb * (1024 ** 3))
                 ):
-                    tfsa_cache.spill_all_ram()
-                    tfsa_cache.max_ram_bytes = 0
+                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.rmtree(scratch_work_dir, ignore_errors=True)
+                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
+                    tfsa_spill_written_bytes += copy_directory_files(active_work_dir, scratch_work_dir)
+                    shutil.rmtree(active_work_dir, ignore_errors=True)
+                    active_work_dir = scratch_work_dir
+                    params["save_cache_path"] = str(active_work_dir)
+                    using_ram_file_cache = False
                     pressure_relief_triggered = True
                     log(
-                        f"[MorphAny3D] pair={pair_id:04d} RAM pressure guard triggered: "
-                        f"MemAvailable={gib(available):.2f} GiB; TFSA cache switched to local spill for this pair",
+                        f"[MorphAny3D] pair={pair_id:04d} RAM pressure guard triggered before step "
+                        f"{step_idx + 1}: MemAvailable={gib(available):.2f} GiB; "
+                        "TFSA file cache migrated to shared scratch",
                         run_root,
                     )
 
@@ -962,18 +1032,43 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
                 del outputs, mesh
 
-                if tfsa_cache is not None:
-                    tfsa_cache.prune_to_morphing_idx(step_idx + 1, promote=tfsa_cache.max_ram_bytes > 0)
-                    stats = tfsa_cache.stats()
+                tfsa_pruned_bytes += prune_morphany_file_cache(active_work_dir, step_idx + 1)
+                retained_bytes = directory_size_bytes(active_work_dir)
+                if using_ram_file_cache:
+                    tfsa_peak_ram_bytes = max(tfsa_peak_ram_bytes, retained_bytes)
                 else:
-                    stats = {
-                        "ram_gib": 0.0,
-                        "peak_ram_gib": 0.0,
-                        "spill_gib": 0.0,
-                        "peak_spill_gib": 0.0,
-                        "spill_written_gib": 0.0,
-                        "spill_read_gib": 0.0,
-                    }
+                    tfsa_peak_spill_bytes = max(tfsa_peak_spill_bytes, retained_bytes)
+
+                # A retained state larger than the configured per-worker RAM budget
+                # is migrated after the step. During a step both previous and current
+                # state may transiently coexist, so the true tmpfs peak can be up to
+                # roughly 2x the retained-state size.
+                ram_budget = int(args.tfsa_ram_gb * (1024 ** 3))
+                if using_ram_file_cache and ram_budget > 0 and retained_bytes > ram_budget:
+                    shutil.rmtree(scratch_work_dir, ignore_errors=True)
+                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
+                    tfsa_spill_written_bytes += copy_directory_files(active_work_dir, scratch_work_dir)
+                    shutil.rmtree(active_work_dir, ignore_errors=True)
+                    active_work_dir = scratch_work_dir
+                    using_ram_file_cache = False
+                    pressure_relief_triggered = True
+                    retained_bytes = directory_size_bytes(active_work_dir)
+                    tfsa_peak_spill_bytes = max(tfsa_peak_spill_bytes, retained_bytes)
+                    log(
+                        f"[MorphAny3D] pair={pair_id:04d} TFSA retained state "
+                        f"{gib(retained_bytes):.2f} GiB exceeded per-worker RAM budget "
+                        f"{args.tfsa_ram_gb:.2f} GiB; migrated to shared scratch",
+                        run_root,
+                    )
+
+                stats = {
+                    "ram_gib": gib(retained_bytes) if using_ram_file_cache else 0.0,
+                    "peak_ram_gib": gib(tfsa_peak_ram_bytes),
+                    "spill_gib": 0.0 if using_ram_file_cache else gib(retained_bytes),
+                    "peak_spill_gib": gib(tfsa_peak_spill_bytes),
+                    "spill_written_gib": gib(tfsa_spill_written_bytes),
+                    "spill_read_gib": 0.0,
+                }
                 rss = process_rss_bytes()
                 peak_rss = max(peak_rss, rss)
                 available = node_mem_available_bytes()
@@ -989,11 +1084,12 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
             cuda_sync()
             sequence_end_to_end_seconds = time.perf_counter() - pair_wall_start
-            cache_stats = tfsa_cache.stats() if tfsa_cache is not None else {
-                "peak_ram_gib": 0.0,
-                "peak_spill_gib": 0.0,
-                "spill_written_gib": 0.0,
+            cache_stats = {
+                "peak_ram_gib": gib(tfsa_peak_ram_bytes),
+                "peak_spill_gib": gib(tfsa_peak_spill_bytes),
+                "spill_written_gib": gib(tfsa_spill_written_bytes),
                 "spill_read_gib": 0.0,
+                "pruned_gib": gib(tfsa_pruned_bytes),
             }
             timing_valid = steps_generated == int(plan["k_intermediate"]) and steps_skipped_output == 0
             append_timing(
@@ -1021,6 +1117,8 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                     "tfsa_peak_spill_gib": float(cache_stats.get("peak_spill_gib", 0.0)),
                     "tfsa_spill_written_gib": float(cache_stats.get("spill_written_gib", 0.0)),
                     "tfsa_spill_read_gib": float(cache_stats.get("spill_read_gib", 0.0)),
+                    "tfsa_pruned_gib": float(cache_stats.get("pruned_gib", 0.0)),
+                    "tfsa_backend": "tmpfs_files" if not pressure_relief_triggered else "tmpfs_then_scratch_files",
                     "process_peak_rss_gib": gib(peak_rss),
                     "node_min_mem_available_gib": gib(min_node_available),
                     "ram_pressure_guard_triggered": bool(pressure_relief_triggered),
@@ -1036,10 +1134,12 @@ def command_morphany3d(args: argparse.Namespace) -> None:
         finally:
             pipeline.preprocess_image = original_preprocess
             pipeline.get_cond = original_get_cond
-            if tfsa_cache is not None:
-                tfsa_cache.clear()
             if local_pair is not None:
                 shutil.rmtree(local_pair, ignore_errors=True)
+            try:
+                shutil.rmtree(cache_root / pair["pair_dir"] / "work_fallback", ignore_errors=True)
+            except Exception:
+                pass
             del src_cond_cached, tar_cond_cached, src_pre, tar_pre, src_img, tar_img
             torch.cuda.empty_cache()
 
