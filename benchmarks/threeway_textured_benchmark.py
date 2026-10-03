@@ -9,7 +9,7 @@ Design goals
 * K intermediate states per pair;
 * generation saves raw TRELLIS meshes first;
 * ONE common TRELLIS texture-baking path converts every raw mesh to a textured GLB;
-* existing eval_perceptual_sequence.py evaluates final textured GLBs (materials mode);
+* eval_textured_benchmark.py wraps eval_perceptual_sequence.py and adds full-path metrics + FID;
 * resumable outputs and append-only progress log.
 
 This script intentionally has several modes because the three methods live in
@@ -122,6 +122,26 @@ def load_plan(run_root: Path) -> Dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing plan: {path}")
     return read_json(path)
+
+
+def shard_pairs(plan: Mapping[str, Any], shard_index: int, num_shards: int) -> List[Dict[str, Any]]:
+    if num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"--shard-index must be in [0, {num_shards - 1}]")
+    return [
+        dict(pair)
+        for pair in plan["pairs"]
+        if int(pair["pair_id"]) % int(num_shards) == int(shard_index)
+    ]
+
+
+def shard_tag(args: argparse.Namespace) -> str:
+    return f"shard_{int(args.shard_index):02d}_of_{int(args.num_shards):02d}"
+
+
+def shard_jsonl(run_root: Path, args: argparse.Namespace) -> Path:
+    return run_root / f"generation_{shard_tag(args)}.jsonl"
 
 
 def save_raw_mesh(mesh: Any, path: Path, metadata: Optional[Mapping[str, Any]] = None) -> None:
@@ -243,9 +263,9 @@ def command_plan(args: argparse.Namespace) -> None:
 def command_morphflow(args: argparse.Namespace) -> None:
     import torch
 
-    # Benchmark = inference only. Important: sample_ss() itself is not
-    # decorated with torch.no_grad(), so without this it retains autograd
-    # graphs across the iterative flow sampling steps.
+    # This benchmark is inference-only. sample_ss() is not decorated with
+    # torch.no_grad() upstream, so disable autograd globally to avoid retaining
+    # the iterative SS sampling graph and exhausting VRAM.
     torch.set_grad_enabled(False)
 
     from data.morph_dataset import MorphingDistillDataset
@@ -266,6 +286,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
 
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    pairs = shard_pairs(plan, args.shard_index, args.num_shards)
     device = torch.device("cuda")
 
     ss_ckpt = load_checkpoint(args.checkpoint_path)
@@ -305,15 +326,15 @@ def command_morphflow(args: argparse.Namespace) -> None:
     log(
         "MorphFlow generation start | "
         f"ss_arch={checkpoint_args(ss_ckpt).get('ss_flow_arch', 'standard')} | "
-        f"pairs={plan['num_pairs']} | K={plan['k_intermediate']}",
+        f"pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}",
         run_root,
     )
 
-    for pidx, pair in enumerate(plan["pairs"]):
+    for pidx, pair in enumerate(pairs):
         pair_id = int(pair["pair_id"])
         pair_out = method_root / pair["pair_dir"]
         pair_out.mkdir(parents=True, exist_ok=True)
-        log(f"[MorphFlow] pair {pidx + 1}/{plan['num_pairs']} {pair['src1']} -> {pair['src2']}", run_root)
+        log(f"[MorphFlow {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} {pair['src1']} -> {pair['src2']}", run_root)
 
         entry = dataset.metadata[int(pair["metadata_index"])]
         src1 = load_asset(Path(args.data_root), pair["src1"])
@@ -331,7 +352,6 @@ def command_morphflow(args: argparse.Namespace) -> None:
             save_raw_mesh(mesh, src1_raw, {"kind": "reference", "asset": pair["src1"]})
             del mesh
             torch.cuda.empty_cache()
-
         if not src2_raw.exists():
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src2["feats"], src2["coords"], device)
             save_raw_mesh(mesh, src2_raw, {"kind": "reference", "asset": pair["src2"]})
@@ -386,15 +406,16 @@ def command_morphflow(args: argparse.Namespace) -> None:
                     "slat_seed": slat_seed,
                 },
             )
-            append_jsonl(run_root / "generation.jsonl", {"method": "morphflow", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
+            append_jsonl(shard_jsonl(run_root, args), {"method": "morphflow", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
             log(f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
             del pred_ss, pred_coords, pred_slat, mesh, batch
             torch.cuda.empty_cache()
 
+        del src1, src2, template_ss
         torch.cuda.empty_cache()
 
-    write_json(method_root / "generation_status.json", {"status": "complete", "finished_utc": utc_now()})
-    log("MorphFlow generation complete", run_root)
+    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
+    log(f"MorphFlow generation complete | {shard_tag(args)}", run_root)
 
 
 def morphany_cache_ready(path: Path) -> bool:
@@ -408,6 +429,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    pairs = shard_pairs(plan, args.shard_index, args.num_shards)
     method_root = run_root / "morphany3d"
     cache_root = run_root / "method_cache" / "morphany3d"
     method_root.mkdir(parents=True, exist_ok=True)
@@ -415,9 +437,9 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
-    log(f"MorphAny3D generation start | pairs={plan['num_pairs']} | K={plan['k_intermediate']}", run_root)
+    log(f"MorphAny3D generation start | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
 
-    for pidx, pair in enumerate(plan["pairs"]):
+    for pidx, pair in enumerate(pairs):
         pair_id = int(pair["pair_id"])
         pseed = int(pair["pair_seed"])
         pair_out = method_root / pair["pair_dir"]
@@ -432,7 +454,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
         with Image.open(pair["src2_image"]) as im:
             tar_img = im.copy()
 
-        log(f"[MorphAny3D] pair {pidx + 1}/{plan['num_pairs']} {pair['src1']} -> {pair['src2']}", run_root)
+        log(f"[MorphAny3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} {pair['src1']} -> {pair['src2']}", run_root)
 
         base_params = {
             "init_morphing_flag": False,
@@ -487,14 +509,14 @@ def command_morphany3d(args: argparse.Namespace) -> None:
             )
             mesh = outputs["mesh"][0]
             save_raw_mesh(mesh, raw_path, {"method": "morphany3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed})
-            append_jsonl(run_root / "generation.jsonl", {"method": "morphany3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
+            append_jsonl(shard_jsonl(run_root, args), {"method": "morphany3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
             log(f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
             del outputs, mesh
 
         torch.cuda.empty_cache()
 
-    write_json(method_root / "generation_status.json", {"status": "complete", "finished_utc": utc_now()})
-    log("MorphAny3D generation complete", run_root)
+    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
+    log(f"MorphAny3D generation complete | {shard_tag(args)}", run_root)
 
 
 def command_interp3d(args: argparse.Namespace) -> None:
@@ -505,6 +527,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
 
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    pairs = shard_pairs(plan, args.shard_index, args.num_shards)
     method_root = run_root / "interp3d"
     method_root.mkdir(parents=True, exist_ok=True)
 
@@ -517,9 +540,9 @@ def command_interp3d(args: argparse.Namespace) -> None:
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
-    log(f"Interp3D generation start | uniform schedule | pairs={plan['num_pairs']} | K={plan['k_intermediate']}", run_root)
+    log(f"Interp3D generation start | uniform schedule | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
 
-    for pidx, pair in enumerate(plan["pairs"]):
+    for pidx, pair in enumerate(pairs):
         pair_id = int(pair["pair_id"])
         pseed = int(pair["pair_seed"])
         pair_out = method_root / pair["pair_dir"]
@@ -527,7 +550,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
 
         all_exist = all((pair_out / alpha_dir(a) / "mesh_raw.pt").is_file() for a in plan["alphas"])
         if all_exist and not args.overwrite:
-            log(f"[Interp3D] pair {pidx + 1}/{plan['num_pairs']} skip complete pair", run_root)
+            log(f"[Interp3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} skip complete pair", run_root)
             continue
 
         with Image.open(pair["src1_image"]) as im:
@@ -535,7 +558,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
         with Image.open(pair["src2_image"]) as im:
             tar_img = im.copy()
 
-        log(f"[Interp3D] pair {pidx + 1}/{plan['num_pairs']} {pair['src1']} -> {pair['src2']}", run_root)
+        log(f"[Interp3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} {pair['src1']} -> {pair['src2']}", run_root)
         seed_everything(pseed)
         outputs, _ = pipeline.run_interpolation_morphing(
             src_img,
@@ -560,14 +583,14 @@ def command_interp3d(args: argparse.Namespace) -> None:
                 continue
             mesh = item["mesh"][0]
             save_raw_mesh(mesh, raw_path, {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed})
-            append_jsonl(run_root / "generation.jsonl", {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
+            append_jsonl(shard_jsonl(run_root, args), {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
             log(f"[Interp3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
 
         del outputs, middle
         torch.cuda.empty_cache()
 
-    write_json(method_root / "generation_status.json", {"status": "complete", "finished_utc": utc_now(), "schedule": "uniform"})
-    log("Interp3D generation complete", run_root)
+    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "schedule": "uniform", "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
+    log(f"Interp3D generation complete | {shard_tag(args)}", run_root)
 
 
 def load_raw_as_trellis_mesh(path: Path, device: str = "cuda") -> Any:
@@ -615,6 +638,10 @@ def texture_one(raw_path: Path, glb_path: Path, args: argparse.Namespace, run_ro
     )
     textured.export(glb_path)
     log(f"[TEXTURE] done  {label} -> {glb_path}", run_root)
+    # to_glb keeps several large CUDA buffers alive through local references.
+    # Release them immediately so thousands of GLBs can be baked in one process.
+    del textured, mesh
+    torch.cuda.empty_cache()
 
 
 def command_texture(args: argparse.Namespace) -> None:
@@ -623,15 +650,16 @@ def command_texture(args: argparse.Namespace) -> None:
 
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    pairs = shard_pairs(plan, args.shard_index, args.num_shards)
     refs_raw = run_root / "references_raw"
     refs_glb = run_root / "references_textured"
     refs_glb.mkdir(parents=True, exist_ok=True)
 
-    total = int(plan["num_pairs"]) * (2 + len(METHODS) * int(plan["k_intermediate"]))
+    total = len(pairs) * (2 + len(METHODS) * int(plan["k_intermediate"]))
     done = 0
-    log(f"Common texture-baking start | expected GLBs={total} | texture={args.texture_size}px | simplify={args.simplify}", run_root)
+    log(f"Common texture-baking start | {shard_tag(args)} | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | expected GLBs={total} | texture={args.texture_size}px | simplify={args.simplify}", run_root)
 
-    for pair in plan["pairs"]:
+    for pair in pairs:
         pair_ref_raw = refs_raw / pair["pair_dir"]
         pair_ref_glb = refs_glb / pair["pair_dir"]
         src1_glb = pair_ref_glb / "src1.glb"
@@ -689,9 +717,12 @@ def command_texture(args: argparse.Namespace) -> None:
             log(f"[TEXTURE] manifests ready {method} pair={pair['pair_id']:04d} | progress={done}/{total}", run_root)
 
     write_json(
-        run_root / "texture_status.json",
+        run_root / f"texture_status_{shard_tag(args)}.json",
         {
             "status": "complete",
+            "shard_index": int(args.shard_index),
+            "num_shards": int(args.num_shards),
+            "pairs": len(pairs),
             "finished_utc": utc_now(),
             "texture_size": args.texture_size,
             "simplify": args.simplify,
@@ -700,7 +731,35 @@ def command_texture(args: argparse.Namespace) -> None:
         },
     )
     torch.cuda.empty_cache()
-    log("Common texture-baking complete", run_root)
+    log(f"Common texture-baking complete | {shard_tag(args)}", run_root)
+
+
+def command_texture_status(args: argparse.Namespace) -> None:
+    run_root = Path(args.run_root).resolve()
+    plan = load_plan(run_root)
+    missing: List[str] = []
+    for pair in plan["pairs"]:
+        ref = run_root / "references_textured" / pair["pair_dir"]
+        for name in ("src1.glb", "src2.glb"):
+            if not (ref / name).is_file():
+                missing.append(str(ref / name))
+        for method in METHODS:
+            pair_root = run_root / method / pair["pair_dir"]
+            for alpha in plan["alphas"]:
+                path = pair_root / alpha_dir(alpha) / "pred_final.glb"
+                if not path.is_file():
+                    missing.append(str(path))
+    if missing:
+        sample = "\n".join(missing[:20])
+        raise FileNotFoundError(f"Texture phase incomplete: {len(missing)} GLBs missing. First entries:\n{sample}")
+    write_json(run_root / "texture_status.json", {
+        "status": "complete",
+        "finished_utc": utc_now(),
+        "num_pairs": int(plan["num_pairs"]),
+        "k_intermediate": int(plan["k_intermediate"]),
+        "appearance_source": "MeshExtractResult.vertex_attrs -> common TRELLIS to_glb(mesh, mesh)",
+    })
+    log("Texture completeness check passed", run_root)
 
 
 def command_aggregate(args: argparse.Namespace) -> None:
@@ -713,17 +772,26 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "num_pairs": plan["num_pairs"],
         "k_intermediate": plan["k_intermediate"],
         "alphas": plan["alphas"],
-        "metric_source": "eval_perceptual_sequence.py rendered from final textured GLBs with appearance=materials",
+        "metric_source": "eval_textured_benchmark.py over final textured GLBs; common uniform alpha schedule; appearance=materials",
         "methods": {},
     }
     rows: List[Dict[str, Any]] = []
     headline = (
+        # Paper-style full trajectory, INCLUDING src1/src2 endpoints.
+        "lpips_adjacent_full_mean",
+        "ppl_full_sum",
+        "ppl_full_normalized_reference_endpoints",
+        "pdv_full",
+        # Endpoint-aware diagnostics retained from the original benchmark.
+        "endpoint_fidelity_lpips_mean",
+        "ppl_reference_anchored",
+        # Interp3D-style endpoint-manifold FID.
+        "fid_endpoint_manifold",
+        # Original internal-only diagnostics retained for completeness.
         "lpips_adjacent_mean",
         "ppl_sum",
         "ppl_normalized_reference_endpoints",
         "pdv",
-        "endpoint_fidelity_lpips_mean",
-        "ppl_reference_anchored",
     )
 
     for method in METHODS:
@@ -761,6 +829,8 @@ def build_parser() -> argparse.ArgumentParser:
     def common_run(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--run-root", required=True)
         sp.add_argument("--overwrite", action="store_true")
+        sp.add_argument("--shard-index", type=int, default=0)
+        sp.add_argument("--num-shards", type=int, default=1)
 
     plan = sub.add_parser("plan")
     common_run(plan)
@@ -800,6 +870,9 @@ def build_parser() -> argparse.ArgumentParser:
     tx.add_argument("--fill-holes", type=int, choices=[0, 1], default=1)
     tx.add_argument("--texture-verbose", type=int, choices=[0, 1], default=0)
 
+    ts = sub.add_parser("texture-status")
+    common_run(ts)
+
     ag = sub.add_parser("aggregate")
     common_run(ag)
     return p
@@ -818,6 +891,8 @@ def main() -> None:
         command_interp3d(args)
     elif command == "texture":
         command_texture(args)
+    elif command == "texture-status":
+        command_texture_status(args)
     elif command == "aggregate":
         command_aggregate(args)
     else:
