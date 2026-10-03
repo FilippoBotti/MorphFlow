@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=threeway_tex
 #SBATCH --account=g_vbd
-#SBATCH --partition=gpu_guest
-#SBATCH --qos=gpu_guest
+#SBATCH --partition=gpu_vbd
+#SBATCH --qos=gpu_vbd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --nodelist=wn50
-#SBATCH --gres=gpu:l40s_fisstat:1
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:rtx6000_vbd:1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=96G
 #SBATCH --time=08:00:00
 #SBATCH --output=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/reports/threeway-%x-%j.out
@@ -30,7 +29,7 @@ module load singularity/3.8.7
 # -------------------------------
 # Fixed benchmark configuration
 # -------------------------------
-N="${N:-5}"
+N="${N:-100}"
 K="${K:-10}"
 SEED="${SEED:-42}"
 
@@ -59,7 +58,6 @@ ORIGINAL_ENV="${ORIGINAL_ENV:-$TRELLIS_BASE/env}"
 BENCH_ROOT="${BENCH_ROOT:-/hpc/scratch/marco.barezzi/morph-benchmark}"
 BENCH_ARCHIVE="${BENCH_ARCHIVE:-/hpc/archive/G_VBD/marco.barezzi/morph-benchmark}"
 SHARED_CACHE="${SHARED_CACHE:-$BENCH_ROOT/shared-cache}"
-TOOLCHAIN_ROOT_HOST="${TOOLCHAIN_ROOT_HOST:-$BENCH_ROOT/morphany3d/toolchain/cuda118-gcc11}"
 
 MORPHANY_ENV="${MORPHANY_ENV:-$BENCH_ROOT/morphany3d/env}"
 MORPHANY_REPO="${MORPHANY_REPO:-$BENCH_ROOT/morphany3d/work/MorphAny3D}"
@@ -73,8 +71,8 @@ METADATA="${METADATA:-metadata_test.json}"
 SOURCE_IMAGE_FILENAME="${SOURCE_IMAGE_FILENAME:-}"
 
 # Required MorphFlow checkpoints.
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/v3_ss_tangentScaleAnchor_r030_s020_g025_ep14/checkpoints/morphflow_last.pt}"
-SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:-/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/v3_slat_lora_cross_r32_tokenGate_semMatch_T0p01_align0p10_hub_w0p01_cap4_lr5e-5_noAlphaEmb/checkpoints/morphflow_best.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:?Set CHECKPOINT_PATH=/absolute/path/to/ss_checkpoint.pt}"
+SLAT_CHECKPOINT_PATH="${SLAT_CHECKPOINT_PATH:?Set SLAT_CHECKPOINT_PATH=/absolute/path/to/slat_checkpoint.pt}"
 
 RUN_NAME="${RUN_NAME:-threeway_test_n${N}_k${K}_seed${SEED}}"
 RUN_ROOT="$BENCH_ROOT/threeway-runs/$RUN_NAME"
@@ -132,8 +130,7 @@ for d in \
     "$DATA_PARENT/$SOURCE_IMAGES_NAME" \
     "$SHARED_CACHE/hf-home" \
     "$SHARED_CACHE/torch-home" \
-    "$SHARED_CACHE/u2net" \
-    "$TOOLCHAIN_ROOT_HOST"
+    "$SHARED_CACHE/u2net"
 do
     [[ -d "$d" ]] || { echo "ERROR: missing directory: $d" >&2; exit 1; }
 done
@@ -176,9 +173,6 @@ run_phase() {
     if [[ -n "$BLENDER_ROOT_HOST" ]]; then
         singularity exec --cleanenv --containall --no-mount hostfs --nv \
             --bind "$env_host:/opt/trellis/env:ro" \
-            --bind /usr/lib64:/host/usr/lib64:ro \
-            --bind /lib64:/host/lib64:ro \
-            --bind "$TOOLCHAIN_ROOT_HOST:/opt/trellis/toolchain/cuda118-gcc11:ro" \
             --bind "$PROJECT_DIR:/workspace/MorphFlow:ro" \
             --bind "$repo_host:/workspace/MethodRepo:ro" \
             --bind "$DATA_PARENT:/inputs:ro" \
@@ -202,17 +196,6 @@ export TMPDIR=/runtime-tmp
 export XDG_CACHE_HOME=/runtime-home/.cache
 export HF_HOME=/opt/trellis/hf-home
 export TORCH_HOME=/opt/trellis/torch-home
-export CUDA_HOME=/opt/trellis/toolchain/cuda118-gcc11
-export CUDACXX="$CUDA_HOME/bin/nvcc"
-export CC="$CUDA_HOME/bin/x86_64-conda-linux-gnu-gcc"
-export CXX="$CUDA_HOME/bin/x86_64-conda-linux-gnu-g++"
-export CUDAHOSTCXX="$CXX"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
-export TORCH_EXTENSIONS_DIR=/opt/trellis/torch-home/extensions/nvdiffrast-035
-export MAX_JOBS=4
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-mkdir -p "$TORCH_EXTENSIONS_DIR"
 export U2NET_HOME=/opt/trellis/u2net
 export ATTN_BACKEND=xformers
 export SPCONV_ALGO=native
@@ -226,9 +209,6 @@ IN_CONTAINER
     else
         singularity exec --cleanenv --containall --no-mount hostfs --nv \
             --bind "$env_host:/opt/trellis/env:ro" \
-            --bind /usr/lib64:/host/usr/lib64:ro \
-            --bind /lib64:/host/lib64:ro \
-            --bind "$TOOLCHAIN_ROOT_HOST:/opt/trellis/toolchain/cuda118-gcc11:ro" \
             --bind "$PROJECT_DIR:/workspace/MorphFlow:ro" \
             --bind "$repo_host:/workspace/MethodRepo:ro" \
             --bind "$DATA_PARENT:/inputs:ro" \
@@ -251,17 +231,6 @@ export TMPDIR=/runtime-tmp
 export XDG_CACHE_HOME=/runtime-home/.cache
 export HF_HOME=/opt/trellis/hf-home
 export TORCH_HOME=/opt/trellis/torch-home
-export CUDA_HOME=/opt/trellis/toolchain/cuda118-gcc11
-export CUDACXX="$CUDA_HOME/bin/nvcc"
-export CC="$CUDA_HOME/bin/x86_64-conda-linux-gnu-gcc"
-export CXX="$CUDA_HOME/bin/x86_64-conda-linux-gnu-g++"
-export CUDAHOSTCXX="$CXX"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
-export TORCH_EXTENSIONS_DIR=/opt/trellis/torch-home/extensions/nvdiffrast-035
-export MAX_JOBS=4
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-mkdir -p "$TORCH_EXTENSIONS_DIR"
 export U2NET_HOME=/opt/trellis/u2net
 export ATTN_BACKEND=xformers
 export SPCONV_ALGO=native
@@ -301,7 +270,7 @@ IN_CONTAINER
 # Only the MorphAny3D benchmark env needs these extra evaluation dependencies.
 # -------------------------------
 run_phase preflight "$MORPHANY_ENV" "$MORPHANY_REPO" \
-    python -c 'import torch; import nvdiffrast.torch as dr; import lpips; ctx=dr.RasterizeCudaContext(); print("preflight CUDA OK | torch", torch.__version__, "| cuda", torch.version.cuda, "| gpu", torch.cuda.get_device_name(0))'
+    python -c 'import torch; import nvdiffrast.torch; import lpips; print("preflight python OK | torch", torch.__version__, "| cuda", torch.version.cuda, "| gpu", torch.cuda.get_device_name(0))'
 
 run_phase blender_check "$MORPHANY_ENV" "$MORPHANY_REPO" \
     "$BLENDER_BIN_IN" --version

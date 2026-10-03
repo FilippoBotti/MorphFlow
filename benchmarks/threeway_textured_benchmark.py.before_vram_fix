@@ -154,8 +154,7 @@ def decode_slat_mesh(mesh_decoder: Any, sparse_tensor_cls: Any, feats: Any, coor
     coords = coords.clone()
     coords[:, 0] = 0
     sparse = sparse_tensor_cls(feats=feats, coords=coords)
-    with torch.no_grad():
-        return mesh_decoder(sparse)[0]
+    return mesh_decoder(sparse)[0]
 
 
 def command_plan(args: argparse.Namespace) -> None:
@@ -243,11 +242,6 @@ def command_plan(args: argparse.Namespace) -> None:
 def command_morphflow(args: argparse.Namespace) -> None:
     import torch
 
-    # Benchmark = inference only. Important: sample_ss() itself is not
-    # decorated with torch.no_grad(), so without this it retains autograd
-    # graphs across the iterative flow sampling steps.
-    torch.set_grad_enabled(False)
-
     from data.morph_dataset import MorphingDistillDataset
     from eval_validation_latents import (
         build_model,
@@ -329,14 +323,9 @@ def command_morphflow(args: argparse.Namespace) -> None:
         if not src1_raw.exists():
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src1["feats"], src1["coords"], device)
             save_raw_mesh(mesh, src1_raw, {"kind": "reference", "asset": pair["src1"]})
-            del mesh
-            torch.cuda.empty_cache()
-
         if not src2_raw.exists():
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src2["feats"], src2["coords"], device)
             save_raw_mesh(mesh, src2_raw, {"kind": "reference", "asset": pair["src2"]})
-            del mesh
-            torch.cuda.empty_cache()
 
         template_ss = torch.zeros_like(src1["ss_latent"])
         for step_idx, alpha in enumerate(plan["alphas"]):
@@ -389,7 +378,6 @@ def command_morphflow(args: argparse.Namespace) -> None:
             append_jsonl(run_root / "generation.jsonl", {"method": "morphflow", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
             log(f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
             del pred_ss, pred_coords, pred_slat, mesh, batch
-            torch.cuda.empty_cache()
 
         torch.cuda.empty_cache()
 
