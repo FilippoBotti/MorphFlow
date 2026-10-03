@@ -63,6 +63,25 @@ else
 fi
 NGPUS="${NGPUS:-${DETECTED_GPUS:-4}}"
 
+# MorphAny3D TFSA acceleration/safety. Each worker gets a hard CPU-RAM budget;
+# overflow is transparently spilled to node-local storage, never shared scratch.
+MORPHANY_TFSA_CACHE_MODE="${MORPHANY_TFSA_CACHE_MODE:-hybrid}"
+MORPHANY_TFSA_RAM_GB_PER_WORKER="${MORPHANY_TFSA_RAM_GB_PER_WORKER:-4}"
+MORPHANY_TFSA_MIN_NODE_FREE_GB="${MORPHANY_TFSA_MIN_NODE_FREE_GB:-20}"
+
+# Avoid CPU oversubscription with one Python process per GPU.
+SLURM_CPUS_EFFECTIVE="${SLURM_CPUS_PER_TASK:-16}"
+CPU_THREADS_PER_WORKER="${CPU_THREADS_PER_WORKER:-$(( SLURM_CPUS_EFFECTIVE / NGPUS ))}"
+if (( CPU_THREADS_PER_WORKER < 1 )); then CPU_THREADS_PER_WORKER=1; fi
+
+# Use compute-node-local temporary storage for TFSA spill and transient caches.
+# Never remove SLURM_TMPDIR itself; only our private subdirectory.
+NODE_LOCAL_PARENT="${SLURM_TMPDIR:-/tmp/${USER}/slurm-${SLURM_JOB_ID:-$$}}"
+NODE_LOCAL_TMP_BASE="${NODE_LOCAL_TMP_BASE:-$NODE_LOCAL_PARENT/morph-benchmark-threeway}"
+mkdir -p "$NODE_LOCAL_TMP_BASE"
+cleanup_node_tmp() { rm -rf "$NODE_LOCAL_TMP_BASE" 2>/dev/null || true; }
+trap cleanup_node_tmp EXIT
+
 # -------------------------------
 # Host paths
 # -------------------------------
@@ -183,7 +202,7 @@ run_phase() {
     shift 4
 
     local phase_home="$RUN_ROOT/runtime-home/$phase"
-    local phase_tmp="$RUN_ROOT/tmp/$phase"
+    local phase_tmp="$NODE_LOCAL_TMP_BASE/$phase"
     mkdir -p "$phase_home" "$phase_tmp"
 
     if [[ "$gpu_token" != "cpu" ]]; then
@@ -191,6 +210,10 @@ run_phase() {
     else
         unset SINGULARITYENV_CUDA_VISIBLE_DEVICES || true
     fi
+    export SINGULARITYENV_OMP_NUM_THREADS="$CPU_THREADS_PER_WORKER"
+    export SINGULARITYENV_MKL_NUM_THREADS="$CPU_THREADS_PER_WORKER"
+    export SINGULARITYENV_OPENBLAS_NUM_THREADS="$CPU_THREADS_PER_WORKER"
+    export SINGULARITYENV_NUMEXPR_NUM_THREADS="$CPU_THREADS_PER_WORKER"
 
     singularity exec --cleanenv --containall --no-mount hostfs --nv \
         --bind "$env_host:/opt/trellis/env:ro" \
@@ -294,6 +317,11 @@ run_sharded() {
     echo "SEED=$SEED"
     echo "NGPUS=$NGPUS"
     echo "GPU_TOKENS=${GPU_TOKENS[*]}"
+    echo "CPU_THREADS_PER_WORKER=$CPU_THREADS_PER_WORKER"
+    echo "NODE_LOCAL_TMP_BASE=$NODE_LOCAL_TMP_BASE"
+    echo "MORPHANY_TFSA_CACHE_MODE=$MORPHANY_TFSA_CACHE_MODE"
+    echo "MORPHANY_TFSA_RAM_GB_PER_WORKER=$MORPHANY_TFSA_RAM_GB_PER_WORKER"
+    echo "MORPHANY_TFSA_MIN_NODE_FREE_GB=$MORPHANY_TFSA_MIN_NODE_FREE_GB"
     echo "SCHEDULE=uniform_shared_all_methods"
     echo "TEXTURE_SIZE=$TEXTURE_SIZE"
     echo "NUM_VIEWS=$NUM_VIEWS"
@@ -357,7 +385,12 @@ run_sharded morphflow "$ORIGINAL_ENV" "$TRELLIS_REPO_HOST" \
         --trellis-model image_large
 
 run_sharded morphany3d "$MORPHANY_ENV" "$MORPHANY_REPO" \
-    python "$SCRIPT_IN" morphany3d --run-root /benchmark
+    python "$SCRIPT_IN" morphany3d \
+        --run-root /benchmark \
+        --tfsa-cache-mode "$MORPHANY_TFSA_CACHE_MODE" \
+        --tfsa-ram-gb "$MORPHANY_TFSA_RAM_GB_PER_WORKER" \
+        --tfsa-min-node-free-gb "$MORPHANY_TFSA_MIN_NODE_FREE_GB" \
+        --local-cache-root /runtime-tmp/morphany-local
 
 run_sharded interp3d "$INTERP_ENV" "$INTERP_REPO" \
     python "$SCRIPT_IN" interp3d --run-root /benchmark
@@ -416,6 +449,8 @@ cp -f "$RUN_ROOT/plan.json" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/progress.log" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/final_metrics.json" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/final_metrics.csv" "$FINAL_ARCHIVE/"
+cp -f "$RUN_ROOT/generation_timings.json" "$FINAL_ARCHIVE/"
+cp -f "$RUN_ROOT/generation_timings.csv" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/texture_status.json" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/threeway_textured_benchmark.py" "$FINAL_ARCHIVE/"
 cp -f "$RUN_ROOT/eval_textured_benchmark.py" "$FINAL_ARCHIVE/"

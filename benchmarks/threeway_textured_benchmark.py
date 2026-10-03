@@ -73,6 +73,215 @@ def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
         handle.write(json.dumps(dict(payload)) + "\n")
 
 
+def object_nbytes(obj: Any) -> int:
+    """Best-effort tensor payload size without counting Python/container overhead."""
+    try:
+        import torch
+    except Exception:
+        torch = None
+    if torch is not None and torch.is_tensor(obj):
+        return int(obj.numel() * obj.element_size())
+    if isinstance(obj, Mapping):
+        return sum(object_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(object_nbytes(v) for v in obj)
+    return 0
+
+
+def process_rss_bytes() -> int:
+    """Linux RSS from /proc; zero on non-Linux/failure."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def node_mem_available_bytes() -> int:
+    """Linux MemAvailable from /proc; zero on failure."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def gib(value: int | float) -> float:
+    return float(value) / float(1024 ** 3)
+
+
+def cuda_sync() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def torch_load_cpu(path: Path) -> Any:
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+class HybridTFSACache:
+    """Bounded CPU-RAM cache with transparent spill to node-local storage.
+
+    MorphAny3D's attention modules only require mapping-style ``in``, assignment,
+    and ``get``.  Keeping this object alive across alpha steps avoids the
+    thousands of shared-filesystem torch.save/torch.load operations performed by
+    the upstream disk cache.  Only the immediately preceding morph state is kept
+    after each alpha, because TFSA never needs anything older.
+    """
+
+    def __init__(self, max_ram_bytes: int, spill_dir: Path):
+        self.max_ram_bytes = max(0, int(max_ram_bytes))
+        self.spill_dir = Path(spill_dir)
+        self.spill_dir.mkdir(parents=True, exist_ok=True)
+        self._ram: Dict[Any, Any] = {}
+        self._ram_sizes: Dict[Any, int] = {}
+        self._spill: Dict[Any, Tuple[Path, int]] = {}
+        self.ram_bytes = 0
+        self.spill_bytes = 0
+        self.peak_ram_bytes = 0
+        self.peak_spill_bytes = 0
+        self.spill_bytes_written = 0
+        self.spill_bytes_read = 0
+        self._serial = 0
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._ram or key in self._spill
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            return
+        size = object_nbytes(value)
+        if self.max_ram_bytes > 0 and self.ram_bytes + size <= self.max_ram_bytes:
+            self._ram[key] = value
+            self._ram_sizes[key] = size
+            self.ram_bytes += size
+            self.peak_ram_bytes = max(self.peak_ram_bytes, self.ram_bytes)
+            return
+        self._spill_value(key, value, size)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self._ram:
+            return self._ram[key]
+        item = self._spill.get(key)
+        if item is None:
+            return default
+        path, _size = item
+        try:
+            on_disk = int(path.stat().st_size)
+        except OSError:
+            on_disk = 0
+        value = torch_load_cpu(path)
+        self.spill_bytes_read += on_disk
+        return value
+
+    def _spill_value(self, key: Any, value: Any, logical_size: Optional[int] = None) -> None:
+        import torch
+        self._serial += 1
+        path = self.spill_dir / f"tfsa_{self._serial:08d}.pt"
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        torch.save(value, tmp)
+        tmp.replace(path)
+        size = int(path.stat().st_size)
+        self._spill[key] = (path, size)
+        self.spill_bytes += size
+        self.spill_bytes_written += size
+        self.peak_spill_bytes = max(self.peak_spill_bytes, self.spill_bytes)
+
+    def _delete_key(self, key: Any) -> None:
+        if key in self._ram:
+            self.ram_bytes -= self._ram_sizes.pop(key, 0)
+            del self._ram[key]
+        item = self._spill.pop(key, None)
+        if item is not None:
+            path, size = item
+            self.spill_bytes -= size
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _morph_idx(key: Any) -> Optional[int]:
+        if isinstance(key, tuple) and len(key) >= 2 and key[0] in {"ss", "slat", "slat_coords"}:
+            try:
+                return int(key[1])
+            except Exception:
+                return None
+        return None
+
+    def prune_to_morphing_idx(self, morphing_idx: int, promote: bool = True) -> None:
+        """Drop states older than the one needed by the next alpha."""
+        keep = int(morphing_idx)
+        for key in list(self._ram) + list(self._spill):
+            idx = self._morph_idx(key)
+            if idx is not None and idx != keep:
+                self._delete_key(key)
+        if promote and self.max_ram_bytes > 0:
+            self._promote_spill_until_full()
+
+    def _promote_spill_until_full(self) -> None:
+        for key, (path, disk_size) in list(self._spill.items()):
+            # File size is a conservative-enough precheck and avoids loading a
+            # large spilled tensor only to discover that it cannot fit in RAM.
+            if self.ram_bytes + disk_size > self.max_ram_bytes:
+                continue
+            value = torch_load_cpu(path)
+            logical_size = object_nbytes(value)
+            if self.ram_bytes + logical_size > self.max_ram_bytes:
+                del value
+                continue
+            self._ram[key] = value
+            self._ram_sizes[key] = logical_size
+            self.ram_bytes += logical_size
+            self.peak_ram_bytes = max(self.peak_ram_bytes, self.ram_bytes)
+            self.spill_bytes_read += disk_size
+            self.spill_bytes -= disk_size
+            del self._spill[key]
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def spill_all_ram(self) -> None:
+        """Emergency pressure relief: move every resident entry to local disk."""
+        for key in list(self._ram):
+            value = self._ram[key]
+            logical = self._ram_sizes.get(key, object_nbytes(value))
+            self._spill_value(key, value, logical)
+            self.ram_bytes -= self._ram_sizes.pop(key, 0)
+            del self._ram[key]
+
+    def clear(self) -> None:
+        for key in list(self._ram) + list(self._spill):
+            self._delete_key(key)
+        try:
+            self.spill_dir.rmdir()
+        except OSError:
+            pass
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "ram_gib": gib(self.ram_bytes),
+            "peak_ram_gib": gib(self.peak_ram_bytes),
+            "spill_gib": gib(self.spill_bytes),
+            "peak_spill_gib": gib(self.peak_spill_bytes),
+            "spill_written_gib": gib(self.spill_bytes_written),
+            "spill_read_gib": gib(self.spill_bytes_read),
+        }
+
+
 def safe_slug(value: str, limit: int = 36) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
     if not value:
@@ -142,6 +351,19 @@ def shard_tag(args: argparse.Namespace) -> str:
 
 def shard_jsonl(run_root: Path, args: argparse.Namespace) -> Path:
     return run_root / f"generation_{shard_tag(args)}.jsonl"
+
+
+def timing_jsonl(run_root: Path, method: str, args: argparse.Namespace) -> Path:
+    return run_root / "timings" / f"{method}_{shard_tag(args)}.jsonl"
+
+
+def append_timing(run_root: Path, method: str, args: argparse.Namespace, payload: Mapping[str, Any]) -> None:
+    row = dict(payload)
+    row.setdefault("method", method)
+    row.setdefault("shard_index", int(args.shard_index))
+    row.setdefault("num_shards", int(args.num_shards))
+    row.setdefault("recorded_utc", utc_now())
+    append_jsonl(timing_jsonl(run_root, method, args), row)
 
 
 def save_raw_mesh(mesh: Any, path: Path, metadata: Optional[Mapping[str, Any]] = None) -> None:
@@ -331,6 +553,13 @@ def command_morphflow(args: argparse.Namespace) -> None:
     )
 
     for pidx, pair in enumerate(pairs):
+        pair_wall_start = time.perf_counter()
+        reference_export_seconds = 0.0
+        intermediate_compute_seconds = 0.0
+        serialization_seconds = 0.0
+        steps_generated = 0
+        steps_skipped_output = 0
+        peak_rss = process_rss_bytes()
         pair_id = int(pair["pair_id"])
         pair_out = method_root / pair["pair_dir"]
         pair_out.mkdir(parents=True, exist_ok=True)
@@ -347,6 +576,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
         ref_pair.mkdir(parents=True, exist_ok=True)
         src1_raw = ref_pair / "src1_raw.pt"
         src2_raw = ref_pair / "src2_raw.pt"
+        ref_start = time.perf_counter()
         if not src1_raw.exists():
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src1["feats"], src1["coords"], device)
             save_raw_mesh(mesh, src1_raw, {"kind": "reference", "asset": pair["src1"]})
@@ -357,12 +587,15 @@ def command_morphflow(args: argparse.Namespace) -> None:
             save_raw_mesh(mesh, src2_raw, {"kind": "reference", "asset": pair["src2"]})
             del mesh
             torch.cuda.empty_cache()
+        cuda_sync()
+        reference_export_seconds = time.perf_counter() - ref_start
 
         template_ss = torch.zeros_like(src1["ss_latent"])
         for step_idx, alpha in enumerate(plan["alphas"]):
             step_out = pair_out / alpha_dir(alpha)
             raw_path = step_out / "mesh_raw.pt"
             if raw_path.exists() and not args.overwrite:
+                steps_skipped_output += 1
                 log(f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} skip existing", run_root)
                 continue
 
@@ -370,6 +603,8 @@ def command_morphflow(args: argparse.Namespace) -> None:
             slat_seed = step_seed(plan["seed"], pair_id, step_idx, 10_000)
             seed_everything(ss_seed)
             batch = batch_for_alpha(src1, src2, float(alpha))
+            cuda_sync()
+            compute_start = time.perf_counter()
             pred_ss = sample_ss(
                 ss_model,
                 batch,
@@ -394,6 +629,11 @@ def command_morphflow(args: argparse.Namespace) -> None:
             if pred_slat is None:
                 raise RuntimeError(f"MorphFlow produced empty SLat coords for pair={pair_id}, alpha={alpha}")
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, pred_slat.feats, pred_slat.coords, device)
+            cuda_sync()
+            step_compute = time.perf_counter() - compute_start
+            intermediate_compute_seconds += step_compute
+            steps_generated += 1
+            serial_start = time.perf_counter()
             save_raw_mesh(
                 mesh,
                 raw_path,
@@ -406,11 +646,48 @@ def command_morphflow(args: argparse.Namespace) -> None:
                     "slat_seed": slat_seed,
                 },
             )
+            serialization_seconds += time.perf_counter() - serial_start
             append_jsonl(shard_jsonl(run_root, args), {"method": "morphflow", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
-            log(f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
+            rss = process_rss_bytes()
+            peak_rss = max(peak_rss, rss)
+            log(
+                f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved "
+                f"compute={step_compute:.2f}s rss={gib(rss):.2f}GiB",
+                run_root,
+            )
             del pred_ss, pred_coords, pred_slat, mesh, batch
             torch.cuda.empty_cache()
 
+        cuda_sync()
+        pair_total_wall_seconds = time.perf_counter() - pair_wall_start
+        sequence_end_to_end_seconds = max(0.0, pair_total_wall_seconds - reference_export_seconds)
+        timing_valid = steps_generated == int(plan["k_intermediate"]) and steps_skipped_output == 0
+        append_timing(
+            run_root,
+            "morphflow",
+            args,
+            {
+                "pair_id": pair_id,
+                "pair_dir": pair["pair_dir"],
+                "timing_valid": bool(timing_valid),
+                "steps_generated": int(steps_generated),
+                "steps_skipped_output": int(steps_skipped_output),
+                "k_intermediate": int(plan["k_intermediate"]),
+                "sequence_end_to_end_seconds": float(sequence_end_to_end_seconds),
+                "pair_total_wall_seconds": float(pair_total_wall_seconds),
+                "benchmark_reference_export_seconds": float(reference_export_seconds),
+                "intermediate_compute_seconds": float(intermediate_compute_seconds),
+                "serialization_seconds": float(serialization_seconds),
+                "seconds_per_intermediate_compute": float(intermediate_compute_seconds / max(1, steps_generated)),
+                "process_peak_rss_gib": gib(peak_rss),
+                "node_min_mem_available_gib": gib(node_mem_available_bytes()),
+            },
+        )
+        log(
+            f"[MorphFlow] pair={pair_id:04d} sequence timing: end_to_end={sequence_end_to_end_seconds:.2f}s "
+            f"compute={intermediate_compute_seconds:.2f}s serialization={serialization_seconds:.2f}s",
+            run_root,
+        )
         del src1, src2, template_ss
         torch.cuda.empty_cache()
 
@@ -435,11 +712,24 @@ def command_morphany3d(args: argparse.Namespace) -> None:
     method_root.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    local_cache_root = Path(args.local_cache_root).resolve() if args.local_cache_root else None
+    if local_cache_root is not None:
+        local_cache_root.mkdir(parents=True, exist_ok=True)
+
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
-    log(f"MorphAny3D generation start | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
+    log(
+        "MorphAny3D generation start | "
+        f"pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)} | "
+        f"tfsa_cache_mode={args.tfsa_cache_mode} | tfsa_ram_limit={args.tfsa_ram_gb:.2f} GiB | "
+        f"min_node_free={args.tfsa_min_node_free_gb:.2f} GiB | local_cache={local_cache_root}",
+        run_root,
+    )
+
+    required_cache_names = ("coords_zs_init.pt", "slat_init.pt", "coords.pt")
 
     for pidx, pair in enumerate(pairs):
+        pair_wall_start = time.perf_counter()
         pair_id = int(pair["pair_id"])
         pseed = int(pair["pair_seed"])
         pair_out = method_root / pair["pair_dir"]
@@ -449,6 +739,24 @@ def command_morphany3d(args: argparse.Namespace) -> None:
         src_cache.mkdir(parents=True, exist_ok=True)
         tar_cache.mkdir(parents=True, exist_ok=True)
 
+        raw_paths = [pair_out / alpha_dir(a) / "mesh_raw.pt" for a in plan["alphas"]]
+        if all(path.is_file() for path in raw_paths) and not args.overwrite:
+            log(f"[MorphAny3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} skip complete pair", run_root)
+            append_timing(
+                run_root,
+                "morphany3d",
+                args,
+                {
+                    "pair_id": pair_id,
+                    "pair_dir": pair["pair_dir"],
+                    "timing_valid": False,
+                    "reason": "complete_pair_already_existed",
+                    "steps_generated": 0,
+                    "steps_skipped_output": int(plan["k_intermediate"]),
+                },
+            )
+            continue
+
         with Image.open(pair["src1_image"]) as im:
             src_img = im.copy()
         with Image.open(pair["src2_image"]) as im:
@@ -456,68 +764,299 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
         log(f"[MorphAny3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} {pair['src1']} -> {pair['src2']}", run_root)
 
-        base_params = {
-            "init_morphing_flag": False,
-            "ss_mca_flag": False,
-            "slat_mca_flag": False,
-            "ss_tfsa_flag": False,
-            "slat_tfsa_flag": False,
-            "oc_flag": False,
-        }
-        if not morphany_cache_ready(src_cache):
-            params = dict(base_params, save_cache_path=str(src_cache))
-            seed_everything(pseed)
-            pipeline.run_morphing(src_img, tar_img, morphing_params=params, seed=pseed, formats=["mesh"])
-            log(f"[MorphAny3D] pair={pair_id:04d} source cache ready", run_root)
-        if not morphany_cache_ready(tar_cache):
-            params = dict(base_params, save_cache_path=str(tar_cache))
-            seed_everything(pseed)
-            pipeline.run_morphing(tar_img, src_img, morphing_params=params, seed=pseed, formats=["mesh"])
-            log(f"[MorphAny3D] pair={pair_id:04d} target cache ready", run_root)
+        # Cache image preprocessing + DINO conditioning once per pair. Upstream
+        # run_morphing recomputes both for every alpha although the inputs are
+        # unchanged. Reusing them is numerically equivalent and removes a large
+        # amount of repeated GPU/CPU work.
+        conditioning_start = time.perf_counter()
+        original_preprocess = pipeline.preprocess_image
+        original_get_cond = pipeline.get_cond
+        src_pre = original_preprocess(src_img)
+        tar_pre = original_preprocess(tar_img)
+        with torch.no_grad():
+            src_cond_cached = original_get_cond([src_pre])
+            tar_cond_cached = original_get_cond([tar_pre])
+        cuda_sync()
+        conditioning_seconds = time.perf_counter() - conditioning_start
 
-        for step_idx, alpha in enumerate(plan["alphas"]):
-            step_out = pair_out / alpha_dir(alpha)
-            raw_path = step_out / "mesh_raw.pt"
-            if raw_path.exists() and not args.overwrite:
-                log(f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} skip existing", run_root)
-                continue
+        def cached_preprocess(image):
+            return image
 
-            params = {
-                "morphing_num": int(plan["k_intermediate"]) + 2,
-                "src_load_cache_path": str(src_cache),
-                "tar_load_cache_path": str(tar_cache),
-                "save_cache_path": str(cache_root / pair["pair_dir"] / "work"),
+        def cached_get_cond(images):
+            if len(images) == 1 and images[0] is src_pre:
+                return src_cond_cached
+            if len(images) == 1 and images[0] is tar_pre:
+                return tar_cond_cached
+            return original_get_cond(images)
+
+        pipeline.preprocess_image = cached_preprocess
+        pipeline.get_cond = cached_get_cond
+
+        source_cache_hit = morphany_cache_ready(src_cache)
+        target_cache_hit = morphany_cache_ready(tar_cache)
+        cache_prep_seconds = 0.0
+        intermediate_compute_seconds = 0.0
+        serialization_seconds = 0.0
+        steps_generated = 0
+        steps_skipped_output = 0
+        pressure_relief_triggered = False
+        peak_rss = process_rss_bytes()
+        min_node_available = node_mem_available_bytes() or 0
+        tfsa_cache = None
+        local_pair = None
+
+        try:
+            base_params = {
                 "init_morphing_flag": False,
-                "ss_mca_flag": True,
-                "slat_mca_flag": True,
-                "ss_tfsa_flag": True,
-                "slat_tfsa_flag": True,
+                "ss_mca_flag": False,
+                "slat_mca_flag": False,
+                "ss_tfsa_flag": False,
+                "slat_tfsa_flag": False,
                 "oc_flag": False,
-                "alpha": float(alpha),
-                "morphing_idx": int(step_idx + 1),
-                "tfsa_cache_idx": int(step_idx),
-                "tfsa_alpha": 0.8,
             }
-            Path(params["save_cache_path"]).mkdir(parents=True, exist_ok=True)
-            seed_everything(pseed)
-            outputs = pipeline.run_morphing(
-                src_img,
-                tar_img,
-                morphing_params=params,
-                seed=pseed,
-                formats=["mesh"],
+
+            # Source/target initialization caches are persistent for resumability,
+            # but we do NOT decode an unused mesh here. formats=[] still executes
+            # the samplers and writes coords_zs_init/slat_init/coords.
+            prep_start = time.perf_counter()
+            if not source_cache_hit:
+                params = dict(base_params, save_cache_path=str(src_cache))
+                seed_everything(pseed)
+                pipeline.run_morphing(src_pre, tar_pre, morphing_params=params, seed=pseed, formats=[])
+                cuda_sync()
+                log(f"[MorphAny3D] pair={pair_id:04d} source cache ready", run_root)
+            if not target_cache_hit:
+                params = dict(base_params, save_cache_path=str(tar_cache))
+                seed_everything(pseed)
+                pipeline.run_morphing(tar_pre, src_pre, morphing_params=params, seed=pseed, formats=[])
+                cuda_sync()
+                log(f"[MorphAny3D] pair={pair_id:04d} target cache ready", run_root)
+
+            # Stage the small reusable endpoint caches onto node-local storage so
+            # the 10 alpha steps do not repeatedly torch.load them from shared FS.
+            load_src_cache = src_cache
+            load_tar_cache = tar_cache
+            if local_cache_root is not None:
+                local_pair = local_cache_root / pair["pair_dir"]
+                if local_pair.exists():
+                    shutil.rmtree(local_pair, ignore_errors=True)
+                local_src = local_pair / "src"
+                local_tar = local_pair / "tar"
+                local_src.mkdir(parents=True, exist_ok=True)
+                local_tar.mkdir(parents=True, exist_ok=True)
+                for name in required_cache_names:
+                    shutil.copy2(src_cache / name, local_src / name)
+                    shutil.copy2(tar_cache / name, local_tar / name)
+                load_src_cache = local_src
+                load_tar_cache = local_tar
+                work_dir = local_pair / "work"
+            else:
+                work_dir = cache_root / pair["pair_dir"] / "work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            cache_prep_seconds = time.perf_counter() - prep_start
+
+            if args.tfsa_cache_mode == "hybrid":
+                spill_dir = (local_pair / "tfsa-spill") if local_pair is not None else (work_dir / "tfsa-spill")
+                tfsa_cache = HybridTFSACache(int(args.tfsa_ram_gb * (1024 ** 3)), spill_dir)
+
+            for step_idx, alpha in enumerate(plan["alphas"]):
+                step_out = pair_out / alpha_dir(alpha)
+                raw_path = step_out / "mesh_raw.pt"
+                output_exists = raw_path.exists() and not args.overwrite
+
+                # If an incomplete pair is resumed, MorphAny3D must still replay
+                # earlier alphas to rebuild the previous-state TFSA cache chain.
+                # Existing raw meshes are left untouched; only the compute is replayed.
+                params = {
+                    "morphing_num": int(plan["k_intermediate"]) + 2,
+                    "src_load_cache_path": str(load_src_cache),
+                    "tar_load_cache_path": str(load_tar_cache),
+                    "save_cache_path": str(work_dir),
+                    "init_morphing_flag": False,
+                    "ss_mca_flag": True,
+                    "slat_mca_flag": True,
+                    "ss_tfsa_flag": True,
+                    "slat_tfsa_flag": True,
+                    "oc_flag": False,
+                    "alpha": float(alpha),
+                    "morphing_idx": int(step_idx + 1),
+                    "tfsa_cache_idx": int(step_idx),
+                    "tfsa_alpha": 0.8,
+                }
+                if tfsa_cache is not None:
+                    params["tfsa_cache"] = tfsa_cache
+
+                available = node_mem_available_bytes()
+                if available:
+                    if min_node_available == 0:
+                        min_node_available = available
+                    else:
+                        min_node_available = min(min_node_available, available)
+                if (
+                    tfsa_cache is not None
+                    and tfsa_cache.max_ram_bytes > 0
+                    and available > 0
+                    and available < int(args.tfsa_min_node_free_gb * (1024 ** 3))
+                ):
+                    tfsa_cache.spill_all_ram()
+                    tfsa_cache.max_ram_bytes = 0
+                    pressure_relief_triggered = True
+                    log(
+                        f"[MorphAny3D] pair={pair_id:04d} RAM pressure guard triggered: "
+                        f"MemAvailable={gib(available):.2f} GiB; TFSA cache switched to local spill for this pair",
+                        run_root,
+                    )
+
+                seed_everything(pseed)
+                cuda_sync()
+                compute_start = time.perf_counter()
+                outputs = pipeline.run_morphing(
+                    src_pre,
+                    tar_pre,
+                    morphing_params=params,
+                    seed=pseed,
+                    formats=["mesh"],
+                )
+                cuda_sync()
+                step_compute = time.perf_counter() - compute_start
+                intermediate_compute_seconds += step_compute
+                steps_generated += 1
+
+                mesh = outputs["mesh"][0]
+                if output_exists:
+                    steps_skipped_output += 1
+                    log(
+                        f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} "
+                        f"alpha={alpha:.6f} recomputed for TFSA chain; raw output kept",
+                        run_root,
+                    )
+                else:
+                    serial_start = time.perf_counter()
+                    save_raw_mesh(
+                        mesh,
+                        raw_path,
+                        {
+                            "method": "morphany3d",
+                            "pair_id": pair_id,
+                            "step": step_idx,
+                            "alpha": float(alpha),
+                            "seed": pseed,
+                        },
+                    )
+                    serialization_seconds += time.perf_counter() - serial_start
+                    append_jsonl(
+                        shard_jsonl(run_root, args),
+                        {
+                            "method": "morphany3d",
+                            "pair_id": pair_id,
+                            "step": step_idx,
+                            "alpha": float(alpha),
+                            "raw": str(raw_path),
+                        },
+                    )
+                    log(
+                        f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} "
+                        f"alpha={alpha:.6f} saved",
+                        run_root,
+                    )
+
+                del outputs, mesh
+
+                if tfsa_cache is not None:
+                    tfsa_cache.prune_to_morphing_idx(step_idx + 1, promote=tfsa_cache.max_ram_bytes > 0)
+                    stats = tfsa_cache.stats()
+                else:
+                    stats = {
+                        "ram_gib": 0.0,
+                        "peak_ram_gib": 0.0,
+                        "spill_gib": 0.0,
+                        "peak_spill_gib": 0.0,
+                        "spill_written_gib": 0.0,
+                        "spill_read_gib": 0.0,
+                    }
+                rss = process_rss_bytes()
+                peak_rss = max(peak_rss, rss)
+                available = node_mem_available_bytes()
+                if available:
+                    min_node_available = available if min_node_available == 0 else min(min_node_available, available)
+                log(
+                    f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} "
+                    f"compute={step_compute:.2f}s tfsa_ram={stats['ram_gib']:.2f}GiB "
+                    f"tfsa_spill={stats['spill_gib']:.2f}GiB rss={gib(rss):.2f}GiB "
+                    f"node_mem_available={gib(available):.2f}GiB",
+                    run_root,
+                )
+
+            cuda_sync()
+            sequence_end_to_end_seconds = time.perf_counter() - pair_wall_start
+            cache_stats = tfsa_cache.stats() if tfsa_cache is not None else {
+                "peak_ram_gib": 0.0,
+                "peak_spill_gib": 0.0,
+                "spill_written_gib": 0.0,
+                "spill_read_gib": 0.0,
+            }
+            timing_valid = steps_generated == int(plan["k_intermediate"]) and steps_skipped_output == 0
+            append_timing(
+                run_root,
+                "morphany3d",
+                args,
+                {
+                    "pair_id": pair_id,
+                    "pair_dir": pair["pair_dir"],
+                    "timing_valid": bool(timing_valid),
+                    "steps_generated": int(steps_generated),
+                    "steps_skipped_output": int(steps_skipped_output),
+                    "k_intermediate": int(plan["k_intermediate"]),
+                    "sequence_end_to_end_seconds": float(sequence_end_to_end_seconds),
+                    "conditioning_seconds": float(conditioning_seconds),
+                    "endpoint_cache_and_staging_seconds": float(cache_prep_seconds),
+                    "intermediate_compute_seconds": float(intermediate_compute_seconds),
+                    "serialization_seconds": float(serialization_seconds),
+                    "seconds_per_intermediate_compute": float(intermediate_compute_seconds / max(1, steps_generated)),
+                    "source_cache_hit": bool(source_cache_hit),
+                    "target_cache_hit": bool(target_cache_hit),
+                    "tfsa_cache_mode": args.tfsa_cache_mode,
+                    "tfsa_ram_limit_gib": float(args.tfsa_ram_gb),
+                    "tfsa_peak_ram_gib": float(cache_stats.get("peak_ram_gib", 0.0)),
+                    "tfsa_peak_spill_gib": float(cache_stats.get("peak_spill_gib", 0.0)),
+                    "tfsa_spill_written_gib": float(cache_stats.get("spill_written_gib", 0.0)),
+                    "tfsa_spill_read_gib": float(cache_stats.get("spill_read_gib", 0.0)),
+                    "process_peak_rss_gib": gib(peak_rss),
+                    "node_min_mem_available_gib": gib(min_node_available),
+                    "ram_pressure_guard_triggered": bool(pressure_relief_triggered),
+                },
             )
-            mesh = outputs["mesh"][0]
-            save_raw_mesh(mesh, raw_path, {"method": "morphany3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed})
-            append_jsonl(shard_jsonl(run_root, args), {"method": "morphany3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
-            log(f"[MorphAny3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
-            del outputs, mesh
+            log(
+                f"[MorphAny3D] pair={pair_id:04d} sequence timing: end_to_end={sequence_end_to_end_seconds:.2f}s "
+                f"compute={intermediate_compute_seconds:.2f}s serialization={serialization_seconds:.2f}s "
+                f"tfsa_peak_ram={cache_stats.get('peak_ram_gib', 0.0):.2f}GiB "
+                f"tfsa_peak_spill={cache_stats.get('peak_spill_gib', 0.0):.2f}GiB",
+                run_root,
+            )
+        finally:
+            pipeline.preprocess_image = original_preprocess
+            pipeline.get_cond = original_get_cond
+            if tfsa_cache is not None:
+                tfsa_cache.clear()
+            if local_pair is not None:
+                shutil.rmtree(local_pair, ignore_errors=True)
+            del src_cond_cached, tar_cond_cached, src_pre, tar_pre, src_img, tar_img
+            torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()
-
-    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
+    write_json(
+        method_root / f"generation_status_{shard_tag(args)}.json",
+        {
+            "status": "complete",
+            "finished_utc": utc_now(),
+            "pairs": len(pairs),
+            "shard_index": args.shard_index,
+            "num_shards": args.num_shards,
+            "tfsa_cache_mode": args.tfsa_cache_mode,
+            "tfsa_ram_gb": args.tfsa_ram_gb,
+            "tfsa_min_node_free_gb": args.tfsa_min_node_free_gb,
+        },
+    )
     log(f"MorphAny3D generation complete | {shard_tag(args)}", run_root)
-
 
 def command_interp3d(args: argparse.Namespace) -> None:
     import torch
@@ -543,6 +1082,10 @@ def command_interp3d(args: argparse.Namespace) -> None:
     log(f"Interp3D generation start | uniform schedule | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
 
     for pidx, pair in enumerate(pairs):
+        pair_wall_start = time.perf_counter()
+        intermediate_compute_seconds = 0.0
+        serialization_seconds = 0.0
+        peak_rss = process_rss_bytes()
         pair_id = int(pair["pair_id"])
         pseed = int(pair["pair_seed"])
         pair_out = method_root / pair["pair_dir"]
@@ -551,6 +1094,19 @@ def command_interp3d(args: argparse.Namespace) -> None:
         all_exist = all((pair_out / alpha_dir(a) / "mesh_raw.pt").is_file() for a in plan["alphas"])
         if all_exist and not args.overwrite:
             log(f"[Interp3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} skip complete pair", run_root)
+            append_timing(
+                run_root,
+                "interp3d",
+                args,
+                {
+                    "pair_id": pair_id,
+                    "pair_dir": pair["pair_dir"],
+                    "timing_valid": False,
+                    "reason": "complete_pair_already_existed",
+                    "steps_generated": 0,
+                    "steps_skipped_output": int(plan["k_intermediate"]),
+                },
+            )
             continue
 
         with Image.open(pair["src1_image"]) as im:
@@ -560,6 +1116,8 @@ def command_interp3d(args: argparse.Namespace) -> None:
 
         log(f"[Interp3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} {pair['src1']} -> {pair['src2']}", run_root)
         seed_everything(pseed)
+        cuda_sync()
+        compute_start = time.perf_counter()
         outputs, _ = pipeline.run_interpolation_morphing(
             src_img,
             tar_img,
@@ -567,6 +1125,8 @@ def command_interp3d(args: argparse.Namespace) -> None:
             seed=pseed,
             formats=["mesh"],
         )
+        cuda_sync()
+        intermediate_compute_seconds = time.perf_counter() - compute_start
         expected = int(plan["k_intermediate"]) + 2
         if len(outputs) != expected:
             raise RuntimeError(
@@ -577,15 +1137,50 @@ def command_interp3d(args: argparse.Namespace) -> None:
         if len(middle) != int(plan["k_intermediate"]):
             raise RuntimeError(f"Interp3D middle-state count mismatch: {len(middle)}")
 
+        steps_generated = 0
+        steps_skipped_output = 0
         for step_idx, (alpha, item) in enumerate(zip(plan["alphas"], middle)):
             raw_path = pair_out / alpha_dir(alpha) / "mesh_raw.pt"
             if raw_path.exists() and not args.overwrite:
+                steps_skipped_output += 1
                 continue
             mesh = item["mesh"][0]
+            serial_start = time.perf_counter()
             save_raw_mesh(mesh, raw_path, {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed})
+            serialization_seconds += time.perf_counter() - serial_start
+            steps_generated += 1
             append_jsonl(shard_jsonl(run_root, args), {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
             log(f"[Interp3D] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} alpha={alpha:.6f} saved", run_root)
 
+        cuda_sync()
+        sequence_end_to_end_seconds = time.perf_counter() - pair_wall_start
+        rss = process_rss_bytes()
+        peak_rss = max(peak_rss, rss)
+        timing_valid = steps_generated == int(plan["k_intermediate"]) and steps_skipped_output == 0
+        append_timing(
+            run_root,
+            "interp3d",
+            args,
+            {
+                "pair_id": pair_id,
+                "pair_dir": pair["pair_dir"],
+                "timing_valid": bool(timing_valid),
+                "steps_generated": int(steps_generated),
+                "steps_skipped_output": int(steps_skipped_output),
+                "k_intermediate": int(plan["k_intermediate"]),
+                "sequence_end_to_end_seconds": float(sequence_end_to_end_seconds),
+                "intermediate_compute_seconds": float(intermediate_compute_seconds),
+                "serialization_seconds": float(serialization_seconds),
+                "seconds_per_intermediate_compute": float(intermediate_compute_seconds / max(1, int(plan["k_intermediate"]))),
+                "process_peak_rss_gib": gib(peak_rss),
+                "node_min_mem_available_gib": gib(node_mem_available_bytes()),
+            },
+        )
+        log(
+            f"[Interp3D] pair={pair_id:04d} sequence timing: end_to_end={sequence_end_to_end_seconds:.2f}s "
+            f"compute={intermediate_compute_seconds:.2f}s serialization={serialization_seconds:.2f}s",
+            run_root,
+        )
         del outputs, middle
         torch.cuda.empty_cache()
 
@@ -762,6 +1357,108 @@ def command_texture_status(args: argparse.Namespace) -> None:
     log("Texture completeness check passed", run_root)
 
 
+def read_jsonl_rows(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.is_file():
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(dict(json.loads(line)))
+    return rows
+
+
+def numeric_stats(values: Sequence[float]) -> Dict[str, Any]:
+    arr = np.asarray([float(v) for v in values if v is not None and np.isfinite(float(v))], dtype=np.float64)
+    if arr.size == 0:
+        return {"mean": None, "std": None, "median": None, "count": 0}
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)),
+        "median": float(np.median(arr)),
+        "count": int(arr.size),
+    }
+
+
+def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
+    timing_root = run_root / "timings"
+    result: Dict[str, Any] = {
+        "definition": (
+            "Per-sequence timing excludes one-time model loading. sequence_end_to_end_seconds includes "
+            "method-specific pair preparation, intermediate generation, and raw-mesh serialization; "
+            "MorphFlow benchmark-only reference export is excluded. intermediate_compute_seconds is "
+            "CUDA-synchronized model compute only. Only fresh complete sequences (timing_valid=true) "
+            "enter aggregate timing statistics."
+        ),
+        "methods": {},
+    }
+    fields = (
+        "sequence_end_to_end_seconds",
+        "intermediate_compute_seconds",
+        "serialization_seconds",
+        "seconds_per_intermediate_compute",
+        "process_peak_rss_gib",
+        "node_min_mem_available_gib",
+    )
+    for method in METHODS:
+        rows: List[Dict[str, Any]] = []
+        for path in sorted(timing_root.glob(f"{method}_shard_*.jsonl")):
+            rows.extend(read_jsonl_rows(path))
+        valid = [row for row in rows if bool(row.get("timing_valid"))]
+        aggregate = {
+            field: numeric_stats([row.get(field) for row in valid if row.get(field) is not None])
+            for field in fields
+        }
+        if method == "morphany3d":
+            for field in (
+                "conditioning_seconds",
+                "endpoint_cache_and_staging_seconds",
+                "tfsa_peak_ram_gib",
+                "tfsa_peak_spill_gib",
+                "tfsa_spill_written_gib",
+                "tfsa_spill_read_gib",
+            ):
+                aggregate[field] = numeric_stats([row.get(field) for row in valid if row.get(field) is not None])
+        result["methods"][method] = {
+            "num_records": len(rows),
+            "num_valid_sequences": len(valid),
+            "aggregate": aggregate,
+            "pairs": rows,
+        }
+    write_json(run_root / "generation_timings.json", result)
+
+    csv_fields = [
+        "method",
+        "pair_id",
+        "pair_dir",
+        "timing_valid",
+        "sequence_end_to_end_seconds",
+        "intermediate_compute_seconds",
+        "serialization_seconds",
+        "seconds_per_intermediate_compute",
+        "process_peak_rss_gib",
+        "node_min_mem_available_gib",
+        "conditioning_seconds",
+        "endpoint_cache_and_staging_seconds",
+        "tfsa_cache_mode",
+        "tfsa_ram_limit_gib",
+        "tfsa_peak_ram_gib",
+        "tfsa_peak_spill_gib",
+        "tfsa_spill_written_gib",
+        "tfsa_spill_read_gib",
+        "ram_pressure_guard_triggered",
+    ]
+    with (run_root / "generation_timings.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_fields, extrasaction="ignore")
+        writer.writeheader()
+        for method in METHODS:
+            for row in result["methods"][method]["pairs"]:
+                writer.writerow(row)
+    return result
+
+
 def command_aggregate(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
@@ -775,6 +1472,8 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "metric_source": "eval_textured_benchmark.py over final textured GLBs; common uniform alpha schedule; appearance=materials",
         "methods": {},
     }
+    generation_timings = aggregate_generation_timings(run_root)
+    combined["generation_timings"] = generation_timings
     rows: List[Dict[str, Any]] = []
     headline = (
         # Paper-style full trajectory, INCLUDING src1/src2 endpoints.
@@ -811,6 +1510,25 @@ def command_aggregate(args: argparse.Namespace) -> None:
                     "std": stats.get("std"),
                     "median": stats.get("median"),
                     "num_pairs": data.get("num_pairs"),
+                }
+            )
+
+        timing_agg = generation_timings.get("methods", {}).get(method, {}).get("aggregate", {})
+        timing_n = generation_timings.get("methods", {}).get(method, {}).get("num_valid_sequences", 0)
+        for output_metric, timing_field in (
+            ("generation_sequence_end_to_end_seconds", "sequence_end_to_end_seconds"),
+            ("generation_intermediate_compute_seconds", "intermediate_compute_seconds"),
+            ("generation_seconds_per_intermediate_compute", "seconds_per_intermediate_compute"),
+        ):
+            stats = timing_agg.get(timing_field, {})
+            rows.append(
+                {
+                    "method": method,
+                    "metric": output_metric,
+                    "mean": stats.get("mean"),
+                    "std": stats.get("std"),
+                    "median": stats.get("median"),
+                    "num_pairs": timing_n,
                 }
             )
 
@@ -859,6 +1577,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     ma = sub.add_parser("morphany3d")
     common_run(ma)
+    ma.add_argument("--tfsa-cache-mode", choices=["hybrid", "disk"], default="hybrid")
+    ma.add_argument(
+        "--tfsa-ram-gb",
+        type=float,
+        default=4.0,
+        help="Per-worker TFSA CPU-RAM budget in hybrid mode; overflow spills to node-local storage.",
+    )
+    ma.add_argument(
+        "--tfsa-min-node-free-gb",
+        type=float,
+        default=20.0,
+        help="If node MemAvailable drops below this threshold, disable RAM caching for the current pair.",
+    )
+    ma.add_argument(
+        "--local-cache-root",
+        default="",
+        help="Node-local directory for staged endpoint caches and TFSA spill files.",
+    )
 
     ip = sub.add_parser("interp3d")
     common_run(ip)
