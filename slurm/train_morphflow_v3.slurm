@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v3_ss_encDual_tokenGate_loraCross_lr1e-4_bs2
+#SBATCH --job-name=v3_slat_encDual_tokenGate_loraCross_lr5e-5_bs1
 #SBATCH --account=g_vbd
 #SBATCH --partition=gpu_vbd
 #SBATCH --qos=gpu_vbd
@@ -206,11 +206,11 @@ accelerate launch \
   --train_bs 2 \
   --val_bs 1 \
   --train_epochs 25 \
-  --lr 1e-4 \
-  --cond_lr 1e-4 \
+  --lr 5e-5 \
+  --cond_lr 5e-5 \
   --flow_lr 5e-5 \
-  --lora_lr 1e-4 \
-  --weight_decay 1e-4 \
+  --lora_lr 5e-5 \
+  --weight_decay 5e-5 \
   --warmup_steps 10000 \
   --plateau_factor 0.5 \
   --plateau_patience 5 \
@@ -232,7 +232,7 @@ accelerate launch \
   --cond_residual_blocks_16 2 \
   --cfg_drop_prob 0.0 \
   --trellis_model image_large \
-  --flow_target ss \
+  --flow_target slat \
   --teacher_mid_weight 1.0 \
   --trellis_prior_weight "$TRELLIS_PRIOR_WEIGHT" \
   --trellis_prior_every "$TRELLIS_PRIOR_EVERY" \

@@ -1179,9 +1179,46 @@ def command_interp3d(args: argparse.Namespace) -> None:
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
+
+    def reset_interp3d_attention_state():
+        # Interp3D leaves its flow-model self-attention in "interpolate"
+        # after a morph sequence. Reusing the same pipeline for the next
+        # pair would therefore feed alpha=None through interpolate attention.
+        for model_name in ("sparse_structure_flow_model", "slat_flow_model"):
+            if model_name not in pipeline.models:
+                continue
+
+            model = pipeline.models[model_name]
+
+            for attr, value in (
+                ("mode", "normal"),
+                ("alpha", 0.5),
+                ("step_id0", 0),
+                ("step_id1", 0),
+                ("step_id2", 0),
+            ):
+                if hasattr(model, attr):
+                    setattr(model, attr, value)
+
+            for cache_name in ("kv_dict_img0", "kv_dict_img1"):
+                cache = getattr(model, cache_name, None)
+                if cache is not None and hasattr(cache, "clear"):
+                    cache.clear()
+
+            for block in getattr(model, "blocks", []):
+                attn = getattr(block, "self_attn", None)
+                if attn is None:
+                    continue
+                if hasattr(attn, "attn_phase"):
+                    attn.attn_phase = "normal"
+                if hasattr(attn, "alpha"):
+                    attn.alpha = 0.5
+                if hasattr(attn, "step_id"):
+                    attn.step_id = 0
     log(f"Interp3D generation start | uniform schedule | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
 
     for pidx, pair in enumerate(pairs):
+        reset_interp3d_attention_state()
         pair_wall_start = time.perf_counter()
         intermediate_compute_seconds = 0.0
         serialization_seconds = 0.0
@@ -1316,6 +1353,7 @@ def hardlink_or_copy(src: Path, dst: Path) -> None:
 
 
 def texture_one(raw_path: Path, glb_path: Path, args: argparse.Namespace, run_root: Path, label: str) -> None:
+    import torch
     if glb_path.is_file() and not args.overwrite:
         return
     from trellis.utils import postprocessing_utils
