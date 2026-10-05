@@ -65,7 +65,7 @@ class TrellisSLatPrior(nn.Module):
         if cfg.get("name")!="SLatFlowModel": raise ValueError("expected SLatFlowModel checkpoint")
         with torch.random.fork_rng(devices=[]): flow=_build_original_slat_flow(cfg["args"])
         flow.load_state_dict(load_file(wp),strict=True)
-        with torch.random.fork_rng(devices=[]): enc=torch.hub.load("facebookresearch/dinov2",dino_model,pretrained=True)
+        with torch.random.fork_rng(devices=[]): enc=torch.hub.load("facebookresearch/dinov2:main",dino_model,pretrained=True,trust_repo=True)
         obj=cls(flow,enc,**kw); return obj.to(device=device) if device is not None else obj
     def train(self,mode=True):
         super().train(False); self.flow.eval(); self.image_encoder.eval(); return self

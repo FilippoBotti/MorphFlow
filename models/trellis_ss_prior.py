@@ -250,9 +250,10 @@ class TrellisSSPrior(nn.Module):
 
         with torch.random.fork_rng(devices=[]):
             image_encoder = torch.hub.load(
-                "facebookresearch/dinov2",
+                "facebookresearch/dinov2:main",
                 dino_model,
                 pretrained=True,
+                trust_repo=True,
             )
 
         prior = cls(

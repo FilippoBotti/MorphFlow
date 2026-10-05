@@ -48,7 +48,7 @@ case "$FLOW_TARGET" in
         ;;
     slat)
         DEFAULT_RUN_NAME=v3_slat_trellisPrior_r015_stat015_bs1_fromBest_leonardo
-        DEFAULT_TRELLIS_PRIOR_WEIGHT=0.0
+        DEFAULT_TRELLIS_PRIOR_WEIGHT=1.0
         ;;
     *) die "FLOW_TARGET deve essere ss o slat." ;;
 esac
@@ -164,6 +164,48 @@ for filename in sorted(filenames):
             "bash slurm/train_morphflow_v3_leonardo.sbatch --prepare"
         ) from exc
     print(f"TRELLIS weights: {path}")
+
+if weight > 0:
+    from pathlib import Path
+    from unittest.mock import patch
+    import torch
+
+    # Il prior usa DINO anche quando lo student e' condizionato sui latenti SLat.
+    # Questi nomi corrispondono al --dino_model fissato nei train_args sotto.
+    dino_model = "dinov2_vitl14_reg"
+    hub = Path(torch.hub.get_dir())
+    required = (
+        hub / "facebookresearch_dinov2_main" / "hubconf.py",
+        hub / "checkpoints" / "dinov2_vitl14_reg4_pretrain.pth",
+    )
+    prepare_hint = (
+        f"FLOW_TARGET={flow_target} TRELLIS_PRIOR_WEIGHT={weight} "
+        "bash slurm/train_morphflow_v3_leonardo.sbatch --prepare"
+    )
+    if mode != "--prepare":
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise SystemExit(
+                "Cache DINOv2 incompleta: " + ", ".join(missing)
+                + "\nDal login node: " + prepare_hint
+            )
+    if mode in ("--prepare", "--check"):
+        torch.set_num_threads(2)
+        def load_dino():
+            return torch.hub.load(
+                "facebookresearch/dinov2:main", dino_model,
+                pretrained=True, trust_repo=True,
+            )
+        if mode == "--prepare":
+            encoder = load_dino()
+        else:
+            # HF_HUB_OFFLINE non copre Torch Hub: vietare la rete anche qui.
+            with patch("torch.hub.urlopen", side_effect=RuntimeError(
+                "Download DINOv2 disabilitato in --check; eseguire " + prepare_hint
+            )):
+                encoder = load_dino()
+        del encoder
+    print(f"DINOv2 cache: {hub}")
 PY
 fi
 
@@ -305,8 +347,10 @@ import sys
 import torch
 from train import build_parser
 from modules.trellis_prior_training import validate_trellis_prior_args
+from modules.prior_gradient_balance import validate_balance_args
 args = build_parser().parse_args(sys.argv[1:])
 validate_trellis_prior_args(args)
+validate_balance_args(args)
 print(f"Python: {sys.executable}; torch: {torch.__version__}; CUDA build: {torch.version.cuda}")
 print(f"Dataset: {args.root_dir}")
 print(f"Output: {args.out_dir}/{args.run_name}")

@@ -24,24 +24,30 @@ Percorsi predefiniti:
 - Log Slurm: `/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/<jobname>_<jobid>.out` e `.err`.
 - Pesi Hugging Face: `/leonardo_work/IscrC_MORPHFL/mbarezzi/cache/huggingface`.
 
-Le immagini FLUX e DINO non vengono caricate in questa configurazione
-(`flow_target=slat`, `slat_condition_source=slat`), quindi `source_images_root`
-e' omesso. NVLink e InfiniBand restano abilitati per NCCL.
+Lo student con `flow_target=slat` e `slat_condition_source=slat` usa i latenti.
+Quando si abilita il prior TRELLIS, il supervisore usa invece le immagini
+endpoint e DINOv2: servono `source_images_root` e la cache Torch Hub.
+NVLink e InfiniBand restano abilitati per NCCL.
 Le notifiche Slurm `ALL` sono inviate a `marco.barezzi@unipr.it`.
 
 ## Preparazione dal login node
 
 ```bash
 cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
-bash slurm/train_morphflow_v3_leonardo.sbatch --prepare
+TRELLIS_PRIOR_WEIGHT=1.0 bash slurm/train_morphflow_v3_leonardo.sbatch --prepare
 ```
 
-Scarica nella cache condivisa i pesi TRELLIS SLat image_large
-(`ckpts/slat_flow_img_dit_L_64l8p2_fp16.safetensors`) e
-controlla import e argomenti. Non avvia il training e non richiede GPU.
-Con `--check` esegue lo stesso controllo senza scaricare nulla.
-I job usano la cache offline; se si riparte da un checkpoint, non servono i
-pesi iniziali TRELLIS. La cartella dei log Slurm deve esistere prima di `sbatch`;
+Scarica nella cache condivisa pesi e configurazione TRELLIS SLat image_large,
+il codice DINOv2 e i pesi `dinov2_vitl14_reg4_pretrain.pth`. Carica DINOv2
+su CPU e controlla import e argomenti, incluso il bilanciamento dei gradienti.
+Non avvia il training e non richiede GPU. Con lo stesso peso e `--check`
+verifica anche il caricamento DINOv2 con i download Torch Hub disabilitati.
+I job controllano la presenza della cache prima di avviare i worker GPU.
+Il prior richiede i suoi pesi TRELLIS e DINOv2 anche con `INIT_FROM`.
+Con il bilanciamento attivo, `TRELLIS_PRIOR_WEIGHT` deve essere positivo
+(default SLat: `1.0`); passare lo stesso valore a `--prepare`, `--check`
+e `sbatch` quando si usa un override.
+La cartella dei log Slurm deve esistere prima di `sbatch`;
 `--prepare` la crea (esiste gia' nell'installazione corrente).
 
 ## Prova della comunicazione su quattro nodi
