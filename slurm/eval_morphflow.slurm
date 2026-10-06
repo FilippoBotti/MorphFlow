@@ -12,7 +12,7 @@
 #SBATCH --output=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/final_dataset/eval-%x-%j.out
 #SBATCH --error=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/final_dataset/eval-%x-%j.err
 #SBATCH --mail-user=marco.barezzi@unipr.it
-#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 

@@ -127,3 +127,64 @@ tail -f /leonardo_work/IscrC_MORPHFL/mbarezzi/logs/<jobname>_<jobid>.out
 
 Riferimenti: [Leonardo, risorse e QoS](https://docs.hpc.cineca.it/hpc/leonardo.html),
 [esempio ufficiale Accelerate/Slurm](https://github.com/huggingface/accelerate/blob/main/examples/slurm/submit_multinode.sh).
+
+## Valutazione v3 su Leonardo
+
+`eval_morphflow_v3_leonardo.slurm` usa lo stesso `eval_validation_latents.py`
+del launcher di ateneo, con `env.sh`, cache e percorsi nativi di Leonardo.
+Richiede un nodo, una GPU, 8 CPU, 32 GiB di RAM e quattro ore.
+I default sono 50 coppie di test, seed 42, 50 passi, CFG 1, BF16 e
+`SAVE_LATENTS=0`. La configurazione del modello viene letta dal checkpoint.
+Il teacher TRELLIS del prior non viene caricato durante l'eval.
+
+```bash
+cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
+
+# Prepara i decoder Hugging Face dal login e verifica gli import.
+bash slurm/eval_morphflow_v3_leonardo.slurm --prepare
+
+# Verifica offline senza richiedere GPU o lanciare la generazione.
+bash slurm/eval_morphflow_v3_leonardo.slurm --check
+
+# Valuta il best della run SLat con prior, letto all'avvio del job.
+sbatch slurm/eval_morphflow_v3_leonardo.slurm
+```
+
+Il checkpoint predefinito e'
+`/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/v3_slat_trellisPrior_r015_stat015_bs1_fromBest_leonardo/checkpoints/morphflow_best.pt`.
+`CHECKPOINT_PATH` permette di scegliere un altro checkpoint; per confronti
+riproducibili mentre il training continua, usare uno snapshot con epoca e step.
+
+```bash
+# Esempio: checkpoint fisso, coppie di validation e due CFG.
+CHECKPOINT_PATH=/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/v3_slat_trellisPrior_r015_stat015_bs1_fromBest_leonardo/checkpoints/morphflow_epoch_0002_step_0020000.pt \
+    METADATA=metadata_val.json RUN_NAME=prior_step20000_val \
+    CFG_VALUES="1.0 3.0" SAVE_LATENTS=1 \
+    sbatch slurm/eval_morphflow_v3_leonardo.slurm
+
+# Baseline importata dall'ateneo, con le stesse coppie e lo stesso seed.
+CHECKPOINT_PATH=/leonardo_work/IscrC_MORPHFL/mbarezzi/checkpoints/slat_from_hpc/morphflow_best.pt \
+    METADATA=metadata_val.json RUN_NAME=baseline_hpc_val \
+    CFG_VALUES="1.0 3.0" SAVE_LATENTS=1 \
+    sbatch slurm/eval_morphflow_v3_leonardo.slurm
+```
+
+Per la pipeline completa, impostare `CHECKPOINT_PATH` a un checkpoint **SS** e
+`SLAT_CHECKPOINT_PATH` a un checkpoint **SLat**. Eseguire prima `--prepare`
+con entrambi i percorsi: serve anche il decoder SS. `STEPS` e `CFG_VALUES`
+controllano il primo flow; `SLAT_STEPS` e `SLAT_CFG_SCALE` il secondo.
+Un checkpoint SLat da solo genera sulle coordinate sparse del target:
+questa modalita' isola il flow SLat e non valuta la generazione delle coordinate SS.
+
+Risultati:
+`/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/<EVAL_TYPE>/<RUN_NAME>/job_<jobid>/cfg_<cfg>/<timestamp>/`.
+L'evaluator salva i mesh `.glb`, le metriche per campione, `summary.json`,
+`selected_samples.json` e, con `SAVE_LATENTS=1`, i latenti. `OUTPUT_DIR`
+modifica la directory base. I log Slurm sono in `$WORK/$USER/logs/`.
+
+Restano disponibili le variabili del launcher di ateneo: `ROOT_DIR`,
+`SOURCE_IMAGES_ROOT`, `SOURCE_IMAGE_FILENAME`, `PROJECT_DIR`, `METADATA`,
+`EVAL_TYPE`, `RUN_NAME`, `NUM_SAMPLES`, `SEED`, `STEPS`, `CFG_VALUES`,
+`SLAT_STEPS`, `SLAT_CFG_SCALE`, `TRELLIS_MODEL`, `MIXED_PRECISION`, `SAVE_LATENTS`.
+I checkpoint SLat condizionati con DINO richiedono immagini e cache Torch Hub;
+`--prepare` prepara anche quest'ultima quando necessaria.

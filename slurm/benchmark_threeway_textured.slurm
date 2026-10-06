@@ -12,6 +12,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/reports/threeway-%x-%j.out
 #SBATCH --error=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/reports/threeway-%x-%j.err
+#SBATCH --mail-user=marco.barezzi@unipr.it
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 # Multi-GPU, resumable benchmark:
 #   MorphFlow vs MorphAny3D vs Interp3D

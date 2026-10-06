@@ -9,6 +9,8 @@
 #SBATCH --time=00:10:00
 #SBATCH --output=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/%x_%j.out
 #SBATCH --error=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/%x_%j.err
+#SBATCH --mail-user=marco.barezzi@unipr.it
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 

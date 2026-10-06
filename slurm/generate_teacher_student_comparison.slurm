@@ -12,6 +12,8 @@
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 #SBATCH --open-mode=append
+#SBATCH --mail-user=marco.barezzi@unipr.it
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 # Ateneo: same Singularity image/environment as generate_morphany3d_v3.slurm.
 # Prefer submit_teacher_student_comparison.sh: it configures Slurm's own logs
