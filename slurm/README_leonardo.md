@@ -1,132 +1,100 @@
-# MorphFlow v3 SLat su Leonardo
+# MorphFlow v3 su Leonardo
 
-`train_morphflow_v3_leonardo.sbatch` usa l'env nativo attivato da
-`/leonardo_work/IscrC_MORPHFL/mbarezzi/env.sh`.
-La configurazione iniziale richiede 4 nodi Booster, 4 A100 per nodo, 32 CPU e
-128 GiB di RAM per nodo. Slurm avvia un launcher Accelerate per nodo; ogni launcher
-crea 4 processi GPU. Il rank del nodo viene assegnato da `SLURM_PROCID`.
+I launcher usano l'ambiente nativo `/leonardo_work/IscrC_MORPHFL/mbarezzi/env.sh`,
+2 nodi Booster, 4 GPU per nodo, 32 CPU e 128 GiB di RAM per nodo.
+Slurm avvia un launcher Accelerate per nodo e ogni launcher crea 4 processi GPU.
+Le notifiche mail `ALL` includono inizio, fine ed errore.
 
-Con 16 GPU e `train_bs=2` il batch globale e' 32 (nell'allegato di ateneo era 16).
-Il training usa `flow_target=slat` e `slat_condition_source=slat`.
-Gli altri iperparametri seguono l'allegato r32/semMatch: LoRA rank 32, alpha 64,
-`flow_lr=lora_lr=1e-4`, semantic token matching abilitato con max align 0.25,
-semantic cycle loss con peso 0.01 e probabilita' 0.25, 60 epoche, `val_bs=1`,
-BF16, scheduler cosine e 8 worker del DataLoader per processo.
-I 32 worker per nodo si aggiungono ai processi del training: se la CPU diventa
-un limite, provare `NUM_WORKERS=4` e confrontare la velocita'.
-
-Percorsi predefiniti:
-
-- Dataset: `/leonardo_scratch/fast/IscrC_MORPHFL/mbarezzi/datasets/morphing_dataset_v3`.
-- Run: `/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/v3_slat_lora_cross_r32_tokenGate_semMatch_loralr1e-4_leonardo`.
-- Checkpoint: `<run>/checkpoints/`; TensorBoard: `<run>/tb/`.
-- Log training: `<run>/logs/train_<jobid>.log`.
-- Log Slurm: `/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/<jobname>_<jobid>.out` e `.err`.
-- Pesi Hugging Face: `/leonardo_work/IscrC_MORPHFL/mbarezzi/cache/huggingface`.
-
-Lo student con `flow_target=slat` e `slat_condition_source=slat` usa i latenti.
-Quando si abilita il prior TRELLIS, il supervisore usa invece le immagini
-endpoint e DINOv2: servono `source_images_root` e la cache Torch Hub.
-NVLink e InfiniBand restano abilitati per NCCL.
-Le notifiche Slurm `ALL` sono inviate a `marco.barezzi@unipr.it`.
-
-## Preparazione dal login node
+## Esperimenti encDual (7 ottobre 2026)
 
 ```bash
 cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
-TRELLIS_PRIOR_WEIGHT=1.0 bash slurm/train_morphflow_v3_leonardo.sbatch --prepare
-```
-
-Scarica nella cache condivisa pesi e configurazione TRELLIS SLat image_large,
-il codice DINOv2 e i pesi `dinov2_vitl14_reg4_pretrain.pth`. Carica DINOv2
-su CPU e controlla import e argomenti, incluso il bilanciamento dei gradienti.
-Non avvia il training e non richiede GPU. Con lo stesso peso e `--check`
-verifica anche il caricamento DINOv2 con i download Torch Hub disabilitati.
-I job controllano la presenza della cache prima di avviare i worker GPU.
-Il prior richiede i suoi pesi TRELLIS e DINOv2 anche con `INIT_FROM`.
-Con il bilanciamento attivo, `TRELLIS_PRIOR_WEIGHT` deve essere positivo
-(default SLat: `1.0`); passare lo stesso valore a `--prepare`, `--check`
-e `sbatch` quando si usa un override.
-La cartella dei log Slurm deve esistere prima di `sbatch`;
-`--prepare` la crea (esiste gia' nell'installazione corrente).
-
-## Prova della comunicazione su quattro nodi
-
-```bash
-sbatch --qos=boost_qos_dbg --time=00:10:00 \
-    --job-name=morphflow_nccl_check \
-    slurm/train_morphflow_v3_leonardo.sbatch --comm-check
-```
-
-Esegue all-reduce NCCL sulle 16 GPU, verifica i rank distribuiti su quattro nodi
-e importa il codice del training. Non carica dataset o checkpoint e non salva
-una run. Cercare `MULTINODE CHECK PASSED` nel log `.out`.
-Questo controllo non esegue forward/backward del modello: l'uso di memoria
-e i kernel del training si verificano avviando il training vero.
-Per questo test viene impostato `NCCL_DEBUG=INFO`; controllare nei log il
-trasporto selezionato se si vuole verificare l'uso di InfiniBand.
-
-## Training
-
-```bash
+# SLat: replica train_morphflow_v3.slurm, pesi TRELLIS originali, 25 epoche.
 sbatch slurm/train_morphflow_v3_leonardo.sbatch
+# SS: 5 nuove epoche dal best importato, prior sui due endpoint, rollout 24/6.
+sbatch slurm/train_morphflow_v3_ss_prior_dual_leonardo.sbatch
 ```
 
-Il limite iniziale e' 24 ore, QoS `normal`. Per una run fino a quattro giorni,
-con l'account corrente abilitato alla QoS lunga:
+| Parametro | SLat ablation | SS prior dual |
+|---|---|---|
+| Run | `slat_ablation_encDual_lora` | `ss_ablation_encDual_lora_priorDual_s24_g6` |
+| Epoche | 25 | 5 nuove |
+| Batch/GPU (globale) | 2 (16) | 1 (8) |
+| Inizializzazione | TRELLIS originale | `checkpoints/ss_ablation_encDual_lora/morphflow_best.pt` |
+| LR cond/flow/LoRA | 5e-5 | 5e-5 |
+| Weight decay / warmup LR | 5e-5 / 10000 | 1e-4 / 500 |
+| Prior | disabilitato | peso 1.01, ogni 4 update, max 1 sample/GPU |
+| Rollout prior | non eseguito | 24 passi, ultimi 6 con gradiente e checkpointing |
+| Checkpoint periodici | ogni 2 epoche | ogni epoca e a meta' epoca |
+
+Entrambi usano encoder sparse_conv3d, conditioning separato con gate token,
+LoRA cross-attention rank 32 / alpha 64, BF16, scheduler cosine, source swap,
+semantic matching/cycle/usage disabilitati e CFG dropout 0.
+Il fine-tuning SS carica solo i pesi (`--init_from --init_strict 1`):
+optimizer, scheduler e contatore delle cinque epoche iniziano da zero.
+
+Per SS **e** SLat il prior ora valuta entrambe le immagini endpoint sullo
+stesso campione rumoroso, con identici tau e rumore. Ogni correzione viene
+clippata rispetto all'RMS del proprio endpoint prima di calcolare
+`Lproj = alpha * Lsrc1 + (1-alpha) * Lsrc2`.
+Il teacher rimane congelato; scale/stat anchor e guard vengono applicati una volta.
+Per SLat la riduzione resta una media sui token, pesati con l'alpha del loro sample.
+
+Il preset SS mantiene tau `[0.05, 0.20]`, clip ratio `0.08`, rapporto gradiente
+projection/FM target `0.15` (cap `0.30`, cap per gruppo `0.40`), EMA `0.99`
+e warmup della fase prior 500 update. I 24 passi riguardano lo student;
+il teacher fa una proiezione per ciascuno dei due endpoint, senza CFG.
+Nei diagnostici sono presenti `trellis_prior_projection_src1_loss` e
+`trellis_prior_projection_src2_loss`. La metrica storica `src1_fraction`
+indica ora la media di alpha; le diagnostiche dei due endpoint sono pesate
+per alpha. Il valore di Lproj non e' la loss verso il target medio: conserva
+anche il disaccordo tra i target, mentre il gradiente combina le due correzioni.
+
+## Percorsi e controlli
+
+Radice del progetto: `/leonardo_work/IscrC_MORPHFL/mbarezzi`.
+
+- Dataset: `/leonardo_scratch/fast/IscrC_MORPHFL/mbarezzi/datasets/morphing_dataset_v3`.
+- Checkpoint SLat: `checkpoints/slat_ablation_encDual_lora/`.
+- Checkpoint SS: `checkpoints/ss_ablation_encDual_lora_priorDual_s24_g6/`.
+- Run/TensorBoard/diagnostici: `outputs/<run>/{tb,logs}/`.
+- Log Slurm: `logs/<jobname>_<jobid>.out` e `.err`.
+
+`MF_CHECKPOINT_DIR` imposta una directory checkpoint esplicita e viene passato
+al nuovo `--checkpoint_dir`. Senza questo argomento il training continua a
+usare `<out_dir>/<run_name>/checkpoints`. Il launcher protegge sia la directory
+della run sia quella dei checkpoint da scritture concorrenti.
 
 ```bash
-sbatch --qos=boost_qos_lprod --time=4-00:00:00 \
-    slurm/train_morphflow_v3_leonardo.sbatch
+bash slurm/train_morphflow_v3_leonardo.sbatch --check
+bash slurm/train_morphflow_v3_ss_prior_dual_leonardo.sbatch --check
+# Solo se mancano pesi in cache, dal login:
+bash slurm/train_morphflow_v3_ss_prior_dual_leonardo.sbatch --prepare
 ```
 
-La QoS lunga ammette fino a 8 nodi per progetto. La disponibilita' dipende
-anche dagli altri job del progetto.
+`--check` verifica import, parsing, cache e caricamento DINO su CPU per il prior.
+I job usano le cache offline. DINO e immagini endpoint servono al prior anche
+quando lo student usa i latenti come conditioning.
 
-## Ripresa e varianti
+## Ripresa
 
 ```bash
-# Riprende morphflow_last.pt; in sua assenza il checkpoint compatibile piu' recente.
 AUTO_RESUME=1 sbatch slurm/train_morphflow_v3_leonardo.sbatch
-
-# Percorso assoluto di un checkpoint di questa stessa architettura.
-RESUME_FROM=/percorso/checkpoint.pt RUN_NAME=run_ripresa \
-    sbatch slurm/train_morphflow_v3_leonardo.sbatch
-
-# 4 nodi = 16 GPU; train_bs=1 conserva il batch globale 16.
-TRAIN_BS=1 RUN_NAME=v3_slat_r32_semMatch_4n_bs1 sbatch --nodes=4 \
-    slurm/train_morphflow_v3_leonardo.sbatch
-
-# Override dei percorsi, senza modificare env.sh.
-MF_DATA_ROOT=/percorso/dataset MF_OUT_ROOT=/percorso/risultati RUN_NAME=nuova_run \
-    sbatch slurm/train_morphflow_v3_leonardo.sbatch
+AUTO_RESUME=1 sbatch slurm/train_morphflow_v3_ss_prior_dual_leonardo.sbatch
 ```
 
-`AUTO_RESUME=1` parte da zero se non trova checkpoint. La ripresa resta manuale
-tramite `sbatch`: non vengono accodati job automaticamente.
-Il nome della run SLat e' distinto dalle precedenti run SS. Usare checkpoint
-SLat della stessa architettura r32/semMatch per `RESUME_FROM`; i checkpoint SS
-non sono compatibili con questo flow.
-Il codice salva `morphflow_last.pt` alla fine di ogni epoca; al limite di tempo
-si perde il lavoro dell'epoca incompleta. Non e' un salvataggio su segnale Slurm.
-Il checkpoint ripristina modello, optimizer e scheduler secondo la logica
-esistente in `train.py`. Conservare numero di GPU e batch per una ripresa
-coerente; cambiare parallelismo modifica la scansione dei dati e i passi
-del scheduler. Usare un nuovo `RUN_NAME` per confronti con parallelismo o batch
-diversi. Gli altri iperparametri non vengono riscalati automaticamente.
+Il limite Slurm e' 24 ore. La ripresa resta manuale: `morphflow_last.pt` viene
+salvato a fine epoca; gli snapshot di meta' epoca/fase sono solo per eval.
+La ripresa ripristina optimizer/scheduler e conserva per default lo stato del
+bilanciamento del prior. `TRAIN_EPOCHS` e' il totale della fase, non il numero
+di epoche da aggiungere a un resume. Conservare batch e numero di GPU.
+Non rilanciare una nuova fase sulla stessa cartella gia' popolata.
 
-`--nodes` si puo' cambiare alla submission. Conservare `--ntasks-per-node=1`
-e `--gres=gpu:4`: i processi per GPU sono gestiti da Accelerate.
-`TRAIN_EPOCHS`, `NUM_WORKERS`, `OMP_NUM_THREADS`, `MASTER_PORT`, `AUTO_RESUME`,
-`RESUME_FROM` e `RUN_NAME` sono anch'essi modificabili tramite ambiente.
-
-```bash
-squeue -u "$USER"
-tail -f /leonardo_work/IscrC_MORPHFL/mbarezzi/logs/<jobname>_<jobid>.out
-```
-
-Riferimenti: [Leonardo, risorse e QoS](https://docs.hpc.cineca.it/hpc/leonardo.html),
-[esempio ufficiale Accelerate/Slurm](https://github.com/huggingface/accelerate/blob/main/examples/slurm/submit_multinode.sh).
+Altri override: `RUN_NAME`, `MF_OUT_ROOT`, `MF_DATA_ROOT`, `INIT_FROM`,
+`RESUME_FROM`, `TRAIN_BS`, `TRAIN_EPOCHS`, `NUM_WORKERS`, `WARMUP_STEPS`,
+`WEIGHT_DECAY` e le variabili `TRELLIS_PRIOR_*` del launcher comune.
+`INIT_FROM=` disabilita l'inizializzazione predefinita. Gli script di ateneo
+restano la sorgente della configurazione baseline SLat.
 
 ## Valutazione v3 su Leonardo
 

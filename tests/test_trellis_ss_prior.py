@@ -214,7 +214,8 @@ class TrellisProjectionPriorTests(unittest.TestCase):
             noise=torch.zeros_like(z),
         )
 
-        used_cond = flow.calls[-1][2]
+        self.assertEqual(len(flow.calls), 2)
+        used_cond = flow.calls[0][2]
         expected_cond = prior.encode_image(src1_image)
 
         torch.testing.assert_close(
@@ -252,6 +253,41 @@ class TrellisProjectionPriorTests(unittest.TestCase):
             used_cond,
             expected_cond,
         )
+
+    def test_dual_projection_loss_and_gradient_with_independent_clipping(self):
+        for clip in (0.0, 0.10):
+            flow = ConditionalPointMassFlow()
+            prior = self.make_prior(flow=flow, projection_clip_ratio=clip)
+            z, image1, image2, endpoint1, endpoint2 = make_inputs()
+            z.requires_grad_()
+            alpha = torch.tensor([0.2, 0.8])
+            noise = torch.randn_like(z)
+            targets = []
+            for image, endpoint in ((image1, endpoint1), (image2, endpoint2)):
+                target = flow.center_from_cond(prior.encode_image(image))
+                delta = target - z.detach()
+                if clip:
+                    radius = clip * endpoint.abs()
+                    delta = delta.clamp(min=-radius, max=radius)
+                targets.append(z.detach() + delta)
+            loss, metrics, terms = prior(
+                z, src1_image=image1, src2_image=image2, alpha=alpha,
+                src1_ss_latent=endpoint1, src2_ss_latent=endpoint2,
+                tau=torch.tensor([0.1, 0.15]), noise=noise, return_loss_terms=True,
+            )
+            weight = alpha.view(-1, 1, 1, 1, 1)
+            expected = 0.5 * (weight * (z - targets[0]).square()
+                              + (1 - weight) * (z - targets[1]).square()).mean()
+            torch.testing.assert_close(loss, expected)
+            torch.testing.assert_close(loss, sum(terms.values()))
+            loss.backward()
+            torch.testing.assert_close(z.grad, (z.detach() - weight * targets[0]
+                                               - (1 - weight) * targets[1]) / z.numel())
+            self.assertEqual(len(flow.calls), 2)
+            torch.testing.assert_close(flow.calls[0][0], flow.calls[1][0])
+            torch.testing.assert_close(flow.calls[0][1], flow.calls[1][1])
+            self.assertTrue(all(not call[-1] for call in flow.calls))
+            self.assertTrue(all(not value.requires_grad for value in metrics.values()))
 
     def test_low_noise_timestep_range(self):
         batch = 64

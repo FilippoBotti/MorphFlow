@@ -18,7 +18,8 @@ TRELLIS_PRIOR_METRIC_NAMES=(
  "trellis_prior_sample_endpoint_rms_ratio","trellis_prior_delta_endpoint_rms_ratio",
  "trellis_prior_src1_fraction","trellis_prior_slat_stat_loss",
  "trellis_prior_slat_stat_active_fraction","trellis_prior_slat_mean_deviation",
- "trellis_prior_slat_std_ratio")
+ "trellis_prior_slat_std_ratio", "trellis_prior_projection_src1_loss",
+ "trellis_prior_projection_src2_loss")
 
 def _build_original_slat_flow(config_args):
     from models.structured_latent_flow import SLatFlowModel
@@ -95,47 +96,127 @@ class TrellisSLatPrior(nn.Module):
             rf.append(rad.reshape(-1).square().mean().sqrt()/dv.square().mean().clamp_min(1e-12).sqrt())
             co.append(dot/(dv.square().sum().sqrt()*xs.sqrt()).clamp_min(1e-12))
         return out,torch.stack(rf),torch.stack(co)
-    def forward(self,z,*,src1_image,src2_image,alpha,src1_slat,src2_slat,tau=None,noise=None,return_loss_terms=False):
-        if not isinstance(z,sp.SparseTensor): raise TypeError("SLat prior expects SparseTensor")
-        B=int(z.shape[0]); alpha=alpha[:B].detach().float().reshape(-1).clamp(0,1); choose=torch.rand(B,device=z.device)<alpha
-        image=torch.where(choose.view(B,1,1,1),src1_image[:B],src2_image[:B])
-        m1,s1,r1=self._stats(src1_slat); m2,s2,r2=self._stats(src2_slat); m1,s1,r1=m1[:B],s1[:B],r1[:B]; m2,s2,r2=m2[:B],s2[:B],r2[:B]
-        endpoint_rms=torch.where(choose,r1,r2).detach()
-        with torch.no_grad(),torch.autocast(device_type=z.device.type,enabled=False):
-            dz=z.replace(z.feats.detach().float()); ids=self._ids(dz)
-            if tau is None: tau=torch.rand(B,device=z.device)*(self.t_max-self.t_min)+self.t_min
+    def forward(self, z, *, src1_image, src2_image, alpha, src1_slat, src2_slat,
+                tau=None, noise=None, return_loss_terms=False):
+        if not isinstance(z, sp.SparseTensor):
+            raise TypeError("SLat prior expects SparseTensor")
+        B = int(z.shape[0])
+        alpha = alpha[:B].detach().float().reshape(-1).clamp(0, 1)
+        if B < 1 or alpha.shape != (B,):
+            raise ValueError("alpha must contain one value per nonempty prior sample")
+        if src1_image.shape[0] < B or src2_image.shape[0] < B:
+            raise ValueError("Not enough endpoint images for the prior batch")
+        with torch.no_grad(), torch.autocast(device_type=z.device.type, enabled=False):
+            m1, s1, r1 = (v[:B] for v in self._stats(src1_slat))
+            m2, s2, r2 = (v[:B] for v in self._stats(src2_slat))
+            endpoint_rms = alpha * r1 + (1 - alpha) * r2
+            dz = z.replace(z.feats.detach().float())
+            ids = self._ids(dz)
+            if tau is None:
+                tau = torch.rand(B, device=z.device) * (self.t_max - self.t_min) + self.t_min
             else:
-                tau=torch.as_tensor(tau,device=z.device,dtype=torch.float32).detach(); tau=tau.expand(B) if tau.numel()==1 else tau
-            nf=torch.randn_like(dz.feats) if noise is None else noise.detach().to(z.device,dtype=torch.float32)
-            cond=self.encode_image(image).float(); tf=tau[ids,None]; sf=self.sigma_min+(1-self.sigma_min)*tf
-            xt=dz.replace((1-tf)*dz.feats+sf*nf); vel=self.flow(xt,tau*1000.,cond).feats.float()
-            px=(1-self.sigma_min)*xt.feats.float()-sf*vel; raw=px-dz.feats; rawr=self._rms(raw,dz)
-            tan,radfrac,cos=self._tangent(raw,dz); tanr=self._rms(tan,dz); pd=tan if self.tangent_projection else raw; pdr=tanr if self.tangent_projection else rawr
-            if self.projection_clip_ratio>0:
-                sc=(self.projection_clip_ratio*endpoint_rms/pdr.clamp_min(1e-12)).clamp(max=1.); delta=pd*sc[ids,None]; clip=(sc<.999999).float().mean()
-            else: delta=pd; clip=raw.new_zeros(())
-            target=dz.feats+delta; clipr=self._rms(delta,dz)
-            rm=alpha[:,None]*m1+(1-alpha[:,None])*m2
-            rs=torch.exp(alpha[:,None]*torch.log(s1.clamp_min(1e-4))+(1-alpha[:,None])*torch.log(s2.clamp_min(1e-4)))
-            rr=torch.exp(alpha*torch.log(r1.clamp_min(1e-8))+(1-alpha)*torch.log(r2.clamp_min(1e-8)))
-            gl=self.rms_guard_low_ratio*torch.minimum(r1,r2); gh=self.rms_guard_high_ratio*torch.maximum(r1,r2)
-        pl=.5*F.mse_loss(z.feats.float(),target); zm,zs,zr=self._stats(z)
-        md=(zm-rm).abs()/rs.clamp_min(1e-4); mv=F.relu(md-self.stat_mean_tolerance); sr=zs/rs.clamp_min(1e-4); sl=torch.log(sr.clamp_min(1e-6))
-        lo=F.relu(sl.new_tensor(math.log(self.stat_std_low_ratio))-sl); hi=F.relu(sl-sl.new_tensor(math.log(self.stat_std_high_ratio)))
-        stat=(mv.square()+lo.square()+hi.square()).mean(); active=((mv>0)|(lo>0)|(hi>0)).any(1).float().mean()
-        lg=F.relu(gl-zr); hg=F.relu(zr-gh); guard=(lg.square()+hg.square()).mean(); gf=((lg>0)|(hg>0)).float().mean(); ratio=zr/rr.clamp_min(1e-8)
-        loss=pl+self.stat_anchor_weight*stat+self.rms_guard_weight*guard
-        metrics={
-          "trellis_prior_loss":loss.detach(),"trellis_prior_projection_loss":pl.detach(),"trellis_prior_projection_delta_rms":rawr.mean().detach(),
-          "trellis_prior_projection_tangent_delta_rms":tanr.mean().detach(),"trellis_prior_projection_radial_fraction":radfrac.mean().detach(),
-          "trellis_prior_projection_raw_cosine_z":cos.mean().detach(),"trellis_prior_projection_delta_clipped_rms":clipr.mean().detach(),
-          "trellis_prior_projection_clip_fraction":clip.detach(),"trellis_prior_projection_x0_rms":px.square().mean().sqrt().detach(),
-          "trellis_prior_velocity_rms":vel.square().mean().sqrt().detach(),"trellis_prior_t_mean":tau.mean().detach(),"trellis_prior_scale_loss":stat.detach(),
-          "trellis_prior_scale_active_fraction":active.detach(),"trellis_prior_scale_reference_rms":rr.mean().detach(),"trellis_prior_scale_ratio":ratio.mean().detach(),
-          "trellis_prior_guard_loss":guard.detach(),"trellis_prior_guard_fraction":gf.detach(),"trellis_prior_guard_low":gl.mean().detach(),
-          "trellis_prior_guard_high":gh.mean().detach(),"trellis_prior_endpoint_rms":endpoint_rms.mean().detach(),
-          "trellis_prior_sample_endpoint_rms_ratio":(zr/endpoint_rms.clamp_min(1e-8)).mean().detach(),"trellis_prior_delta_endpoint_rms_ratio":(clipr/endpoint_rms.clamp_min(1e-8)).mean().detach(),
-          "trellis_prior_src1_fraction":choose.float().mean().detach(),"trellis_prior_slat_stat_loss":stat.detach(),"trellis_prior_slat_stat_active_fraction":active.detach(),
-          "trellis_prior_slat_mean_deviation":md.mean().detach(),"trellis_prior_slat_std_ratio":sr.mean().detach()}
-        if return_loss_terms: return loss,metrics,{"projection":pl,"scale":self.stat_anchor_weight*stat,"guard":self.rms_guard_weight*guard}
-        return loss,metrics
+                tau = torch.as_tensor(tau, device=z.device, dtype=torch.float32).detach()
+                tau = tau.expand(B) if tau.numel() == 1 else tau
+                if tau.shape != (B,) or not torch.isfinite(tau).all():
+                    raise ValueError("tau must be a finite scalar or have shape [B]")
+                if not ((tau >= self.t_min) & (tau <= self.t_max)).all():
+                    raise ValueError("tau outside configured prior range")
+            nf = torch.randn_like(dz.feats) if noise is None else noise.detach().to(z.device, dtype=torch.float32)
+            if nf.shape != dz.feats.shape or not torch.isfinite(nf).all():
+                raise ValueError("noise must be finite with the same shape as SLat features")
+            tf = tau[ids, None]
+            sf = self.sigma_min + (1 - self.sigma_min) * tf
+            xt = dz.replace((1 - tf) * dz.feats + sf * nf)
+            targets, diagnostics = [], []
+            # Share tau/noise, but project and clip independently for each source.
+            for image, source_rms in ((src1_image[:B], r1), (src2_image[:B], r2)):
+                cond = self.encode_image(image).float()
+                vel = self.flow(xt, tau * 1000., cond).feats.float()
+                if vel.shape != dz.feats.shape or not torch.isfinite(vel).all():
+                    raise FloatingPointError("Invalid endpoint-conditioned TRELLIS SLat velocity")
+                px = (1 - self.sigma_min) * xt.feats.float() - sf * vel
+                if not torch.isfinite(px).all():
+                    raise FloatingPointError("Non-finite TRELLIS SLat projection")
+                raw = px - dz.feats
+                rawr = self._rms(raw, dz)
+                tan, radfrac, cos = self._tangent(raw, dz)
+                tanr = self._rms(tan, dz)
+                pd = tan if self.tangent_projection else raw
+                pdr = tanr if self.tangent_projection else rawr
+                sc = torch.ones_like(source_rms)
+                if self.projection_clip_ratio > 0:
+                    sc = (self.projection_clip_ratio * source_rms / pdr.clamp_min(1e-12)).clamp(max=1.)
+                delta = pd * sc[ids, None]
+                clipr = self._rms(delta, dz)
+                targets.append(dz.feats + delta)
+                diagnostics.append({
+                    "raw": rawr, "tangent": tanr, "radial": radfrac, "cosine": cos,
+                    "clipped": clipr, "clip": (sc < .999999).float(),
+                    "x0": self._rms(px, dz), "velocity": self._rms(vel, dz),
+                    "relative_delta": clipr / source_rms.clamp_min(1e-8),
+                })
+            weighted = {key: alpha * diagnostics[0][key] + (1 - alpha) * diagnostics[1][key]
+                        for key in diagnostics[0]}
+            rm = alpha[:, None] * m1 + (1 - alpha[:, None]) * m2
+            rs = torch.exp(alpha[:, None] * torch.log(s1.clamp_min(1e-4))
+                           + (1 - alpha[:, None]) * torch.log(s2.clamp_min(1e-4)))
+            rr = torch.exp(alpha * torch.log(r1.clamp_min(1e-8)) + (1 - alpha) * torch.log(r2.clamp_min(1e-8)))
+            gl = self.rms_guard_low_ratio * torch.minimum(r1, r2)
+            gh = self.rms_guard_high_ratio * torch.maximum(r1, r2)
+
+        # Preserve the original token-mean reduction, including unequal sparse
+        # item sizes. Apply each sample's alpha to its own tokens before reducing.
+        endpoint_errors = [0.5 * (z.feats.float() - target).square() for target in targets]
+        pl = (alpha[ids, None] * endpoint_errors[0]
+              + (1 - alpha[ids, None]) * endpoint_errors[1]).mean()
+        zm, zs, zr = self._stats(z)
+        md = (zm - rm).abs() / rs.clamp_min(1e-4)
+        mv = F.relu(md - self.stat_mean_tolerance)
+        sr = zs / rs.clamp_min(1e-4)
+        sl = torch.log(sr.clamp_min(1e-6))
+        lo = F.relu(sl.new_tensor(math.log(self.stat_std_low_ratio)) - sl)
+        hi = F.relu(sl - sl.new_tensor(math.log(self.stat_std_high_ratio)))
+        stat = (mv.square() + lo.square() + hi.square()).mean()
+        active = ((mv > 0) | (lo > 0) | (hi > 0)).any(1).float().mean()
+        lg, hg = F.relu(gl - zr), F.relu(zr - gh)
+        guard = (lg.square() + hg.square()).mean()
+        gf = ((lg > 0) | (hg > 0)).float().mean()
+        ratio = zr / rr.clamp_min(1e-8)
+        loss = pl + self.stat_anchor_weight * stat + self.rms_guard_weight * guard
+        metrics = {
+            "trellis_prior_loss": loss.detach(),
+            "trellis_prior_projection_loss": pl.detach(),
+            "trellis_prior_projection_delta_rms": weighted["raw"].mean(),
+            "trellis_prior_projection_tangent_delta_rms": weighted["tangent"].mean(),
+            "trellis_prior_projection_radial_fraction": weighted["radial"].mean(),
+            "trellis_prior_projection_raw_cosine_z": weighted["cosine"].mean(),
+            "trellis_prior_projection_delta_clipped_rms": weighted["clipped"].mean(),
+            "trellis_prior_projection_clip_fraction": weighted["clip"].mean(),
+            "trellis_prior_projection_x0_rms": weighted["x0"].mean(),
+            "trellis_prior_velocity_rms": weighted["velocity"].mean(),
+            "trellis_prior_t_mean": tau.mean(),
+            "trellis_prior_scale_loss": stat.detach(),
+            "trellis_prior_scale_active_fraction": active.detach(),
+            "trellis_prior_scale_reference_rms": rr.mean(),
+            "trellis_prior_scale_ratio": ratio.mean().detach(),
+            "trellis_prior_guard_loss": guard.detach(),
+            "trellis_prior_guard_fraction": gf.detach(),
+            "trellis_prior_guard_low": gl.mean(),
+            "trellis_prior_guard_high": gh.mean(),
+            "trellis_prior_endpoint_rms": endpoint_rms.mean(),
+            "trellis_prior_sample_endpoint_rms_ratio": (alpha * zr / r1.clamp_min(1e-8)
+                                                        + (1 - alpha) * zr / r2.clamp_min(1e-8)).mean().detach(),
+            "trellis_prior_delta_endpoint_rms_ratio": weighted["relative_delta"].mean(),
+            # Historical key: now the deterministic src1 weight, not a draw.
+            "trellis_prior_src1_fraction": alpha.mean(),
+            "trellis_prior_slat_stat_loss": stat.detach(),
+            "trellis_prior_slat_stat_active_fraction": active.detach(),
+            "trellis_prior_slat_mean_deviation": md.mean().detach(),
+            "trellis_prior_slat_std_ratio": sr.mean().detach(),
+            "trellis_prior_projection_src1_loss": endpoint_errors[0].mean().detach(),
+            "trellis_prior_projection_src2_loss": endpoint_errors[1].mean().detach(),
+        }
+        if return_loss_terms:
+            return loss, metrics, {"projection": pl, "scale": self.stat_anchor_weight * stat,
+                                   "guard": self.rms_guard_weight * guard}
+        return loss, metrics

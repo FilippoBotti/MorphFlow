@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v3_slat_lora_cross_r32_tokenGate_semMatch_loralr1e-4_leonardo
+#SBATCH --job-name=v3_slat_ablation_encDual_lora
 #SBATCH --account=IscrC_MORPHFL
 #SBATCH --partition=boost_usr_prod
 #SBATCH --qos=normal
@@ -43,35 +43,59 @@ export MF_SOURCE_IMAGES_ROOT="${MF_SOURCE_IMAGES_ROOT:-$FAST/$USER/datasets/flux
 FLOW_TARGET="${FLOW_TARGET:-slat}"
 case "$FLOW_TARGET" in
     ss)
-        DEFAULT_RUN_NAME=v3_ss_trellis_prior_leonardo
+        DEFAULT_RUN_NAME=ss_ablation_encDual_lora_priorDual_s24_g6
+        DEFAULT_INIT_FROM="$WORK/$USER/checkpoints/ss_ablation_encDual_lora/morphflow_best.pt"
+        DEFAULT_TRAIN_EPOCHS=5
+        DEFAULT_TRAIN_BS=1
+        DEFAULT_WARMUP_STEPS=500
+        DEFAULT_WEIGHT_DECAY=1e-4
+        DEFAULT_GRAD_BALANCE=1
+        DEFAULT_CHECKPOINT_EVERY=1
+        DEFAULT_CHECKPOINT_HALF_EPOCH=1
         DEFAULT_TRELLIS_PRIOR_WEIGHT=1.01
         ;;
     slat)
-        DEFAULT_RUN_NAME=v3_slat_trellisPrior_r015_stat015_bs1_fromBest_leonardo
-        DEFAULT_TRELLIS_PRIOR_WEIGHT=1.0
+        DEFAULT_RUN_NAME=slat_ablation_encDual_lora
+        DEFAULT_INIT_FROM=""
+        DEFAULT_TRAIN_EPOCHS=25
+        DEFAULT_TRAIN_BS=2
+        DEFAULT_WARMUP_STEPS=10000
+        DEFAULT_WEIGHT_DECAY=5e-5
+        DEFAULT_GRAD_BALANCE=0
+        DEFAULT_CHECKPOINT_EVERY=2
+        DEFAULT_CHECKPOINT_HALF_EPOCH=0
+        DEFAULT_TRELLIS_PRIOR_WEIGHT=0.0
         ;;
     *) die "FLOW_TARGET deve essere ss o slat." ;;
 esac
 RUN_NAME="${RUN_NAME:-$DEFAULT_RUN_NAME}"
 [[ "$RUN_NAME" != */* && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die "RUN_NAME deve essere un nome, non un percorso."
 RUN_DIR="$MF_OUT_ROOT/$RUN_NAME"
+MF_CHECKPOINT_DIR="${MF_CHECKPOINT_DIR:-$WORK/$USER/checkpoints/$RUN_NAME}"
 AUTO_RESUME="${AUTO_RESUME:-0}"
 RESUME_FROM="${RESUME_FROM:-}"
-INIT_FROM="${INIT_FROM:-$WORK/$USER/checkpoints/slat_from_hpc/morphflow_best.pt}"
+# An explicit empty INIT_FROM disables the preset (also needed for resume).
+DEFAULT_RESET_PHASE=1
+if [[ -n "$RESUME_FROM" || "$AUTO_RESUME" == 1 ]]; then
+    DEFAULT_INIT_FROM=""
+    DEFAULT_RESET_PHASE=0
+fi
+INIT_FROM="${INIT_FROM-$DEFAULT_INIT_FROM}"
 [[ -z "$RESUME_FROM" || -z "$INIT_FROM" ]] || die "Usare RESUME_FROM oppure INIT_FROM, non entrambi."
 [[ "$AUTO_RESUME" == 0 || "$AUTO_RESUME" == 1 ]] || die "AUTO_RESUME deve essere 0 o 1."
 
-# Parametri dell'allegato r32/semMatch, applicati al flow SLat.
-# Con 4 nodi e train_bs=2: 16 GPU, batch globale 32.
-TRAIN_BS="${TRAIN_BS:-1}"
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-5}"
+# SLat mirrors train_morphflow_v3.slurm: baseline encDual, matching/prior off.
+# SS starts a new five-epoch prior phase from the imported ablation best.
+# Two nodes x four GPUs: global batch 16 for SLat, 8 for SS.
+TRAIN_BS="${TRAIN_BS:-$DEFAULT_TRAIN_BS}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-$DEFAULT_TRAIN_EPOCHS}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 # Prior TRELLIS locale disponibile per SS e SLat.
 TRELLIS_PRIOR_WEIGHT="${TRELLIS_PRIOR_WEIGHT:-$DEFAULT_TRELLIS_PRIOR_WEIGHT}"
 TRELLIS_PRIOR_EVERY="${TRELLIS_PRIOR_EVERY:-4}"
 TRELLIS_PRIOR_WARMUP_STEPS="${TRELLIS_PRIOR_WARMUP_STEPS:-0}"
-TRELLIS_PRIOR_ROLLOUT_STEPS="${TRELLIS_PRIOR_ROLLOUT_STEPS:-8}"
-TRELLIS_PRIOR_GRAD_STEPS="${TRELLIS_PRIOR_GRAD_STEPS:-2}"
+TRELLIS_PRIOR_ROLLOUT_STEPS="${TRELLIS_PRIOR_ROLLOUT_STEPS:-24}"
+TRELLIS_PRIOR_GRAD_STEPS="${TRELLIS_PRIOR_GRAD_STEPS:-6}"
 TRELLIS_PRIOR_MAX_ITEMS="${TRELLIS_PRIOR_MAX_ITEMS:-1}"
 TRELLIS_PRIOR_CHECKPOINT="${TRELLIS_PRIOR_CHECKPOINT:-1}"
 TRELLIS_PRIOR_T_MIN="${TRELLIS_PRIOR_T_MIN:-0.05}"
@@ -101,7 +125,7 @@ if [[ "$MODE" != --comm-check ]]; then
     done
 
     if [[ "$AUTO_RESUME" == 1 && -z "$RESUME_FROM" && -z "$INIT_FROM" ]]; then
-        RESUME_FROM="$(python - "$RUN_DIR/checkpoints" <<'PY'
+        RESUME_FROM="$(python - "$MF_CHECKPOINT_DIR" <<'PY'
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -122,8 +146,9 @@ PY
     elif [[ -n "$INIT_FROM" ]]; then
         [[ -r "$INIT_FROM" ]] || die "Checkpoint INIT_FROM non trovato: $INIT_FROM"
         INIT_FROM="$(realpath "$INIT_FROM")"
-    elif compgen -G "$RUN_DIR/checkpoints/morphflow_*.pt" >/dev/null; then
-        die "La run contiene checkpoint: usare AUTO_RESUME=1, RESUME_FROM oppure un nuovo RUN_NAME."
+    fi
+    if [[ -z "$RESUME_FROM" ]] && compgen -G "$MF_CHECKPOINT_DIR/morphflow_*.pt" >/dev/null; then
+        die "La destinazione contiene checkpoint: usare AUTO_RESUME=1, RESUME_FROM oppure un nuovo MF_CHECKPOINT_DIR."
     fi
 
     # --prepare popola la cache dal login; gli altri modi restano offline.
@@ -218,6 +243,7 @@ train_args=(
     --val_metadata metadata_val.json
     --out_dir "$MF_OUT_ROOT"
     --run_name "$RUN_NAME"
+    --checkpoint_dir "$MF_CHECKPOINT_DIR"
     --train_bs "$TRAIN_BS"
     --val_bs 1
     --train_epochs "$TRAIN_EPOCHS"
@@ -225,8 +251,8 @@ train_args=(
     --cond_lr 5e-5
     --flow_lr 5e-5
     --lora_lr 5e-5
-    --weight_decay 1e-4
-    --warmup_steps 500
+    --weight_decay "${WEIGHT_DECAY:-$DEFAULT_WEIGHT_DECAY}"
+    --warmup_steps "${WARMUP_STEPS:-$DEFAULT_WARMUP_STEPS}"
     --plateau_factor 0.5
     --plateau_patience 5
     --grad_clip 1.0
@@ -245,9 +271,10 @@ train_args=(
     --cond_residual_blocks_64 2
     --cond_residual_blocks_32 2
     --cond_residual_blocks_16 2
-    --cfg_drop_prob 0.2
+    --cfg_drop_prob 0.0
     --trellis_model image_large
     --flow_target "$FLOW_TARGET"
+    --teacher_mid_weight 1.0
     --trellis_prior_weight "$TRELLIS_PRIOR_WEIGHT"
     --trellis_prior_every "$TRELLIS_PRIOR_EVERY"
     --trellis_prior_warmup_steps "$TRELLIS_PRIOR_WARMUP_STEPS"
@@ -266,7 +293,7 @@ train_args=(
     --trellis_prior_rms_guard_weight "$TRELLIS_PRIOR_RMS_GUARD_WEIGHT"
     --trellis_prior_rms_guard_low_ratio "$TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO"
     --trellis_prior_rms_guard_high_ratio "$TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO"
-    --trellis_prior_grad_balance "${TRELLIS_PRIOR_GRAD_BALANCE:-1}" \
+    --trellis_prior_grad_balance "${TRELLIS_PRIOR_GRAD_BALANCE:-$DEFAULT_GRAD_BALANCE}" \
     --trellis_prior_ratio_target "${TRELLIS_PRIOR_RATIO_TARGET:-0.15}" \
     --trellis_prior_ratio_max "${TRELLIS_PRIOR_RATIO_MAX:-0.30}" \
     --trellis_prior_group_ratio_max "${TRELLIS_PRIOR_GROUP_RATIO_MAX:-0.40}" \
@@ -278,7 +305,7 @@ train_args=(
     --trellis_prior_phase_start_weight "${TRELLIS_PRIOR_PHASE_START_WEIGHT:-0.05}" \
     --trellis_prior_phase_warmup_steps "${TRELLIS_PRIOR_PHASE_WARMUP_STEPS:-500}" \
     --trellis_prior_guard_scale "${TRELLIS_PRIOR_GUARD_SCALE:-0.10}" \
-    --trellis_prior_reset_phase "${TRELLIS_PRIOR_RESET_PHASE:-1}" \
+    --trellis_prior_reset_phase "${TRELLIS_PRIOR_RESET_PHASE:-$DEFAULT_RESET_PHASE}" \
     --trellis_prior_weak_patience "${TRELLIS_PRIOR_WEAK_PATIENCE:-25}" \
     --trellis_prior_log_every "${TRELLIS_PRIOR_LOG_EVERY:-20}" \
     --trellis_prior_phase_eval_steps "${TRELLIS_PRIOR_PHASE_EVAL_STEPS:-500,1500,3000}" \
@@ -301,9 +328,9 @@ train_args=(
     --symmetry_loss_weight 0.0
     --endpoint_loss_prob 0.0
     --symmetry_loss_prob 0.0
-    --use_semantic_token_matching 1
-    --semantic_match_max_align 0.10
-    --semantic_match_temperature 0.01
+    --use_semantic_token_matching 0
+    --semantic_match_max_align 0.35
+    --semantic_match_temperature 0.05
     --semantic_match_dim 128
     --semantic_match_alpha_weight 1
     --semantic_match_detach_scores 0
@@ -312,15 +339,15 @@ train_args=(
     --semantic_cycle_loss_prob 0.0
     --semantic_cycle_detach_targets 1
     --semantic_cycle_alpha_weight 1
-    --semantic_usage_loss_weight 0.01
+    --semantic_usage_loss_weight 0.0
     --semantic_usage_cap 4.0
-    --semantic_match_log_stats 1
+    --semantic_match_log_stats 0
     --separate_cond 1
     --separate_cond_gate token
     --t_schedule logit_normal
     --t_logit_mean 1.0
     --t_logit_std 1.0
-    --trainable_scope cond_cross_attn
+    --trainable_scope full
     --freeze_modules none
     --use_lora 1
     --train_flow_alpha_gate 1
@@ -330,10 +357,10 @@ train_args=(
     --allow_tf32 1
     --use_checkpoint 0
     --augment_source_swap 1
-    --checkpoint_every 1
-    --checkpoint_half_epoch 1
+    --checkpoint_every "${CHECKPOINT_EVERY:-$DEFAULT_CHECKPOINT_EVERY}"
+    --checkpoint_half_epoch "${CHECKPOINT_HALF_EPOCH:-$DEFAULT_CHECKPOINT_HALF_EPOCH}"
 )
-# Non serve --source_images_root: SLat con slat_condition_source=slat usa i latenti.
+# The frozen prior needs source images even for a latent-conditioned student.
 if [[ -n "$RESUME_FROM" ]]; then
     train_args+=(--resume_from "$RESUME_FROM" --resume_strict 1 --resume_optimizer 1)
 elif [[ -n "$INIT_FROM" ]]; then
@@ -354,6 +381,9 @@ validate_balance_args(args)
 print(f"Python: {sys.executable}; torch: {torch.__version__}; CUDA build: {torch.version.cuda}")
 print(f"Dataset: {args.root_dir}")
 print(f"Output: {args.out_dir}/{args.run_name}")
+print(f"Checkpoints: {args.checkpoint_dir}")
+print(f"Flow: {args.flow_target}; epochs: {args.train_epochs}; batch/GPU: {args.train_bs}; init: {args.init_from}")
+print(f"Prior: {args.trellis_prior_weight}; rollout/grad: {args.trellis_prior_rollout_steps}/{args.trellis_prior_grad_steps}")
 print("Import, argomenti e cache: OK. GPU/NCCL da verificare con --comm-check via sbatch.")
 PY
     exit 0
@@ -372,16 +402,18 @@ if [[ "$MODE" == --comm-check ]]; then
     train_args=("$MF_PROJECT_DIR/slurm/check_multinode.py")
     export NCCL_DEBUG=INFO
 else
-    mkdir -p "$RUN_DIR/logs" "$RUN_DIR/checkpoints"
+    mkdir -p "$RUN_DIR/logs" "$MF_CHECKPOINT_DIR"
     # Impedisce due training contemporanei sulla stessa directory di output.
     exec 9>"$RUN_DIR/.training.lock"
     flock -n 9 || die "Un altro training sta usando $RUN_DIR"
+    exec 8>"$MF_CHECKPOINT_DIR/.training.lock"
+    flock -n 8 || die "Un altro training sta usando $MF_CHECKPOINT_DIR"
     exec > >(tee -a "$RUN_DIR/logs/train_${SLURM_JOB_ID}.log") 2>&1
 fi
 
 echo "JOB=$SLURM_JOB_ID MODE=$MODE NODES=$SLURM_JOB_NODELIST"
 echo "GPUs=$MF_NUM_PROCESSES (${MF_NODE_COUNT} x ${MF_GPUS_PER_NODE}) MASTER=$MASTER_ADDR:$MASTER_PORT"
-echo "DATASET=$MF_DATA_ROOT RUN_DIR=$RUN_DIR"
+echo "DATASET=$MF_DATA_ROOT RUN_DIR=$RUN_DIR CHECKPOINT_DIR=$MF_CHECKPOINT_DIR"
 echo "AUTO_RESUME=$AUTO_RESUME RESUME_FROM=${RESUME_FROM:-<none>} INIT_FROM=${INIT_FROM:-<none>}"
 echo "FLOW_TARGET=$FLOW_TARGET TRELLIS_PRIOR_WEIGHT=$TRELLIS_PRIOR_WEIGHT EVERY=$TRELLIS_PRIOR_EVERY WARMUP_STEPS=$TRELLIS_PRIOR_WARMUP_STEPS"
 echo "TRAIN_BS/GPU=$TRAIN_BS GLOBAL_BATCH=$((TRAIN_BS * MF_NUM_PROCESSES))"

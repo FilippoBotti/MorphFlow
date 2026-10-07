@@ -56,6 +56,8 @@ def build_parser():
     # Output
     parser.add_argument("--out_dir", type=str, default="./outputs")
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="Checkpoint directory; defaults to out_dir/run_name/checkpoints.")
 
     # Training
     parser.add_argument("--train_bs", type=int, default=1, help="Batch size per GPU/process")
@@ -1443,18 +1445,18 @@ def train(args):
     prior_balancer = None
     phase_eval_steps = set()
     if args.trellis_prior_grad_balance:
-        if args.flow_target == "slat" and init_ckpt is not None:
+        if init_ckpt is not None:
             if not args.trellis_prior_reset_phase:
                 raise ValueError(
-                    "SLat --init_from prior phase requires --trellis_prior_reset_phase 1"
+                    "--init_from prior phase requires --trellis_prior_reset_phase 1"
                 )
             accelerator.print(
-                "SLat measured-prior phase: model-only init; optimizer/scheduler start fresh."
+                "Measured-prior phase: model-only init; optimizer/scheduler start fresh."
             )
         elif resume_ckpt is None or not optimizer_restored:
             raise RuntimeError(
-                "The SS strong-prior phase must resume an existing student and "
-                "restore its optimizer. Use --resume_from and --resume_optimizer 1."
+                "The measured-prior phase needs an existing student. Use --init_from "
+                "with --trellis_prior_reset_phase 1, or --resume_from with --resume_optimizer 1."
             )
         validate_balance_runtime(accelerator, model)
         prior_balancer = PriorGradientBalancer(
@@ -1505,7 +1507,7 @@ def train(args):
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.out_dir, run_name)
-    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    ckpt_dir = args.checkpoint_dir or os.path.join(out_dir, "checkpoints")
     tb_dir = os.path.join(out_dir, "tb")
     logs_dir = os.path.join(out_dir, "logs")
     outputs_dir = os.path.join(out_dir, "outputs")
@@ -1522,6 +1524,9 @@ def train(args):
     accelerator.wait_for_everyone()
 
     accelerator.print("===== TRAIN CONFIG =====")
+    accelerator.print(f"Checkpoint directory: {ckpt_dir}")
+    if trellis_prior is not None:
+        accelerator.print("Prior projection: alpha * Lsrc1 + (1-alpha) * Lsrc2; shared tau/noise, separate clipping.")
     accelerator.print(f"Device: {device}")
     accelerator.print(f"Num processes: {accelerator.num_processes}")
     accelerator.print(f"Mixed precision: {mixed_precision}")

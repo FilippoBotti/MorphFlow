@@ -159,7 +159,7 @@ class MorphFlowPriorIntegrationTests(unittest.TestCase):
             torch.tensor([0.25, 0.75]),
         )
         samples = []
-        def prior(sample):
+        def prior(sample, **kwargs):
             samples.append(sample.detach().clone())
             loss = sample.square().mean()
             return loss, {key: loss.detach() for key in TRELLIS_PRIOR_METRIC_NAMES}
@@ -170,6 +170,10 @@ class MorphFlowPriorIntegrationTests(unittest.TestCase):
         model.condition_calls.clear()
         torch.manual_seed(14)
         loss = model(*values, trellis_prior=prior, trellis_prior_weight=0.1,
+                     trellis_prior_src1_image=torch.ones(2, 3, 2, 2),
+                     trellis_prior_src2_image=torch.zeros(2, 3, 2, 2),
+                     src1_ss_latent=torch.ones_like(values[0]),
+                     src2_ss_latent=torch.ones_like(values[0]),
                      trellis_prior_rollout_steps=3, trellis_prior_grad_steps=1)
         self.assertEqual(model.condition_calls, [(True, True, True, 2), (False, False, True, 1)])
         self.assertEqual(tuple(model.state_dict()), state_keys)
@@ -214,6 +218,9 @@ class MorphFlowPriorIntegrationTests(unittest.TestCase):
 
 
 def prior_ddp_regression(rank, store_path):
+    from models.trellis_ss_prior import TrellisSSPrior
+    from test_trellis_ss_prior import ConditionalPointMassFlow, FakeImageEncoder
+
     dist.init_process_group(
         "gloo", init_method=Path(store_path).as_uri(), rank=rank, world_size=2,
         timeout=timedelta(seconds=30),
@@ -223,6 +230,7 @@ def prior_ddp_regression(rank, store_path):
         student = MorphFlowPriorIntegrationTests.model_type().train()
         model = DistributedDataParallel(student, find_unused_parameters=False)
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        prior = TrellisSSPrior(ConditionalPointMassFlow(), FakeImageEncoder(), sigma_min=0.1)
         coords = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0]])
         for iteration in range(4):
             # Repeat graph changes over consecutive DDP forwards, including
@@ -232,9 +240,13 @@ def prior_ddp_regression(rank, store_path):
             loss = model(
                 torch.randn(2, 1, 2, 2, 2), torch.randn(2, 2), coords,
                 torch.randn(2, 2), coords, torch.tensor([0.25, 0.75]),
-                trellis_prior=lambda sample: (sample.square().mean(), {}),
+                trellis_prior=prior,
+                trellis_prior_src1_image=torch.ones(2, 3, 2, 2),
+                trellis_prior_src2_image=torch.zeros(2, 3, 2, 2),
+                src1_ss_latent=torch.ones(2, 1, 2, 2, 2),
+                src2_ss_latent=torch.full((2, 1, 2, 2, 2), 2.0),
                 trellis_prior_weight=0.1 if active else 0.0,
-                trellis_prior_rollout_steps=3, trellis_prior_grad_steps=1,
+                trellis_prior_rollout_steps=24, trellis_prior_grad_steps=6,
             )
             loss.backward()
             for parameter in student.parameters():

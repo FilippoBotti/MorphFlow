@@ -68,8 +68,8 @@ def add_trellis_prior_args(parser):
         type=float,
         default=0.10,
         help=(
-            "Maximum projection-delta RMS relative to selected "
-            "endpoint SS RMS. 0 disables the trust-region clip."
+            "Maximum projection-delta RMS relative to each "
+            "endpoint RMS, clipped before weighting the two losses. 0 disables clipping."
         ),
     )
     group.add_argument(

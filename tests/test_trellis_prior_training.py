@@ -107,7 +107,6 @@ class PriorTrainingTests(unittest.TestCase):
 
     def test_prior_architecture_constraints(self):
         for option, value in (
-            ("--flow_target", "slat"),
             ("--ss_flow_arch", "residual_interp"),
             ("--trellis_model", "text_base"),
         ):
@@ -121,6 +120,12 @@ class PriorTrainingTests(unittest.TestCase):
 
                 with self.assertRaises(ValueError):
                     validate_trellis_prior_args(args)
+
+    def test_dual_prior_rollout_available_for_ss_and_slat(self):
+        for target in ("ss", "slat"):
+            args = parse_args("--flow_target", target, "--trellis_prior_weight", "1",
+                              "--trellis_prior_rollout_steps", "24", "--trellis_prior_grad_steps", "6")
+            validate_trellis_prior_args(args)
 
 
 if __name__ == "__main__":

@@ -5,9 +5,9 @@ rollout. A small amount of noise is then added at a low TRELLIS timestep.
 The original frozen TRELLIS image-conditioned SS flow predicts a local clean
 projection using a real endpoint image as conditioning.
 
-Endpoint conditioning is stochastic:
-    P(src1) = alpha
-    P(src2) = 1 - alpha
+Both endpoint conditions are evaluated at the same noisy student sample:
+    Lproj = alpha * Lsrc1 + (1 - alpha) * Lsrc2
+Each endpoint has its own detached, trust-region-clipped projection target.
 
 No unconditional RFDS residual and no TRELLIS CFG are used.
 """
@@ -47,6 +47,8 @@ TRELLIS_PRIOR_METRIC_NAMES = (
     "trellis_prior_sample_endpoint_rms_ratio",
     "trellis_prior_delta_endpoint_rms_ratio",
     "trellis_prior_src1_fraction",
+    "trellis_prior_projection_src1_loss",
+    "trellis_prior_projection_src2_loss",
 )
 
 
@@ -423,37 +425,6 @@ class TrellisSSPrior(nn.Module):
                 "alpha must contain one value per prior sample"
             )
 
-        # Student convention:
-        # alpha=1 -> src1
-        # alpha=0 -> src2
-        choose_src1 = (
-            torch.rand(
-                batch_size,
-                device=z.device,
-            )
-            < alpha
-        )
-
-        image_mask = choose_src1.view(
-            batch_size, 1, 1, 1
-        )
-
-        selected_image = torch.where(
-            image_mask,
-            src1_image,
-            src2_image,
-        )
-
-        latent_mask = choose_src1.view(
-            batch_size, 1, 1, 1, 1
-        )
-
-        selected_endpoint_ss = torch.where(
-            latent_mask,
-            src1_ss,
-            src2_ss,
-        )
-
         with torch.no_grad(), torch.autocast(
             device_type=z.device.type,
             enabled=False,
@@ -517,10 +488,6 @@ class TrellisSSPrior(nn.Module):
                     "Non-finite prior noise"
                 )
 
-            cond = self.encode_image(
-                selected_image
-            ).float()
-
             time = tau.view(
                 batch_size, 1, 1, 1, 1
             )
@@ -536,167 +503,48 @@ class TrellisSSPrior(nn.Module):
                 + sigma_t * noise
             )
 
-            # Native conditional TRELLIS prediction.
-            # Deliberately NO classifier-free guidance.
-            velocity = self.flow(
-                x_t,
-                tau * 1000.0,
-                cond,
-            ).float()
-
-            if velocity.shape != detached_z.shape:
-                raise ValueError(
-                    "TRELLIS velocity shape must match student SS"
+            src1_rms = self._rms_per_item(src1_ss, batch_size)
+            src2_rms = self._rms_per_item(src2_ss, batch_size)
+            endpoint_rms = alpha * src1_rms + (1 - alpha) * src2_rms
+            targets = []
+            diagnostics = []
+            # Sequential frozen forwards keep peak teacher memory unchanged.
+            # Both use the SAME x_t/tau; clipping precedes endpoint weighting.
+            for image, source_rms in ((src1_image, src1_rms), (src2_image, src2_rms)):
+                cond = self.encode_image(image).float()
+                velocity = self.flow(x_t, tau * 1000.0, cond).float()
+                if velocity.shape != detached_z.shape:
+                    raise ValueError("TRELLIS velocity shape must match student SS")
+                if not torch.isfinite(velocity).all():
+                    raise FloatingPointError("Non-finite endpoint-conditioned TRELLIS velocity")
+                projected_x0 = (1 - self.sigma_min) * x_t - sigma_t * velocity
+                if not torch.isfinite(projected_x0).all():
+                    raise FloatingPointError("Non-finite TRELLIS x0 projection")
+                raw_delta = projected_x0 - detached_z
+                raw_rms = self._rms_per_item(raw_delta, batch_size)
+                tangent, radial_fraction, cosine_z = self._split_radial_tangent(
+                    raw_delta, detached_z, batch_size,
                 )
-
-            if not torch.isfinite(velocity).all():
-                raise FloatingPointError(
-                    "Non-finite endpoint-conditioned TRELLIS velocity"
-                )
-
-            # For:
-            #   x_t = (1-t)x0 + sigma_t eps
-            #   v   = (1-sigma_min)eps - x0
-            #
-            # exact clean reconstruction is:
-            #   x0 = (1-sigma_min)x_t - sigma_t v
-            projected_x0 = (
-                (1.0 - self.sigma_min) * x_t
-                - sigma_t * velocity
-            )
-
-            if not torch.isfinite(projected_x0).all():
-                raise FloatingPointError(
-                    "Non-finite TRELLIS x0 projection"
-                )
-
-            raw_delta = (
-                projected_x0
-                - detached_z
-            )
-
-            if raw_delta.shape != detached_z.shape:
-                raise RuntimeError(
-                    "TRELLIS projection raw_delta shape mismatch: "
-                    f"raw_delta={tuple(raw_delta.shape)}, "
-                    f"z={tuple(detached_z.shape)}"
-                )
-
-            # Every RMS below MUST be [B], never spatial.
-            raw_delta_rms_per_item = self._rms_per_item(
-                raw_delta,
-                batch_size,
-            )
-
-            tangent_delta, radial_fraction_per_item, raw_cosine_z_per_item = self._split_radial_tangent(
-                raw_delta,
-                detached_z,
-                batch_size,
-            )
-            tangent_delta_rms_per_item = self._rms_per_item(
-                tangent_delta,
-                batch_size,
-            )
-            if self.tangent_projection:
-                projection_delta = tangent_delta
-                projection_delta_rms_per_item = tangent_delta_rms_per_item
-            else:
-                projection_delta = raw_delta
-                projection_delta_rms_per_item = raw_delta_rms_per_item
-
-            endpoint_rms = self._rms_per_item(
-                selected_endpoint_ss,
-                batch_size,
-            )
-
-            if tuple(raw_delta_rms_per_item.shape) != (batch_size,):
-                raise RuntimeError(
-                    "raw_delta_rms_per_item must have shape [B], got "
-                    f"{tuple(raw_delta_rms_per_item.shape)}"
-                )
-
-            if tuple(endpoint_rms.shape) != (batch_size,):
-                raise RuntimeError(
-                    "endpoint_rms must have shape [B], got "
-                    f"{tuple(endpoint_rms.shape)}"
-                )
-
-            # Trust region:
-            # TRELLIS can make a LOCAL correction but cannot overwrite
-            # the student's geometry in one prior application.
-            if self.projection_clip_ratio > 0:
-                max_delta_rms = (
-                    self.projection_clip_ratio
-                    * endpoint_rms
-                )
-
-                delta_scale = (
-                    max_delta_rms
-                    / projection_delta_rms_per_item.clamp_min(1e-12)
-                ).clamp(max=1.0)
-
-                if tuple(max_delta_rms.shape) != (batch_size,):
-                    raise RuntimeError(
-                        "max_delta_rms must have shape [B], got "
-                        f"{tuple(max_delta_rms.shape)}"
-                    )
-
-                if tuple(delta_scale.shape) != (batch_size,):
-                    raise RuntimeError(
-                        "delta_scale must have shape [B], got "
-                        f"{tuple(delta_scale.shape)}; "
-                        f"endpoint_rms={tuple(endpoint_rms.shape)}, "
-                        f"raw_delta_rms={tuple(raw_delta_rms_per_item.shape)}, "
-                        f"raw_delta={tuple(raw_delta.shape)}"
-                    )
-
-                broadcast_shape = (
-                    batch_size,
-                    *([1] * (raw_delta.ndim - 1)),
-                )
-
-                delta = (
-                    projection_delta
-                    * delta_scale.reshape(
-                        broadcast_shape
-                    )
-                )
-
-                clip_fraction = (
-                    delta_scale < 0.999999
-                ).float().mean()
-
-            else:
-                delta = projection_delta
-                clip_fraction = detached_z.new_zeros(())
-
-            if delta.shape != raw_delta.shape:
-                raise RuntimeError(
-                    "Clipped TRELLIS delta changed shape: "
-                    f"before={tuple(raw_delta.shape)}, "
-                    f"after={tuple(delta.shape)}"
-                )
-
-            # Detached local projection target.
-            target = (
-                detached_z
-                + delta
-            )
-
-            clipped_delta_rms_per_item = self._rms_per_item(
-                delta,
-                batch_size,
-            )
-
-            src1_rms = self._rms_per_item(
-                src1_ss,
-                batch_size,
-            )
-
-            src2_rms = self._rms_per_item(
-                src2_ss,
-                batch_size,
-            )
+                tangent_rms = self._rms_per_item(tangent, batch_size)
+                delta = tangent if self.tangent_projection else raw_delta
+                delta_rms = tangent_rms if self.tangent_projection else raw_rms
+                scale = torch.ones_like(source_rms)
+                if self.projection_clip_ratio > 0:
+                    scale = (self.projection_clip_ratio * source_rms
+                             / delta_rms.clamp_min(1e-12)).clamp(max=1.0)
+                delta = delta * scale.view(batch_size, 1, 1, 1, 1)
+                clipped_rms = self._rms_per_item(delta, batch_size)
+                targets.append(detached_z + delta)
+                diagnostics.append({
+                    "raw": raw_rms, "tangent": tangent_rms,
+                    "radial": radial_fraction, "cosine": cosine_z,
+                    "clipped": clipped_rms, "clip": (scale < 0.999999).float(),
+                    "x0": self._rms_per_item(projected_x0, batch_size),
+                    "velocity": self._rms_per_item(velocity, batch_size),
+                    "relative_delta": clipped_rms / source_rms.clamp_min(1e-8),
+                })
+            weighted = {key: alpha * diagnostics[0][key] + (1 - alpha) * diagnostics[1][key]
+                        for key in diagnostics[0]}
 
             # Reference scale follows the morph endpoints but does not prescribe
             # geometry. alpha=1 -> src1, alpha=0 -> src2. Log interpolation is
@@ -724,11 +572,11 @@ class TrellisSSPrior(nn.Module):
                 )
             )
 
-        projection_loss = 0.5 * F.mse_loss(
-            z.float(),
-            target,
-            reduction="mean",
-        )
+        endpoint_losses = [
+            0.5 * (z.float() - target).square().reshape(batch_size, -1).mean(dim=1)
+            for target in targets
+        ]
+        projection_loss = (alpha * endpoint_losses[0] + (1 - alpha) * endpoint_losses[1]).mean()
 
         # Differentiable student RMS.
         # Explicit reshape guarantees exactly one scalar per sample.
@@ -796,17 +644,12 @@ class TrellisSSPrior(nn.Module):
             guard_active.float().mean()
         )
 
-        # Scale diagnostics relative to the endpoint selected as TRELLIS
-        # conditioning for this particular prior application.
+        # Expectation of each endpoint-relative diagnostic, matching Lproj.
         sample_endpoint_ratio = (
-            z_rms_per_item
-            / endpoint_rms.clamp_min(1e-8)
+            alpha * z_rms_per_item / src1_rms.clamp_min(1e-8)
+            + (1 - alpha) * z_rms_per_item / src2_rms.clamp_min(1e-8)
         ).mean()
-
-        delta_endpoint_ratio = (
-            clipped_delta_rms_per_item
-            / endpoint_rms.clamp_min(1e-8)
-        ).mean()
+        delta_endpoint_ratio = weighted["relative_delta"].mean()
 
         loss = (
             projection_loss
@@ -822,28 +665,28 @@ class TrellisSSPrior(nn.Module):
                 projection_loss.detach(),
 
             "trellis_prior_projection_delta_rms":
-                raw_delta_rms_per_item.mean().detach(),
+                weighted["raw"].mean().detach(),
 
             "trellis_prior_projection_tangent_delta_rms":
-                tangent_delta_rms_per_item.mean().detach(),
+                weighted["tangent"].mean().detach(),
 
             "trellis_prior_projection_radial_fraction":
-                radial_fraction_per_item.mean().detach(),
+                weighted["radial"].mean().detach(),
 
             "trellis_prior_projection_raw_cosine_z":
-                raw_cosine_z_per_item.mean().detach(),
+                weighted["cosine"].mean().detach(),
 
             "trellis_prior_projection_delta_clipped_rms":
-                clipped_delta_rms_per_item.mean().detach(),
+                weighted["clipped"].mean().detach(),
 
             "trellis_prior_projection_clip_fraction":
-                clip_fraction.detach(),
+                weighted["clip"].mean().detach(),
 
             "trellis_prior_projection_x0_rms":
-                projected_x0.square().mean().sqrt().detach(),
+                weighted["x0"].mean().detach(),
 
             "trellis_prior_velocity_rms":
-                velocity.square().mean().sqrt().detach(),
+                weighted["velocity"].mean().detach(),
 
             "trellis_prior_t_mean":
                 tau.mean().detach(),
@@ -882,7 +725,10 @@ class TrellisSSPrior(nn.Module):
                 delta_endpoint_ratio.detach(),
 
             "trellis_prior_src1_fraction":
-                choose_src1.float().mean().detach(),
+                alpha.mean().detach(),
+
+            "trellis_prior_projection_src1_loss": endpoint_losses[0].mean().detach(),
+            "trellis_prior_projection_src2_loss": endpoint_losses[1].mean().detach(),
         }
 
         if return_loss_terms:
