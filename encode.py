@@ -13,8 +13,8 @@ from tqdm import tqdm
 import open3d as o3d
 import utils3d
 
-from TRELLIS.trellis import models
-from TRELLIS.trellis.modules import sparse as sp
+from trellis import models
+from trellis.modules import sparse as sp
 from dataset_toolkits.utils import sphere_hammersley_sequence
 from tqdm import tqdm
 
@@ -27,6 +27,7 @@ class TrellisSLatEncoderDebug:
         device: str = "cuda",
         slat_encoder=None,
         blender_bin: Optional[str] = None,
+        dino_batch_size: int = 8,
     ):
         self.device = torch.device(device)
 
@@ -38,20 +39,23 @@ class TrellisSLatEncoderDebug:
         self._dino_model = None
         self._dino_transform = None
         self._blender_bin = blender_bin
+        self.dino_batch_size = int(dino_batch_size)
+        if self.dino_batch_size < 1:
+            raise ValueError("dino_batch_size must be positive")
 
     def _ensure_dino(self):
         if self._dino_model is not None:
             return
 
-        self._dino_model = (
-            torch.hub.load(
-                "facebookresearch/dinov2",
-                "dinov2_vitl14_reg",
-                pretrained=True,
-            )
-            .eval()
-            .to(self.device)
-        )
+        if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+            repo = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+            if not os.path.isfile(os.path.join(repo, "hubconf.py")):
+                raise FileNotFoundError(f"DINOv2 offline cache missing: {repo}")
+            self._dino_model = torch.hub.load(repo, "dinov2_vitl14_reg", source="local", pretrained=True)
+        else:
+            self._dino_model = torch.hub.load("facebookresearch/dinov2:main", "dinov2_vitl14_reg",
+                                                pretrained=True, trust_repo=True)
+        self._dino_model = self._dino_model.eval().to(self.device)
 
         self._dino_transform = transforms.Compose([
             transforms.Normalize(
@@ -97,6 +101,8 @@ class TrellisSLatEncoderDebug:
         cmd = [
             blender_bin,
             "-b",
+            "--threads", os.environ.get("OMP_NUM_THREADS", "4"),
+            "--python-exit-code", "1",
             "-P",
             script_path,
             "--",
@@ -113,7 +119,14 @@ class TrellisSLatEncoderDebug:
             "--save_mesh",
         ]
 
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+        log_path = os.path.join(output_dir, "blender.log")
+        with open(log_path, "w") as log:
+            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode:
+            raise RuntimeError(f"Blender failed ({result.returncode}); see {log_path}")
+        for filename in ("transforms.json", "mesh.ply"):
+            if not os.path.isfile(os.path.join(output_dir, filename)):
+                raise RuntimeError(f"Blender did not produce {filename}; see {log_path}")
         return os.path.abspath(output_dir)
 
     def _voxelize_ply(
@@ -162,7 +175,8 @@ class TrellisSLatEncoderDebug:
         with open(os.path.join(render_dir, "transforms.json"), "r") as f:
             frames = json.load(f)["frames"]
 
-        patchtokens_acc = []
+        patchtokens_sum = None
+        num_frames = 0
 
         for i in tqdm(range(0, len(frames), batch_size), desc="DINOv2 features"):
             batch = frames[i:i + batch_size]
@@ -226,9 +240,14 @@ class TrellisSLatEncoderDebug:
                 align_corners=False,
             ).squeeze(2).permute(0, 2, 1)
 
-            patchtokens_acc.append(sampled.cpu())
+            # Stream the view sum instead of retaining [views, voxels, 1024].
+            batch_sum = sampled.float().sum(dim=0).cpu()
+            patchtokens_sum = batch_sum if patchtokens_sum is None else patchtokens_sum + batch_sum
+            num_frames += len(batch)
 
-        return torch.cat(patchtokens_acc, dim=0).mean(dim=0).numpy()
+        if not num_frames:
+            raise ValueError("No rendered views available for DINO encoding")
+        return (patchtokens_sum / num_frames).numpy()
 
     @torch.no_grad()
     def encode_to_slat(
@@ -256,7 +275,9 @@ class TrellisSLatEncoderDebug:
             voxel_ply = os.path.join(tmp_dir, "voxels.ply")
 
             indices = self._voxelize_ply(normalised_mesh, voxel_ply)
-            features = self._extract_dino_features(render_dir, voxel_ply)
+            features = self._extract_dino_features(render_dir, voxel_ply, batch_size=self.dino_batch_size)
+            # Match dataset_toolkits/extract_feature.py's cached FP16 features.
+            features = features.astype(np.float16).astype(np.float32)
 
             coords = torch.cat([
                 torch.zeros(len(indices), 1),

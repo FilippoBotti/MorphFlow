@@ -156,3 +156,52 @@ Restano disponibili le variabili del launcher di ateneo: `ROOT_DIR`,
 `SLAT_STEPS`, `SLAT_CFG_SCALE`, `TRELLIS_MODEL`, `MIXED_PRECISION`, `SAVE_LATENTS`.
 I checkpoint SLat condizionati con DINO richiedono immagini e cache Torch Hub;
 `--prepare` prepara anche quest'ultima quando necessaria.
+
+## Inferenza da due GLB con encoding multiview
+
+`generate_glb_pair.py` accetta due GLB arbitrari, checkpoint SS/SLat espliciti
+(SS standard e conditioning SLat) e una griglia cartesiana di CFG.
+Il launcher `generate_glb_pair_leonardo.sbatch` richiede 1 GPU, 8 CPU, 64 GiB
+per 4 ore. Le notifiche includono inizio, fine e fallimento.
+
+```bash
+# Default: assets/Werewolf_Warrior.glb, assets/pool3913.glb;
+# ultimi checkpoint con prior disponibili al 7 ottobre 2026:
+# SS tangentScaleAnchor ep25/step125000; SLat prior ep5/step50000.
+bash slurm/generate_glb_pair_leonardo.sbatch --prepare
+sbatch slurm/generate_glb_pair_leonardo.sbatch
+
+# Asset, checkpoint e CFG personalizzati:
+SS_CHECKPOINT=/percorso/ss.pt SLAT_CHECKPOINT=/percorso/slat.pt \
+CFG_SS='2,2.5,3' CFG_SLAT='1.5,2,2.5' \
+sbatch slurm/generate_glb_pair_leonardo.sbatch /percorso/primo.glb /percorso/secondo.glb
+```
+
+Per ogni asset: rendering Blender di 50 viste a 512px, normalizzazione nello
+stesso cubo del dataset, voxelizzazione 64^3, DINOv2 ViT-L/14 con register,
+proiezione e media delle feature sulle viste, encoder TRELLIS SLat con media
+posterior deterministica. `ENCODING_VIEWS` e `DINO_BATCH_SIZE` sono modificabili.
+I latenti di condizionamento vengono salvati e riutilizzati, senza ricodifica
+per ogni CFG. Le ricostruzioni dell'encoder sono salvate separatamente.
+
+Con i default vengono prodotti 27 GLB: 3 CFG SS x 3 CFG SLat x 3 alpha.
+La convenzione e' `alpha=1 -> primo GLB`, `alpha=0 -> secondo GLB`.
+Anche alpha 0 e 1 sono generati dal modello, non copie dei file originali.
+SS e SLat usano 50 passi Euler e BF16; il seed SS e quello SLat sono fissi
+per confrontare i CFG. Le 9 strutture SS vengono generate una sola volta.
+
+Output: `outputs/glb_pair/werewolf_pool_prior_cfggrid/job_<id>/`:
+
+- `encoding/src{1,2}/`: viste, mesh normalizzata, voxel, `slat.pt`, `reconstruction.glb`.
+- `ss/`: i 9 latenti SS con le coordinate generate.
+- `cfg_ss_<cfg>_slat_<cfg>/alpha_<alpha>/`: `prediction.glb`, `slat.pt`, `result.json`.
+- `run.json` e `results.json`: configurazione, checkpoint, stato e indice risultati.
+
+I GLB esportano i colori ai vertici del mesh decoder, senza texture baking UV.
+Gli assi tornano a Y-up per la visualizzazione GLB. Encoder, flow SS e flow
+SLat vengono caricati in fasi successive per contenere la memoria GPU.
+
+`OUTPUT_DIR` consente di riprendere la stessa cartella con configurazione e
+file sorgente invariati: gli output completati vengono riutilizzati. In caso
+di errore vengono prodotti traceback Slurm e `last_error.json`.
+`--check` verifica import, checkpoint e cache senza fare inferenza GPU.
