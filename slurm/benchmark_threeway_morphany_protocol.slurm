@@ -25,13 +25,13 @@
 set -euo pipefail
 
 # IMPORTANT: in MorphFlow benchmark K means INTERMEDIATE states only.
-export N=50
-export K=48
-export SEED=42
-export NUM_VIEWS=12
-export RENDER_RESOLUTION=512
-export LPIPS_NET=vgg
-export RUN_NAME="threeway_morphanyproto_pairs50_frames50_seed42_v12"
+export N="${N:-50}"
+export K="${K:-48}"
+export SEED="${SEED:-42}"
+export NUM_VIEWS="${NUM_VIEWS:-12}"
+export RENDER_RESOLUTION="${RENDER_RESOLUTION:-512}"
+export LPIPS_NET="${LPIPS_NET:-vgg}"
+export RUN_NAME="${RUN_NAME:-threeway_morphanyproto_pairs50_frames50_seed42_v12}"
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/trellis-singularity/work/MorphFlow}"
 SIF="${SIF:-$HOME/containers/trellis-py240-cu118.sif}"

@@ -388,16 +388,24 @@ run_sharded morphflow "$ORIGINAL_ENV" "$TRELLIS_REPO_HOST" \
         --mixed-precision "$MIXED_PRECISION" \
         --trellis-model image_large
 
-run_sharded morphany3d "$MORPHANY_ENV" "$MORPHANY_REPO" \
-    python "$SCRIPT_IN" morphany3d \
-        --run-root /benchmark \
-        --tfsa-cache-mode "$MORPHANY_TFSA_CACHE_MODE" \
-        --tfsa-ram-gb "$MORPHANY_TFSA_RAM_GB_PER_WORKER" \
-        --tfsa-min-node-free-gb "$MORPHANY_TFSA_MIN_NODE_FREE_GB" \
-        --local-cache-root /runtime-tmp/morphany-local
+if [[ "${REUSE_MORPHANY3D:-0}" != "1" ]]; then
+    run_sharded morphany3d "$MORPHANY_ENV" "$MORPHANY_REPO" \
+        python "$SCRIPT_IN" morphany3d \
+            --run-root /benchmark \
+            --tfsa-cache-mode "$MORPHANY_TFSA_CACHE_MODE" \
+            --tfsa-ram-gb "$MORPHANY_TFSA_RAM_GB_PER_WORKER" \
+            --tfsa-min-node-free-gb "$MORPHANY_TFSA_MIN_NODE_FREE_GB" \
+            --local-cache-root /runtime-tmp/morphany-local
+else
+    echo "[$(date -Is)] REUSE MorphAny3D generation" | tee -a "$RUN_ROOT/progress.log"
+fi
 
-run_sharded interp3d "$INTERP_ENV" "$INTERP_REPO" \
-    python "$SCRIPT_IN" interp3d --run-root /benchmark
+if [[ "${REUSE_INTERP3D:-0}" != "1" ]]; then
+    run_sharded interp3d "$INTERP_ENV" "$INTERP_REPO" \
+        python "$SCRIPT_IN" interp3d --run-root /benchmark
+else
+    echo "[$(date -Is)] REUSE Interp3D generation" | tee -a "$RUN_ROOT/progress.log"
+fi
 
 # -------------------------------
 # 3) Common texture baking: pair-sharded over GPUs
@@ -416,7 +424,7 @@ run_phase texture_status "$MORPHANY_ENV" "$MORPHANY_REPO" "cpu" \
 # 4) Material-render perceptual evaluation, pair-sharded over GPUs
 #    Includes original metrics + endpoint-inclusive FULL path metrics + FID features.
 # -------------------------------
-for METHOD in morphflow morphany3d interp3d; do
+for METHOD in ${EVAL_METHODS:-morphflow morphany3d interp3d}; do
     run_sharded "metrics_${METHOD}" "$MORPHANY_ENV" "$MORPHANY_REPO" \
         python "$EVAL_IN" shard \
             --run-dir "/benchmark/$METHOD" \
