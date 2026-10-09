@@ -93,13 +93,15 @@ class ModulatedTransformerCrossBlock(nn.Module):
         qkv_bias: bool = True,
         share_mod: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["alpha_residual", "pair_channel", "token"] = "alpha_residual",
+        separate_cond_gate: Literal["token"] = "token",
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.share_mod = share_mod
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
+        if separate_cond and separate_cond_gate != "token":
+            raise ValueError("Only separate_cond_gate=token is supported")
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         self.norm2 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.norm3 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -137,36 +139,15 @@ class ModulatedTransformerCrossBlock(nn.Module):
             # Separate LayerNorm for the second cross-attention branch.
             # It is initialized/copy-loaded from norm2 in train.py.
             self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
-            if self.separate_cond_gate == "alpha_residual":
-                self.alpha_gate = nn.Sequential(
-                    nn.Linear(1, 64),
-                    nn.SiLU(),
-                    nn.Linear(64, channels),
-                )
-
-            elif self.separate_cond_gate == "pair_channel":
-                # Input: alpha + mean(cond1) + mean(cond2) + mean(cond2-cond1)
-                gate_in_dim = 1 + 3 * ctx_channels
-                self.alpha_gate = nn.Sequential(
-                    nn.Linear(gate_in_dim, channels),
-                    nn.SiLU(),
-                    nn.Linear(channels, channels),
-                )
-
-            elif self.separate_cond_gate == "token":
-                # Input per token: h1 + h2 + (h2-h1) + alpha
-                # Output: gate [B, N, C]
-                gate_in_dim = 3 * channels + 1
-                hidden_dim = max(256, channels // 2)
-                self.alpha_gate = nn.Sequential(
-                    nn.LayerNorm(gate_in_dim),
-                    nn.Linear(gate_in_dim, hidden_dim),
-                    nn.SiLU(),
-                    nn.Linear(hidden_dim, channels),
-                )
-
-            else:
-                raise ValueError(f"Unknown separate_cond_gate: {self.separate_cond_gate}")
+            # Preserve token-gate parameter names/shapes for existing checkpoints.
+            gate_in_dim = 3 * channels + 1
+            hidden_dim = max(256, channels // 2)
+            self.alpha_gate = nn.Sequential(
+                nn.LayerNorm(gate_in_dim),
+                nn.Linear(gate_in_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, channels),
+            )
 
             nn.init.zeros_(self.alpha_gate[-1].weight)
             nn.init.zeros_(self.alpha_gate[-1].bias)
@@ -221,49 +202,10 @@ class ModulatedTransformerCrossBlock(nn.Module):
             B, N, C = h1.shape
             alpha_base = alpha.reshape(B, 1, 1).to(device=h1.device, dtype=h1.dtype)
 
-            if self.separate_cond_gate == "alpha_residual":
-                # Gate [B, 1, C], dipende solo da alpha.
-                gate_delta = self.alpha_gate(alpha_base)
-                gate = self._endpoint_preserving_gate(alpha_base, gate_delta)
-
-            elif self.separate_cond_gate == "pair_channel":
-                # Gate [B, 1, C], dipende da alpha e dal contenuto globale della coppia.
-                summary1 = context1.mean(dim=1)
-                summary2 = context2.mean(dim=1)
-                summary_delta = summary2 - summary1
-
-                gate_input = torch.cat(
-                    [
-                        alpha.reshape(B, 1).to(device=h1.device, dtype=h1.dtype),
-                        summary1,
-                        summary2,
-                        summary_delta,
-                    ],
-                    dim=-1,
-                )
-
-                gate_delta = self.alpha_gate(gate_input).unsqueeze(1)
-                gate = self._endpoint_preserving_gate(alpha_base, gate_delta)
-
-            elif self.separate_cond_gate == "token":
-                # Gate [B, N, C], dipende da ogni token.
-                alpha_token = alpha_base.expand(B, N, 1)
-
-                gate_input = torch.cat(
-                    [
-                        h1,
-                        h2,
-                        h2 - h1,
-                        alpha_token,
-                    ],
-                    dim=-1,
-                )
-
-                gate_delta = self.alpha_gate(gate_input)
-                gate = self._endpoint_preserving_gate(alpha_token, gate_delta)
-
-            else:
-                raise ValueError(f"Unknown separate_cond_gate: {self.separate_cond_gate}")
+            alpha_token = alpha_base.expand(B, N, 1)
+            gate_input = torch.cat([h1, h2, h2 - h1, alpha_token], dim=-1)
+            gate_delta = self.alpha_gate(gate_input)
+            gate = self._endpoint_preserving_gate(alpha_token, gate_delta)
 
             h = (1.0 - gate) * h1 + gate * h2
         else:

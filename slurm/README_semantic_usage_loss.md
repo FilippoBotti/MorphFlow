@@ -28,9 +28,8 @@ con la probabilità della cycle.
 | `--semantic_cycle_loss_prob` | `SEMANTIC_CYCLE_LOSS_PROB` | Python `1.0`; script v3 `0.25`, come prima |
 
 Il peso deve essere finito e non negativo; il cap finito e almeno 1. Un peso
-positivo richiede `--use_semantic_token_matching 1`. La loss è supportata da SS,
-SS residual e SLat condizionato su SLat. La variante SLat-DINO non usa questo
-matcher e rifiuta un peso usage positivo.
+positivo richiede `--use_semantic_token_matching 1`. La loss è supportata da SS
+standard e SLat condizionato su SLat, con gating token.
 
 ## Lancio sul cluster di ateneo
 

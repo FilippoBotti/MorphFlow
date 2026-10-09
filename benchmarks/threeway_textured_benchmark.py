@@ -494,12 +494,10 @@ def command_morphflow(args: argparse.Namespace) -> None:
     from eval_validation_latents import (
         build_model,
         checkpoint_args,
-        checkpoint_requires_source_images,
         detect_flow_target,
         detect_model_type,
         load_checkpoint,
         load_decoders,
-        preload_dino_if_needed,
         sample_slat_on_coords,
         sample_ss,
         ss_coords_from_latent,
@@ -522,11 +520,8 @@ def command_morphflow(args: argparse.Namespace) -> None:
     slat_model_type = detect_model_type(slat_ckpt, args.trellis_model)
     ss_model = build_model(ss_ckpt, ss_model_type, "ss").to(device).eval()
     slat_model = build_model(slat_ckpt, slat_model_type, "slat").to(device).eval()
-    preload_dino_if_needed(ss_model, device)
-    preload_dino_if_needed(slat_model, device)
     ss_decoder, mesh_decoder, sparse_cls = load_decoders("ss", device)
 
-    needs_images = checkpoint_requires_source_images(slat_ckpt, "slat")
     dataset = MorphingDistillDataset(
         root=args.data_root,
         metadata_file=args.metadata,
@@ -568,9 +563,6 @@ def command_morphflow(args: argparse.Namespace) -> None:
         entry = dataset.metadata[int(pair["metadata_index"])]
         src1 = load_asset(Path(args.data_root), pair["src1"])
         src2 = load_asset(Path(args.data_root), pair["src2"])
-        if needs_images:
-            src1["image"] = dataset._load_source_image(pair["src1"], entry, "src1")
-            src2["image"] = dataset._load_source_image(pair["src2"], entry, "src2")
 
         ref_pair = refs_root / pair["pair_dir"]
         ref_pair.mkdir(parents=True, exist_ok=True)

@@ -15,4 +15,9 @@ logs/
 
 # OS
 .DS_Store
-*.bak_logging
+*.bak*
+*.before_*
+*.swp
+*.swo
+slurm-*.out
+slurm-*.err

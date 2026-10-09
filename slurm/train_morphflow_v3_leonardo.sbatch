@@ -312,7 +312,6 @@ train_args=(
     --slat_condition_source slat
     --source_images_root "$MF_SOURCE_IMAGES_ROOT"
     --dino_model dinov2_vitl14_reg
-    --dino_dim 1024
     --lora_rank 32
     --lora_alpha 64
     --lora_dropout 0.1
@@ -321,9 +320,6 @@ train_args=(
     --cond_resample_depth 1
     --cond_resample_heads 8
     --ss_flow_arch standard
-    --residual_interp_gate alpha
-    --residual_interp_gate_min 1e-3
-    --residual_endpoint_prob 0
     --endpoint_loss_weight 0.0
     --symmetry_loss_weight 0.0
     --endpoint_loss_prob 0.0

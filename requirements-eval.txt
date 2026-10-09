@@ -1,2 +1,4 @@
-# Evaluation-only dependency for eval_fid_kid.py
+# Evaluation-only dependencies (PyTorch/torchvision are supplied by the training environment).
 clean-fid>=0.1.35,<1
+lpips>=0.1.4,<0.2
+matplotlib>=3.5,<4

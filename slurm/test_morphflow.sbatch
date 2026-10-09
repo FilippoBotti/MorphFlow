@@ -50,11 +50,9 @@ echo "===== MORPHFLOW ====="
 python - <<'PY'
 from models.morph_flow import MorphFlow
 from models.morph_slat_flow import MorphSLatFlow
-from models.morph_residual_flow import MorphResidualSSFlow
 
 print("MorphFlow: OK")
 print("MorphSLatFlow: OK")
-print("MorphResidualSSFlow: OK")
 PY
 
 echo

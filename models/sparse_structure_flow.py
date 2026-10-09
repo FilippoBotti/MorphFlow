@@ -72,7 +72,7 @@ class SparseStructureFlowModel(nn.Module):
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["alpha_residual", "pair_channel", "token"] = "alpha_residual",
+        separate_cond_gate: Literal["token"] = "token",
     ):
         super().__init__()
         self.resolution = resolution

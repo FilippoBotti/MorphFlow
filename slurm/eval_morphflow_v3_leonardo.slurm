@@ -104,7 +104,6 @@ for value in cfg_values:
         raise SystemExit(f"CFG non valido: {value}")
 
 targets = []
-dino_models = set()
 for path in filter(None, (primary, secondary)):
     ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     args = ckpt.get("args", {})
@@ -114,10 +113,12 @@ for path in filter(None, (primary, secondary)):
     targets.append(target)
     print(f"Checkpoint: {path} | flow={target} epoch={ckpt.get('epoch')} "
           f"step={ckpt.get('step')} val_loss={ckpt.get('val_loss')}")
-    if target == "slat" and args.get("slat_condition_source", "slat") == "dino":
-        if not Path(images).is_dir():
-            raise SystemExit(f"Checkpoint DINO: immagini mancanti in {images}")
-        dino_models.add(args.get("dino_model", "dinov2_vitl14_reg"))
+    if args.get("slat_condition_source", "slat") != "slat":
+        raise SystemExit("Checkpoint con conditioning diretto DINO non più supportato.")
+    if args.get("ss_flow_arch", "standard") != "standard":
+        raise SystemExit("Checkpoint SS residuale non più supportato.")
+    if int(args.get("separate_cond", 0)) and args.get("separate_cond_gate") != "token":
+        raise SystemExit("Sono supportati solo checkpoint con gating token.")
     del ckpt
 if secondary and targets != ["ss", "slat"]:
     raise SystemExit("La pipeline richiede CHECKPOINT_PATH=SS e SLAT_CHECKPOINT_PATH=SLat.")
@@ -135,18 +136,6 @@ for decoder in decoders:
             raise SystemExit(f"Decoder mancante: {filename}: {exc}\n"
                              "Eseguire --prepare dal login con gli stessi checkpoint.") from exc
         print(f"Decoder: {path}")
-for model in sorted(dino_models):
-    if mode == "--prepare":
-        encoder = torch.hub.load("facebookresearch/dinov2:main", model,
-                                 pretrained=True, trust_repo=True)
-        del encoder
-    else:
-        from unittest.mock import patch
-        with patch("torch.hub.urlopen", side_effect=RuntimeError(
-                "Cache DINO incompleta: eseguire --prepare dal login.")):
-            encoder = torch.hub.load("facebookresearch/dinov2:main", model,
-                                     pretrained=True, trust_repo=True)
-            del encoder
 PY
 
 eval_args=(

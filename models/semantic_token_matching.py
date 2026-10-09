@@ -34,7 +34,7 @@ class SemanticTokenMatcher(nn.Module):
     the token axis unchanged and mixes each stream with a soft correspondence
     from the opposite stream. It is therefore safe before both:
       - PairConditionFusionV2 (single-condition path), and
-      - separate condition projection/gating (alpha_residual, pair_channel, token).
+      - separate condition projection with token gating.
 
     Optional tail tokens, e.g. global style tokens appended by sparse_conv3d,
     can be excluded from matching and copied unchanged.

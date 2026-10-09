@@ -26,11 +26,12 @@ computes perceptual sequence metrics used in image/textured-3D morphing work:
 * PPL sum                                (DiffMorpher / 3D morphing definition)
 * normalized PPL = path length/endpoints (Interp3D adaptation)
 * PDV = variance of adjacent LPIPS       (DiffMorpher / MorphAny3D)
+* alpha-weighted endpoint LPIPS: alpha*d(frame,src1)+(1-alpha)*d(frame,src2)
 
 It also reports endpoint fidelity and alpha-speed-normalized diagnostics. The
 latter are useful diagnostics, not canonical paper metrics.
 
-Lower is better for all metrics reported by this script.
+Weighted endpoint LPIPS measures source proximity, not overall morphing quality.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -76,6 +78,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output_dir", default=None, help="Defaults to <run_dir>/perceptual_sequence")
+    parser.add_argument("--src1", type=Path, help="Override reference GLB at alpha=1")
+    parser.add_argument("--src2", type=Path, help="Override reference GLB at alpha=0")
     parser.add_argument("--stage", choices=["all", "prepare", "metrics"], default="all")
     parser.add_argument(
         "--pair_glob",
@@ -159,6 +163,8 @@ def discover_sequence_dirs(run_dir: Path, pair_glob: str) -> List[Path]:
     """Return one or more directories that each represent a complete morph pair."""
     if (run_dir / "src1.glb").is_file() and (run_dir / "src2.glb").is_file():
         return [run_dir]
+    if any(run_dir.glob("alpha_*/*.glb")):
+        return [run_dir]
 
     pair_dirs: List[Path] = []
     for path in sorted(run_dir.glob(pair_glob)):
@@ -173,6 +179,11 @@ def discover_sequence_dirs(run_dir: Path, pair_glob: str) -> List[Path]:
 
     if pair_dirs:
         return pair_dirs
+    # generate_glb_pair.py: one independent alpha sequence per CFG combination.
+    cfg_dirs = [p.resolve() for p in sorted(run_dir.glob("cfg_ss_*_slat_*"))
+                if p.is_dir() and any(p.glob("alpha_*/prediction.glb"))]
+    if cfg_dirs:
+        return cfg_dirs
 
     raise FileNotFoundError(
         f"Could not find a single sequence or any {pair_glob!r} sequence directories in {run_dir}. "
@@ -181,11 +192,23 @@ def discover_sequence_dirs(run_dir: Path, pair_glob: str) -> List[Path]:
     )
 
 
-def discover_frames(run_dir: Path) -> Tuple[Path, Path, List[Frame], Dict[str, Any]]:
-    src1 = run_dir / "src1.glb"
-    src2 = run_dir / "src2.glb"
+def discover_frames(run_dir: Path, src1=None, src2=None) -> Tuple[Path, Path, List[Frame], Dict[str, Any]]:
+    config = {}
+    for parent in (run_dir, run_dir.parent):
+        if (parent / "run.json").is_file():
+            config = read_json(parent / "run.json").get("config", {})
+            break
+    def reference(override, role):
+        if override is not None:
+            return Path(override).expanduser().resolve()
+        local = run_dir / (role + ".glb")
+        if local.is_file():
+            return local
+        return Path(config.get(role, str(local))).expanduser()
+    src1 = reference(src1, "src1")
+    src2 = reference(src2, "src2")
     if not src1.is_file() or not src2.is_file():
-        raise FileNotFoundError(f"Expected src1.glb and src2.glb in sequence directory {run_dir}")
+        raise FileNotFoundError(f"Missing source GLBs for {run_dir}; pass --src1 and --src2.")
 
     summary_path = run_dir / "summary.json"
     summary: Dict[str, Any] = read_json(summary_path) if summary_path.is_file() else {}
@@ -246,10 +269,29 @@ def discover_frames(run_dir: Path) -> Tuple[Path, Path, List[Frame], Dict[str, A
                 candidates.append((float(row["alpha"]), mesh.resolve()))
 
     # Deduplicate alpha/path records that can be present in more than one manifest.
+    if not candidates:
+        for folder in sorted(run_dir.glob("alpha_*")):
+            mesh = next((folder / name for name in ("pred_final.glb", "prediction.glb")
+                         if (folder / name).is_file()), None)
+            if mesh is None:
+                continue
+            record = read_json(folder / "result.json") if (folder / "result.json").is_file() else {}
+            alpha_value = record.get("model_alpha", record.get("alpha"))
+            if alpha_value is None:
+                suffix = folder.name[len("alpha_"):].replace("p", ".")
+                if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", suffix):
+                    raise ValueError(f"Cannot infer alpha from {folder}; add metadata/result.json")
+                alpha_value = float(suffix)
+            candidates.append((float(alpha_value), mesh.resolve()))
+
     unique: Dict[Tuple[float, str], Tuple[float, Path]] = {}
     for alpha, mesh in candidates:
+        if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+            raise ValueError(f"Alpha must be finite and in [0,1]: {alpha} ({mesh})")
         unique[(float(alpha), str(mesh))] = (float(alpha), mesh)
     candidates = list(unique.values())
+    if len({a for a, _ in candidates}) != len(candidates):
+        raise ValueError(f"Multiple generated GLBs have the same alpha in {run_dir}")
 
     if len(candidates) < 2:
         raise RuntimeError(
@@ -444,6 +486,68 @@ def safe_ratio(num: float, den: float) -> float:
     return float(num / den)
 
 
+def weighted_endpoint_curve(alphas, to_src1, to_src2):
+    """Distances have shape [views, frames]; alpha=1 selects src1.
+
+    This measures source proximity, not temporal smoothness or realism.
+    Standard deviations below describe variation across cameras, not uncertainty.
+    """
+    alpha = np.asarray(alphas, dtype=np.float64)
+    d1, d2 = np.asarray(to_src1, dtype=np.float64), np.asarray(to_src2, dtype=np.float64)
+    if alpha.ndim != 1 or len(alpha) < 2 or len(np.unique(alpha)) != len(alpha):
+        raise ValueError("Need at least two distinct alpha values")
+    if not np.isfinite(alpha).all() or np.any((alpha < 0) | (alpha > 1)):
+        raise ValueError("Alpha must be finite and in [0,1]")
+    if d1.ndim != 2 or d1.shape != d2.shape or d1.shape[1] != len(alpha) or not len(d1):
+        raise ValueError("Endpoint distances must have matching [views, frames] shapes")
+    if not np.isfinite(d1).all() or not np.isfinite(d2).all():
+        raise ValueError("Non-finite LPIPS distance")
+    c1, c2 = alpha[None, :] * d1, (1 - alpha[None, :]) * d2
+    weighted = c1 + c2
+    rows = []
+    for i, a in enumerate(alpha):
+        rows.append({
+            "alpha": float(a), "num_views": len(d1),
+            "lpips_src1_mean": float(d1[:, i].mean()),
+            "lpips_src2_mean": float(d2[:, i].mean()),
+            "src1_weighted_mean": float(c1[:, i].mean()),
+            "src2_weighted_mean": float(c2[:, i].mean()),
+            "weighted_lpips_mean": float(weighted[:, i].mean()),
+            "weighted_lpips_std_views": float(weighted[:, i].std(ddof=0)),
+        })
+    return rows, weighted
+
+
+def plot_weighted_endpoints(rows, output_dir):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = sorted(rows, key=lambda row: row["alpha"])
+    def column(key):
+        return np.asarray([row[key] for row in rows])
+    alpha, value = column("alpha"), column("weighted_lpips_mean")
+    std = column("weighted_lpips_std_views")
+    fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True, constrained_layout=True)
+    ax = axes[0]
+    ax.plot(alpha, value, "o-", color="#1565c0", label="Weighted endpoint LPIPS")
+    ax.fill_between(alpha, np.maximum(0, value - std), value + std, color="#1565c0", alpha=.16,
+                    label="±1 SD across views")
+    ax.plot(alpha, column("src1_weighted_mean"), "--", color="#2e7d32", label="alpha × LPIPS(src1)")
+    ax.plot(alpha, column("src2_weighted_mean"), "--", color="#ef6c00", label="(1-alpha) × LPIPS(src2)")
+    ax.set_title("Source proximity along the morphing sequence")
+    ax.set_ylabel("Weighted LPIPS"); ax.legend(fontsize=9)
+    axes[1].plot(alpha, column("lpips_src1_mean"), "o-", color="#2e7d32", label="LPIPS to src1")
+    axes[1].plot(alpha, column("lpips_src2_mean"), "o-", color="#ef6c00", label="LPIPS to src2")
+    axes[1].set_ylabel("Unweighted LPIPS")
+    axes[1].set_xlabel("alpha (0 = src2, 1 = src1)"); axes[1].legend(fontsize=9)
+    for ax in axes:
+        ax.grid(alpha=.2); ax.set_xlim(0, 1)
+    for extension in ("png", "pdf"):
+        fig.savefig(output_dir / f"weighted_endpoint_lpips.{extension}", dpi=180)
+    plt.close(fig)
+
+
 def compute_metrics(
     args: argparse.Namespace,
     output_dir: Path,
@@ -460,6 +564,11 @@ def compute_metrics(
     pair_specs: List[Tuple[str, int, int, float, float, Path, Path]] = []
     # kind, view, transition_idx, alpha_from, alpha_to, image_a, image_b
     for view in range(args.num_views):
+        for i, frame in enumerate(frames):
+            for role, endpoint_alpha in (("src1", 1.0), ("src2", 0.0)):
+                pair_specs.append(("to_" + role, view, i, frame.alpha, endpoint_alpha,
+                                   image_path(output_dir, frame.key, view),
+                                   image_path(output_dir, role, view)))
         for i in range(len(frames) - 1):
             a, b = frames[i], frames[i + 1]
             pair_specs.append(
@@ -528,9 +637,12 @@ def compute_metrics(
     transition_rows: List[Dict[str, Any]] = []
     per_view: List[Dict[str, Any]] = []
     grouped: Dict[int, Dict[str, Any]] = {v: {} for v in range(args.num_views)}
+    endpoint_rows = []
     for spec, value in zip(pair_specs, values):
         kind, view, transition_idx, alpha_from, alpha_to, _image_a, _image_b = spec
-        if kind == "adjacent":
+        if kind in ("to_src1", "to_src2"):
+            grouped[view].setdefault(kind, []).append(value)
+        elif kind == "adjacent":
             delta_alpha = abs(alpha_from - alpha_to)
             transition_rows.append(
                 {
@@ -549,6 +661,20 @@ def compute_metrics(
         else:
             grouped[view][kind] = value
 
+    curve, weighted = weighted_endpoint_curve(
+        [f.alpha for f in frames],
+        [grouped[v]["to_src1"] for v in range(args.num_views)],
+        [grouped[v]["to_src2"] for v in range(args.num_views)],
+    )
+    for view in range(args.num_views):
+        for i, frame in enumerate(frames):
+            endpoint_rows.append({"view": view, "frame": i, "alpha": frame.alpha,
+                                  "mesh": str(frame.mesh),
+                                  "lpips_src1": grouped[view]["to_src1"][i],
+                                  "lpips_src2": grouped[view]["to_src2"][i],
+                                  "weighted_lpips": float(weighted[view, i])})
+    order = np.argsort([f.alpha for f in frames])
+    sorted_alphas = np.asarray([f.alpha for f in frames])[order]
     for view in range(args.num_views):
         g = grouped[view]
         adjacent = np.asarray(g["adjacent"], dtype=np.float64)
@@ -562,6 +688,8 @@ def compute_metrics(
         # Canonical-style metrics.
         row = {
             "view": view,
+            "weighted_endpoint_lpips_mean": float(weighted[view].mean()),
+            "weighted_endpoint_lpips_auc": float(np.trapz(weighted[view, order], sorted_alphas)),
             "lpips_adjacent_mean": float(adjacent.mean()),
             "lpips_adjacent_std": float(adjacent.std(ddof=0)),
             "lpips_adjacent_max": float(adjacent.max()),
@@ -626,7 +754,12 @@ def compute_metrics(
         "num_generated_frames": len(frames),
         "sequence_order": "src1 -> src2 (alpha descending)",
         "alphas": [frame.alpha for frame in frames],
+        "weighted_endpoint_curve": curve,
         "definitions": {
+            "weighted_endpoint_lpips": "alpha*LPIPS(frame,src1)+(1-alpha)*LPIPS(frame,src2); mean across identical camera views",
+            "weighted_endpoint_lpips_mean": "mean weighted endpoint distance across sampled frames; depends on alpha sampling",
+            "weighted_endpoint_lpips_auc": "trapezoidal integral over the observed alpha interval, without extrapolation",
+            "weighted_endpoint_interpretation": "source proximity; not a standalone measure of smoothness, realism or morphing quality",
             "lpips_adjacent_mean": "mean LPIPS over consecutive generated morph frames",
             "ppl_sum": "sum of LPIPS over consecutive generated morph frames",
             "ppl_normalized_reference_endpoints": "ppl_sum / LPIPS(src1, src2), matching the Interp3D source-target normalization",
@@ -639,6 +772,9 @@ def compute_metrics(
         },
         "aggregate_across_views": aggregate,
     }
+    _write_batch_csv(output_dir / "weighted_endpoint_lpips.csv", curve)
+    _write_batch_csv(output_dir / "weighted_endpoint_lpips_per_view.csv", endpoint_rows)
+    plot_weighted_endpoints(curve, output_dir)
     write_json(output_dir / "metrics.json", result)
     return result
 
@@ -646,6 +782,8 @@ def compute_metrics(
 def print_summary(result: Mapping[str, Any]) -> None:
     agg = result["aggregate_across_views"]
     keys = [
+        "weighted_endpoint_lpips_mean",
+        "weighted_endpoint_lpips_auc",
         "lpips_adjacent_mean",
         "ppl_sum",
         "ppl_normalized_reference_endpoints",
@@ -701,7 +839,8 @@ def process_sequence(
     lpips_model=None,
     lpips_device=None,
 ) -> Dict[str, Any] | None:
-    src1, src2, frames, source_summary = discover_frames(sequence_dir)
+    src1, src2, frames, source_summary = discover_frames(
+        sequence_dir, getattr(args, "src1", None), getattr(args, "src2", None))
     alpha_info = alpha_diagnostics(frames)
     if args.strict_uniform_alphas and not alpha_info["uniform"]:
         raise ValueError(
@@ -737,7 +876,20 @@ def process_sequence(
             "background": "white RGB after alpha compositing",
         },
     }
-    write_json(output_dir / "manifest.json", manifest)
+    manifest["file_identity"] = [
+        {"path": str(path), "size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
+        for path in (src1, src2, *(frame.mesh for frame in frames))
+    ]
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.is_file():
+        previous = read_json(manifest_path)
+        fields = ("src1", "src2", "frames", "render_protocol", "file_identity")
+        if any(previous.get(key) != manifest[key] for key in fields):
+            if args.stage == "metrics" or not args.overwrite:
+                raise ValueError("Cached renders use different files/settings. Run --stage prepare --overwrite first.")
+    elif args.stage == "metrics":
+        raise FileNotFoundError("Missing render manifest; run --stage prepare first.")
+    write_json(manifest_path, manifest)
 
     if args.stage in ("all", "prepare"):
         render_records(args, output_dir, src1, src2, frames)
@@ -848,6 +1000,8 @@ def main() -> None:
             print("\n===== BATCH PERCEPTUAL SEQUENCE METRICS =====")
             print(f"pairs: {len(pair_results)} | views/pair: {args.num_views} | LPIPS: {args.lpips_net}")
             for key in (
+                "weighted_endpoint_lpips_mean",
+                "weighted_endpoint_lpips_auc",
                 "lpips_adjacent_mean",
                 "ppl_sum",
                 "ppl_normalized_reference_endpoints",

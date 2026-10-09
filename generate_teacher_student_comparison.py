@@ -508,7 +508,7 @@ def student_phase(root, plan):
         return
     device = torch.device("cuda")
     precision = inference.resolve_mixed_precision(args.mixed_precision, device)
-    models, needs_images = [], False
+    models = []
     for target, checkpoint_path in (("ss", args.checkpoint_path), ("slat", args.slat_checkpoint_path)):
         checkpoint = inference.load_checkpoint(checkpoint_path)
         if inference.detect_flow_target(checkpoint) != target:
@@ -517,22 +517,13 @@ def student_phase(root, plan):
         if model_type != "image_large":
             raise ValueError(f"The image teacher requires image_large checkpoints; got {model_type}")
         model = inference.build_model(checkpoint, model_type, target).to(device).eval()
-        inference.preload_dino_if_needed(model, device)
-        needs_images |= inference.checkpoint_requires_source_images(checkpoint, target)
         models.append(model)
         del checkpoint
     ss_model, slat_model = models
     ss_decoder, mesh_decoder, sparse_cls = inference.load_decoders("ss", device)
-    dataset = MorphingDistillDataset(root=str(root / "teacher"), metadata_file="metadata.json",
-                                    split=None, strict_split=False, skip_missing=False, verbose=False)
     with torch.no_grad():
         for pair_index, pair in enumerate(plan["pairs"]):
             src1, src2 = [load_asset(root, pair[key]) for key in ("src_1", "src_2")]
-            if needs_images:
-                entry = {"src_1": pair["src_1"], "src_2": pair["src_2"]}
-                for role, src in (("src1", src1), ("src2", src2)):
-                    entry[f"{role}_image"] = f"assets/{src['name']}/{plan['sources'][src['name']]['input_file']}"
-                    src["image"] = dataset._load_source_image(src["name"], entry, role)
             ss_seed = (args.seed + 2 * pair_index) % 2**32
             slat_seed = (ss_seed + 1) % 2**32
             for index, alpha in enumerate(plan["alphas"], 1):

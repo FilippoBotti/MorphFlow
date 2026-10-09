@@ -100,7 +100,7 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         qkv_bias: bool = True,
         share_mod: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["alpha_residual", "pair_channel", "token"] = "alpha_residual",
+        separate_cond_gate: Literal["token"] = "token",
 
     ):
         super().__init__()
@@ -108,6 +108,8 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         self.share_mod = share_mod
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
+        if separate_cond and separate_cond_gate != "token":
+            raise ValueError("Only separate_cond_gate=token is supported")
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         self.norm2 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.norm3 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -145,30 +147,14 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
             )
             self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
 
-            if self.separate_cond_gate == "alpha_residual":
-                self.alpha_gate = nn.Sequential(
-                    nn.Linear(1, 64),
-                    nn.SiLU(),
-                    nn.Linear(64, channels),
-                )
-            elif self.separate_cond_gate == "pair_channel":
-                gate_in_dim = 1 + 3 * ctx_channels
-                self.alpha_gate = nn.Sequential(
-                    nn.Linear(gate_in_dim, channels),
-                    nn.SiLU(),
-                    nn.Linear(channels, channels),
-                )
-            elif self.separate_cond_gate == "token":
-                gate_in_dim = 3 * channels + 1
-                hidden_dim = max(256, channels // 2)
-                self.alpha_gate = nn.Sequential(
-                    nn.LayerNorm(gate_in_dim),
-                    nn.Linear(gate_in_dim, hidden_dim),
-                    nn.SiLU(),
-                    nn.Linear(hidden_dim, channels),
-                )
-            else:
-                raise ValueError(f"Unknown separate_cond_gate: {self.separate_cond_gate}")
+            gate_in_dim = 3 * channels + 1
+            hidden_dim = max(256, channels // 2)
+            self.alpha_gate = nn.Sequential(
+                nn.LayerNorm(gate_in_dim),
+                nn.Linear(gate_in_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, channels),
+            )
 
             nn.init.zeros_(self.alpha_gate[-1].weight)
             nn.init.zeros_(self.alpha_gate[-1].bias)
@@ -214,35 +200,12 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         h = x.replace(self.norm4(x.feats))
         h2 = self.cross_attn2(h, context2)
 
-        batch_size = x.shape[0]
-        alpha_batch = alpha.reshape(batch_size, 1).to(device=x.device, dtype=h1.dtype)
-
-        if self.separate_cond_gate == "alpha_residual":
-            gate_delta = self.alpha_gate(alpha_batch)
-            gate = self._endpoint_preserving_gate(alpha_batch, gate_delta)
-            return h1 * (1.0 - gate) + h2 * gate
-
-        if self.separate_cond_gate == "pair_channel":
-            summary1 = context1.mean(dim=1)
-            summary2 = context2.mean(dim=1)
-            summary_delta = summary2 - summary1
-            gate_input = torch.cat([alpha_batch, summary1, summary2, summary_delta], dim=-1)
-            gate_delta = self.alpha_gate(gate_input)
-            gate = self._endpoint_preserving_gate(alpha_batch, gate_delta)
-            return h1 * (1.0 - gate) + h2 * gate
-
-        if self.separate_cond_gate == "token":
-            alpha_rows = self._sparse_alpha_rows(h1, alpha)
-            gate_input = torch.cat(
-                [h1.feats, h2.feats, h2.feats - h1.feats, alpha_rows],
-                dim=-1,
-            )
-            gate_delta = self.alpha_gate(gate_input)
-            gate = self._endpoint_preserving_gate(alpha_rows, gate_delta)
-            feats = (1.0 - gate) * h1.feats + gate * h2.feats
-            return h1.replace(feats)
-
-        raise ValueError(f"Unknown separate_cond_gate: {self.separate_cond_gate}")
+        alpha_rows = self._sparse_alpha_rows(h1, alpha)
+        gate_input = torch.cat([h1.feats, h2.feats, h2.feats - h1.feats, alpha_rows], dim=-1)
+        gate_delta = self.alpha_gate(gate_input)
+        gate = self._endpoint_preserving_gate(alpha_rows, gate_delta)
+        feats = (1.0 - gate) * h1.feats + gate * h2.feats
+        return h1.replace(feats)
 
     def _forward(self, x: SparseTensor, mod: torch.Tensor, context) -> SparseTensor:
         if self.share_mod:

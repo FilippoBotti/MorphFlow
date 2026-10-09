@@ -51,7 +51,7 @@ class MorphSLatFlow(SemanticTokenMatchingMixin, nn.Module):
         model_type: str = "text_base",
         separate_cond: bool = False,
         use_checkpoint: bool = False,
-        separate_cond_gate: str = "alpha_residual",
+        separate_cond_gate: str = "token",
         cond_resample_tokens: int = 0,
         cond_resample_depth: int = 1,
         cond_resample_heads: int = 8,

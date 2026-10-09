@@ -25,9 +25,7 @@ from tqdm.auto import tqdm
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
-from models.morph_dino_slat_flow import MorphDinoSLatFlow
 from models.morph_flow import MorphFlow
-from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
 from modules.training_metrics import collect_reduced_forward_metrics
 from modules.trellis_prior_training import (
@@ -87,15 +85,10 @@ def build_parser():
     # Model
     parser.add_argument("--trellis_model", type=str, choices=["text_base", "image_large"], default="text_base")
     parser.add_argument("--flow_target", type=str, choices=["ss", "slat"], default="ss", help="Train sparse-structure flow or structured-latent flow.")
-    parser.add_argument("--slat_condition_source", type=str, choices=["slat", "dino"], default="slat", help="Condition the second flow with source SLat geometry tokens or source-image DINO tokens.")
-    parser.add_argument("--ss_flow_arch", type=str, choices=["standard", "residual_interp"], default="standard", help="SS flow architecture.")
-    parser.add_argument("--residual_interp_gate", type=str, choices=["none", "alpha"], default="alpha", help="For residual_interp: residual gating mode.")
-    parser.add_argument("--residual_interp_gate_min", type=float, default=1e-3, help="Minimum divisor used while mapping target SS to residual space.")
-    parser.add_argument("--residual_endpoint_prob", type=float, default=0.0, help="Probability of auxiliary alpha=0/1 residual flow-matching batch.")
-    parser.add_argument("--residual_endpoint_weight", type=float, default=1.0, help="Weight of auxiliary alpha=0/1 residual flow-matching loss.")
-    parser.add_argument("--residual_endpoint_max_items", type=int, default=1, help="Max endpoint-loss batch items per GPU. Use 0 for full batch.")
+    parser.add_argument("--slat_condition_source", choices=["slat"], default="slat")
+    parser.add_argument("--ss_flow_arch", choices=["standard"], default="standard")
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--separate_cond_gate", type=str, choices=["alpha_residual", "pair_channel", "token"], default="alpha_residual")
+    parser.add_argument("--separate_cond_gate", choices=["token"], default="token")
     parser.add_argument("--cfg_drop_prob", type=float, default=0.0)
 
     # Optional future architecture args.
@@ -110,7 +103,7 @@ def build_parser():
     parser.add_argument("--normalize_cond_latents", type=int, choices=[0, 1], default=0, help="Normalize source SLat features before the MorphFlow condition encoder.")
     parser.add_argument("--cond_input_norm", type=str, choices=["none", "trellis"], default=None, help="Explicit source-SLat normalization before the condition encoder. Overrides --normalize_cond_latents when set.")
     parser.add_argument("--cond_token_norm", type=str, choices=["none", "layernorm", "adaln_alpha"], default="none", help="Optional normalization/modulation on condition tokens after the condition encoder.")
-    parser.add_argument("--cond_proj_norm", type=str, choices=["none", "layernorm"], default="none", help="Optional normalization on SLat condition tokens after separate_cond_proj, matching the DINO path's dino_out_norm.")
+    parser.add_argument("--cond_proj_norm", type=str, choices=["none", "layernorm"], default="none", help="Optional normalization on SLat condition tokens after separate_cond_proj.")
     parser.add_argument("--cond_style_tokens", type=int, default=0, help="Number of global per-source style tokens appended by sparse_conv3d condition encoder.")
     parser.add_argument("--cond_use_occupancy", type=int, choices=[0, 1], default=0, help="Use explicit occupied/empty token handling in sparse_conv3d condition encoder.")
     parser.add_argument("--cond_hybrid_pool_stats", type=int, choices=[0, 1], default=0, help="Fuse local mean/max/std/count pooling stats next to sparse-conv condition features.")
@@ -119,9 +112,7 @@ def build_parser():
     parser.add_argument("--cond_residual_blocks_16", type=int, default=0, help="Number of submanifold residual sparse blocks after 32->16 downsample.")
     parser.add_argument("--source_images_root", type=str, default=None, help="Root containing the source images used to generate dataset assets.")
     parser.add_argument("--source_image_filename", type=str, default="", help="Optional fixed image filename inside each asset directory. Empty also searches root/<asset>.png/jpg/webp.")
-    parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg", help="Frozen DINOv2 torch.hub model used when --slat_condition_source=dino.")
-    parser.add_argument("--dino_dim", type=int, default=1024, help="Feature dimension emitted by the selected DINO model.")
-    parser.add_argument("--dino_layer_norm", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--dino_model", type=str, default="dinov2_vitl14_reg", help="Frozen DINOv2 torch.hub model used by the TRELLIS prior.")
 
     # Semantic token matching / cycle consistency on source condition tokens.
     parser.add_argument("--use_semantic_token_matching", type=int, choices=[0, 1], default=0)
@@ -164,7 +155,7 @@ def build_parser():
 
     # Checkpoint loading modes
     parser.add_argument("--resume_from", type=str, default=None, help="True resume: same architecture, restores model + optimizer + scheduler + epoch/step.")
-    parser.add_argument("--init_from", type=str, default=None, help="Model-only initialization. Use when changing architecture, e.g. alpha_residual -> token.")
+    parser.add_argument("--init_from", type=str, default=None, help="Model-only initialization; starts a new optimizer and training phase.")
     parser.add_argument("--resume_strict", type=int, choices=[0, 1], default=1)
     parser.add_argument("--init_strict", type=int, choices=[0, 1], default=0)
     parser.add_argument("--resume_optimizer", type=int, choices=[0, 1], default=1)
@@ -331,12 +322,8 @@ def load_assets_from_metadata(metadata_path: str, split: Optional[str] = None) -
 
 
 def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
-    if args.flow_target == "slat" and args.slat_condition_source == "dino":
-        model_cls = MorphDinoSLatFlow
-    elif args.flow_target == "slat":
+    if args.flow_target == "slat":
         model_cls = MorphSLatFlow
-    elif args.ss_flow_arch == "residual_interp":
-        model_cls = MorphResidualSSFlow
     else:
         model_cls = MorphFlow
 
@@ -358,17 +345,9 @@ def build_model(args, accelerator: Accelerator) -> torch.nn.Module:
         "cond_residual_blocks_64": args.cond_residual_blocks_64,
         "cond_residual_blocks_32": args.cond_residual_blocks_32,
         "cond_residual_blocks_16": args.cond_residual_blocks_16,
-        "residual_interp_gate": args.residual_interp_gate,
-        "residual_interp_gate_min": args.residual_interp_gate_min,
-        "residual_endpoint_prob": args.residual_endpoint_prob,
-        "residual_endpoint_weight": args.residual_endpoint_weight,
-        "residual_endpoint_max_items": args.residual_endpoint_max_items,
         "t_schedule": args.t_schedule,
         "t_logit_mean": args.t_logit_mean,
         "t_logit_std": args.t_logit_std,
-        "dino_model": args.dino_model,
-        "dino_dim": args.dino_dim,
-        "dino_layer_norm": args.dino_layer_norm == 1,
         "use_semantic_token_matching": args.use_semantic_token_matching == 1,
         "semantic_match_dim": args.semantic_match_dim,
         "semantic_match_temperature": args.semantic_match_temperature,
@@ -438,18 +417,6 @@ def model_forward_supports_source_ss_latents(model: torch.nn.Module) -> bool:
     return "src1_ss_latent" in params and "src2_ss_latent" in params
 
 
-def model_forward_supports_source_images(model: torch.nn.Module) -> bool:
-    signature = inspect.signature(unwrap_model_for_attr(model).forward)
-    params = set(signature.parameters.keys())
-    return "src1_image" in params and "src2_image" in params
-
-
-def model_forward_supports_residual_endpoint_controls(model: torch.nn.Module) -> bool:
-    signature = inspect.signature(unwrap_model_for_attr(model).forward)
-    params = set(signature.parameters.keys())
-    return "residual_endpoint_loss_weight" in params and "residual_endpoint_loss_prob" in params
-
-
 def forced_prob_for_configured_loss(weight: float, prob: float) -> float:
     """
     During validation used for best-checkpoint selection, force each configured
@@ -482,8 +449,6 @@ def compute_loss(
     supports_extra_losses: bool,
     supports_teacher_mid_weight: bool,
     supports_source_ss_latents: bool,
-    supports_source_images: bool,
-    supports_residual_endpoint_controls: bool,
     needs_source_ss_latents: bool,
     teacher_mid_weight: float,
     endpoint_loss_weight: float,
@@ -491,8 +456,6 @@ def compute_loss(
     endpoint_loss_prob: float,
     symmetry_loss_prob: float,
     use_extra_losses: bool,
-    residual_endpoint_loss_weight: Optional[float] = None,
-    residual_endpoint_loss_prob: Optional[float] = None,
     force_configured_extra_losses_active: bool = False,
     trellis_prior_kwargs: Optional[Dict[str, Any]] = None,
 ):
@@ -529,18 +492,6 @@ def compute_loss(
             if i1 is None or i2 is None: raise KeyError("TRELLIS prior active but endpoint images missing")
             model_kwargs["trellis_prior_src1_image"]=i1; model_kwargs["trellis_prior_src2_image"]=i2
 
-        if supports_source_images:
-            model_kwargs["src1_image"] = batch["src1_image"].to(
-                device=device,
-                dtype=torch.float32,
-                non_blocking=True,
-            )
-            model_kwargs["src2_image"] = batch["src2_image"].to(
-                device=device,
-                dtype=torch.float32,
-                non_blocking=True,
-            )
-
         if supports_extra_losses and use_extra_losses:
             model_kwargs.update(
                 {
@@ -566,7 +517,6 @@ def compute_loss(
 
     effective_endpoint_loss_prob = endpoint_loss_prob
     effective_symmetry_loss_prob = symmetry_loss_prob
-    effective_residual_endpoint_loss_prob = residual_endpoint_loss_prob
 
     if force_configured_extra_losses_active:
         effective_endpoint_loss_prob = forced_prob_for_configured_loss(
@@ -577,11 +527,6 @@ def compute_loss(
             symmetry_loss_weight,
             symmetry_loss_prob,
         )
-        if residual_endpoint_loss_weight is not None and residual_endpoint_loss_prob is not None:
-            effective_residual_endpoint_loss_prob = forced_prob_for_configured_loss(
-                residual_endpoint_loss_weight,
-                residual_endpoint_loss_prob,
-            )
 
     source_kwargs = dict(trellis_prior_kwargs or {})
 
@@ -617,14 +562,6 @@ def compute_loss(
             and endpoint_loss_weight > 0.0
             and effective_endpoint_loss_prob > 0.0
         )
-        or (
-            supports_residual_endpoint_controls
-            and use_extra_losses
-            and residual_endpoint_loss_weight is not None
-            and effective_residual_endpoint_loss_prob is not None
-            and residual_endpoint_loss_weight > 0.0
-            and effective_residual_endpoint_loss_prob > 0.0
-        )
     ):
         source_kwargs["src1_ss_latent"] = get_optional_tensor(batch, "src1_ss_latent", device)
         source_kwargs["src2_ss_latent"] = get_optional_tensor(batch, "src2_ss_latent", device)
@@ -640,14 +577,6 @@ def compute_loss(
 
         if supports_teacher_mid_weight:
             kwargs["teacher_mid_weight"] = teacher_mid_weight
-
-        if (
-            supports_residual_endpoint_controls
-            and residual_endpoint_loss_weight is not None
-            and effective_residual_endpoint_loss_prob is not None
-        ):
-            kwargs["residual_endpoint_loss_weight"] = residual_endpoint_loss_weight
-            kwargs["residual_endpoint_loss_prob"] = effective_residual_endpoint_loss_prob
 
         return model(
             target_ss_latent,
@@ -798,31 +727,19 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
     if args.use_ema == 1:
         accelerator.print("WARNING: --use_ema is accepted for compatibility but ignored in this simplified train.py.")
 
-    if args.slat_condition_source == "dino":
-        for name in ["cond_encoder", "cond_fusion", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod", "semantic_matcher"]:
-            module = getattr(model, name, None)
-            if module is not None:
-                for p in module.parameters():
-                    p.requires_grad = False
-        for name in ["dino_norm", "dino_proj", "dino_out_norm"]:
-            module = getattr(model, name, None)
-            if module is not None:
-                for p in module.parameters():
-                    p.requires_grad = True
-    else:
-        # cond_fusion is unused when separate_cond=1.
-        if args.separate_cond == 1 and hasattr(model, "cond_fusion"):
-            for p in model.cond_fusion.parameters():
-                p.requires_grad = False
-        elif hasattr(model, "cond_fusion"):
-            for p in model.cond_fusion.parameters():
-                p.requires_grad = True
+    # cond_fusion is unused when separate_cond=1.
+    if args.separate_cond == 1 and hasattr(model, "cond_fusion"):
+        for p in model.cond_fusion.parameters():
+            p.requires_grad = False
+    elif hasattr(model, "cond_fusion"):
+        for p in model.cond_fusion.parameters():
+            p.requires_grad = True
 
-        for name in ["cond_encoder", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod", "semantic_matcher"]:
-            module = getattr(model, name, None)
-            if module is not None:
-                for p in module.parameters():
-                    p.requires_grad = True
+    for name in ["cond_encoder", "separate_cond_proj", "cond_proj_layer_norm", "cond_resampler", "cond_token_layer_norm", "cond_alpha_mod", "semantic_matcher"]:
+        module = getattr(model, name, None)
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad = True
 
     if args.use_lora == 1:
         flow = get_flow_module(model)
@@ -864,7 +781,7 @@ def set_trainability(model: torch.nn.Module, args, accelerator: Accelerator):
         accelerator.print(f"Trainable scope cond_cross_attn: enabled cross-attention adapters in {enabled_blocks} flow blocks.")
 
     # null_cond is only useful when CFG dropout is enabled.
-    if hasattr(model, "null_cond") and (args.cfg_drop_prob <= 0.0 or args.slat_condition_source == "dino"):
+    if hasattr(model, "null_cond") and args.cfg_drop_prob <= 0.0:
         model.null_cond.requires_grad = False
     elif hasattr(model, "null_cond"):
         model.null_cond.requires_grad = True
@@ -1173,16 +1090,8 @@ def train(args):
         value = getattr(args, name)
         if value < 0.0 or value > 1.0:
             raise ValueError(f"--{name} must be in [0, 1], got {value}")
-    if args.residual_endpoint_prob < 0.0 or args.residual_endpoint_prob > 1.0:
-        raise ValueError(f"--residual_endpoint_prob must be in [0, 1], got {args.residual_endpoint_prob}")
-    if args.residual_endpoint_weight < 0.0:
-        raise ValueError(f"--residual_endpoint_weight must be >= 0, got {args.residual_endpoint_weight}")
-    if args.residual_endpoint_max_items < 0:
-        raise ValueError(f"--residual_endpoint_max_items must be >= 0, got {args.residual_endpoint_max_items}")
     if args.checkpoint_every < 0:
         raise ValueError(f"--checkpoint_every must be >= 0, got {args.checkpoint_every}")
-    if args.residual_interp_gate_min <= 0.0:
-        raise ValueError(f"--residual_interp_gate_min must be > 0, got {args.residual_interp_gate_min}")
     if args.t_logit_std <= 0.0:
         raise ValueError(f"--t_logit_std must be > 0, got {args.t_logit_std}")
     if args.semantic_match_temperature <= 0.0:
@@ -1203,10 +1112,6 @@ def train(args):
         raise ValueError("--semantic_usage_cap must be finite and >= 1")
     if args.semantic_usage_loss_weight > 0.0 and args.use_semantic_token_matching == 0:
         raise ValueError("--semantic_usage_loss_weight > 0 requires --use_semantic_token_matching=1")
-    if args.slat_condition_source == "dino" and args.flow_target != "slat":
-        raise ValueError("--slat_condition_source dino is only valid with --flow_target slat.")
-    if args.slat_condition_source == "dino" and not args.source_images_root:
-        raise ValueError("--slat_condition_source dino requires --source_images_root.")
 
     if args.trellis_prior_weight > 0 and not args.source_images_root:
         raise ValueError(
@@ -1251,13 +1156,7 @@ def train(args):
         split="train",
         verbose=accelerator.is_main_process,
         exclude_assets=excluded_assets,
-        load_source_images=(
-            args.trellis_prior_weight > 0
-            or (
-                args.flow_target == "slat"
-                and args.slat_condition_source == "dino"
-            )
-        ),
+        load_source_images=args.trellis_prior_weight > 0,
         source_images_root=args.source_images_root,
         source_image_filename=args.source_image_filename,
         augment_source_swap=args.augment_source_swap == 1,
@@ -1282,7 +1181,7 @@ def train(args):
             metadata_file=val_metadata_path,
             split="val",
             verbose=accelerator.is_main_process,
-            load_source_images=args.flow_target == "slat" and args.slat_condition_source == "dino",
+            load_source_images=False,
             source_images_root=args.source_images_root,
             source_image_filename=args.source_image_filename,
         )
@@ -1339,8 +1238,6 @@ def train(args):
         model_forward_supports_teacher_mid_weight(model)
     )
     supports_source_ss_latents = model_forward_supports_source_ss_latents(model)
-    supports_source_images = model_forward_supports_source_images(model)
-    supports_residual_endpoint_controls = model_forward_supports_residual_endpoint_controls(model)
     requires_source_ss_latents = model_requires_source_ss_latents(model)
     if not supports_extra_losses and (args.endpoint_loss_weight > 0.0 or args.symmetry_loss_weight > 0.0):
         accelerator.print(
@@ -1396,16 +1293,6 @@ def train(args):
                 from models.trellis_slat_prior import TrellisSLatPrior
                 accelerator.print("Loading frozen endpoint-conditioned TRELLIS SLat projection prior...")
                 trellis_prior=TrellisSLatPrior.from_pretrained(device=device,dino_model=args.dino_model,sigma_min=accelerator.unwrap_model(model).sigma_min,t_min=args.trellis_prior_t_min,t_max=args.trellis_prior_t_max,projection_clip_ratio=args.trellis_prior_projection_clip_ratio,tangent_projection=bool(args.trellis_prior_tangent_projection),stat_anchor_weight=args.trellis_prior_slat_stat_weight,stat_std_low_ratio=args.trellis_prior_slat_std_low_ratio,stat_std_high_ratio=args.trellis_prior_slat_std_high_ratio,stat_mean_tolerance=args.trellis_prior_slat_mean_tolerance,rms_guard_weight=args.trellis_prior_rms_guard_weight,rms_guard_low_ratio=args.trellis_prior_rms_guard_low_ratio,rms_guard_high_ratio=args.trellis_prior_rms_guard_high_ratio)
-
-    if args.flow_target == "slat" and args.slat_condition_source == "dino":
-        dino_owner = accelerator.unwrap_model(model)
-        if accelerator.is_main_process:
-            accelerator.print(f"Loading frozen DINO encoder: {args.dino_model}")
-            dino_owner._get_dino_model(device)
-        accelerator.wait_for_everyone()
-        if not accelerator.is_main_process:
-            dino_owner._get_dino_model(device)
-        accelerator.wait_for_everyone()
 
     start_epoch = 1
     global_step = 0
@@ -1564,11 +1451,6 @@ def train(args):
         )
     if args.flow_target == "slat":
         accelerator.print(f"SLat condition source: {args.slat_condition_source}")
-        if args.slat_condition_source == "dino":
-            accelerator.print(f"Source images root: {args.source_images_root}")
-            accelerator.print(f"Source image filename: {args.source_image_filename or '<auto>'}")
-            accelerator.print(f"DINO model: {args.dino_model}")
-            accelerator.print(f"DINO dim: {args.dino_dim}")
     accelerator.print(f"SS flow architecture: {args.ss_flow_arch}")
     accelerator.print(f"Trainable scope: {args.trainable_scope}")
     accelerator.print(f"Freeze modules: {args.freeze_modules or '<none>'}")
@@ -1594,12 +1476,6 @@ def train(args):
         f"32^3={args.cond_residual_blocks_32} 16^3={args.cond_residual_blocks_16}"
     )
     accelerator.print(f"Condition resampler tokens: {args.cond_resample_tokens}")
-    if args.flow_target == "ss" and args.ss_flow_arch == "residual_interp":
-        accelerator.print(f"Residual interpolation gate: {args.residual_interp_gate}")
-        accelerator.print(f"Residual interpolation gate min: {args.residual_interp_gate_min}")
-        accelerator.print(f"Residual endpoint probability: {args.residual_endpoint_prob}")
-        accelerator.print(f"Residual endpoint weight: {args.residual_endpoint_weight}")
-        accelerator.print(f"Residual endpoint max items: {args.residual_endpoint_max_items}")
     accelerator.print(f"Model requires source SS latents: {requires_source_ss_latents}")
     accelerator.print(f"Separate cond: {args.separate_cond == 1}")
     accelerator.print(f"Separate cond gate: {args.separate_cond_gate}")
@@ -1658,14 +1534,12 @@ def train(args):
     accelerator.print(f"Symmetry loss weight: {args.symmetry_loss_weight}")
     accelerator.print(f"Symmetry loss probability: {args.symmetry_loss_prob}")
     accelerator.print(f"Extra loss support in MorphFlow.forward: {supports_extra_losses}")
-    accelerator.print(f"Residual endpoint loss controls in model.forward: {supports_residual_endpoint_controls}")
     if args.flow_target in ("ss", "slat"):
         accelerator.print(
             "Best-checkpoint validation objective: base validation loss plus all configured "
             "auxiliary losses forced active with probability 1.0. "
             "Residual endpoint loss is only applied to SS residual models."
         )
-    accelerator.print(f"Source-image support in model.forward: {supports_source_images}")
     accelerator.print(f"Source-swap training augmentation: {args.augment_source_swap == 1}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
@@ -1733,8 +1607,6 @@ def train(args):
                         supports_extra_losses=supports_extra_losses,
                         supports_teacher_mid_weight=supports_teacher_mid_weight,
                         supports_source_ss_latents=supports_source_ss_latents,
-                        supports_source_images=supports_source_images,
-                        supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                         needs_source_ss_latents=requires_source_ss_latents,
                         teacher_mid_weight=args.teacher_mid_weight,
                         endpoint_loss_weight=args.endpoint_loss_weight,
@@ -1742,8 +1614,6 @@ def train(args):
                         endpoint_loss_prob=args.endpoint_loss_prob,
                         symmetry_loss_prob=args.symmetry_loss_prob,
                         use_extra_losses=True,
-                        residual_endpoint_loss_weight=args.residual_endpoint_weight,
-                        residual_endpoint_loss_prob=args.residual_endpoint_prob,
                         force_configured_extra_losses_active=False,
                         trellis_prior_kwargs=prior_kwargs,
                     )
@@ -1931,8 +1801,6 @@ def train(args):
                             supports_extra_losses=supports_extra_losses,
                             supports_teacher_mid_weight=supports_teacher_mid_weight,
                             supports_source_ss_latents=supports_source_ss_latents,
-                            supports_source_images=supports_source_images,
-                            supports_residual_endpoint_controls=supports_residual_endpoint_controls,
                             needs_source_ss_latents=requires_source_ss_latents,
                             teacher_mid_weight=args.teacher_mid_weight,
                             endpoint_loss_weight=args.endpoint_loss_weight if use_best_extra_losses else 0.0,
@@ -1940,8 +1808,6 @@ def train(args):
                             endpoint_loss_prob=args.endpoint_loss_prob if use_best_extra_losses else 0.0,
                             symmetry_loss_prob=args.symmetry_loss_prob if use_best_extra_losses else 0.0,
                             use_extra_losses=use_best_extra_losses,
-                            residual_endpoint_loss_weight=args.residual_endpoint_weight if args.flow_target == "ss" else 0.0,
-                            residual_endpoint_loss_prob=args.residual_endpoint_prob if args.flow_target == "ss" else 0.0,
                             force_configured_extra_losses_active=use_best_extra_losses,
                         )
 

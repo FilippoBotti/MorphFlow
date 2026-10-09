@@ -21,13 +21,11 @@ from eval_validation_latents import (
     DEFAULT_DATASET,
     build_model,
     checkpoint_args,
-    checkpoint_requires_source_images,
     detect_flow_target,
     detect_model_type,
     detect_slat_condition_source,
     load_checkpoint,
     load_decoders,
-    preload_dino_if_needed,
     safe_slug,
     sample_slat_on_coords,
     sample_ss,
@@ -168,11 +166,6 @@ def select_candidates(
     raise ValueError(f"Unknown selection: {selection}")
 
 
-def attach_source_images_for_entry(dataset: MorphingDistillDataset, src1: Dict[str, Any], src2: Dict[str, Any], entry: Dict[str, Any]) -> None:
-    src1["image"] = dataset._load_source_image(src1["name"], entry, "src1")
-    src2["image"] = dataset._load_source_image(src2["name"], entry, "src2")
-
-
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -204,7 +197,6 @@ def run_pair(
     mesh_decoder: torch.nn.Module,
     sparse_tensor_cls: Any,
     device: torch.device,
-    needs_source_images: bool,
     ckpt: Dict[str, Any],
     slat_ckpt: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -212,9 +204,6 @@ def run_pair(
     src2_name = str(entry["src_2"])
     src1 = load_asset(root, src1_name)
     src2 = load_asset(root, src2_name)
-
-    if needs_source_images:
-        attach_source_images_for_entry(dataset, src1, src2, entry)
 
     pair_out = output_dir / pair_dir_name(pair_id, src1_name, src2_name)
     pair_out.mkdir(parents=True, exist_ok=True)
@@ -431,10 +420,7 @@ def main() -> None:
     if slat_flow_target != "slat":
         raise ValueError(f"--slat_checkpoint_path must be a SLat checkpoint, got {slat_flow_target!r}.")
 
-    needs_source_images = checkpoint_requires_source_images(slat_ckpt, "slat")
     source_images_root = args.source_images_root or checkpoint_args(slat_ckpt).get("source_images_root")
-    if needs_source_images and not source_images_root:
-        raise ValueError("This DINO-conditioned SLat checkpoint requires --source_images_root.")
 
     model_type = detect_model_type(ckpt, args.trellis_model)
     slat_model_type = detect_model_type(slat_ckpt, args.trellis_model)
@@ -472,9 +458,6 @@ def main() -> None:
     print("pipeline: SS flow -> SS decoder coords -> SLat flow -> mesh decoder")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"slat_condition_source: {detect_slat_condition_source(slat_ckpt)}")
-    if needs_source_images:
-        print(f"source_images_root: {source_images_root}")
-        print(f"source_image_filename: {args.source_image_filename or '<auto>'}")
     print(f"model_type: {model_type}")
     print(f"slat_model_type: {slat_model_type}")
     print(f"alphas: {alphas}")
@@ -502,8 +485,6 @@ def main() -> None:
 
     model = build_model(ckpt, model_type, "ss").to(device).eval()
     slat_model = build_model(slat_ckpt, slat_model_type, "slat").to(device).eval()
-    preload_dino_if_needed(model, device)
-    preload_dino_if_needed(slat_model, device)
     ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders("ss", device)
 
     pair_summaries: List[Dict[str, Any]] = []
@@ -531,7 +512,6 @@ def main() -> None:
                 mesh_decoder=mesh_decoder,
                 sparse_tensor_cls=sparse_tensor_cls,
                 device=device,
-                needs_source_images=needs_source_images,
                 ckpt=ckpt,
                 slat_ckpt=slat_ckpt,
             )

@@ -258,8 +258,7 @@ class ComparisonTests(unittest.TestCase):
             load_checkpoint=Mock(side_effect=["ss", "slat"]),
             detect_flow_target=lambda ckpt: ckpt,
             detect_model_type=Mock(return_value="image_large"),
-            build_model=Mock(side_effect=models), preload_dino_if_needed=Mock(),
-            checkpoint_requires_source_images=Mock(return_value=True),
+            build_model=Mock(side_effect=models),
             load_decoders=Mock(return_value=(Mock(), Mock(), Mock())),
             sample_ss=Mock(return_value=object()), ss_logits_raw=Mock(return_value=logits),
             sample_slat_on_coords=Mock(return_value=object()),
@@ -268,7 +267,7 @@ class ComparisonTests(unittest.TestCase):
         seeds = Mock()
         generate = SimpleNamespace(
             load_asset=lambda root, name: {"name": name, "ss_latent": object()},
-            batch_for_alpha=lambda a, b, alpha: {"alpha": alpha, "src1_image": a["image"], "src2_image": b["image"]},
+            batch_for_alpha=lambda a, b, alpha: {"alpha": alpha},
         )
         modules = {
             "torch": torch,
@@ -282,7 +281,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual([c.args[1]["alpha"] for c in calls], plan["alphas"])
         self.assertTrue(all(c.args[2] is coords for c in calls))
         self.assertTrue(all(c.args[0] is models[1] for c in calls))
-        self.assertEqual(loader._load_source_image.call_count, 2)
+        loader._load_source_image.assert_not_called()
         self.assertEqual([c.args[0] for c in seeds.call_args_list], [42, 43] * 7)
 
     def test_slurm_forwards_paths_with_spaces_and_gpu_visibility(self):

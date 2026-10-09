@@ -22,9 +22,7 @@ if os.environ.get("TRELLIS_REPO"):
 
 from data.morph_dataset import MorphingDistillDataset, morphing_collate_fn
 from models.lora import add_lora_to_attention
-from models.morph_dino_slat_flow import MorphDinoSLatFlow
 from models.morph_flow import MorphFlow
-from models.morph_residual_flow import MorphResidualSSFlow
 from models.morph_slat_flow import MorphSLatFlow
 
 
@@ -133,10 +131,6 @@ def detect_slat_condition_source(ckpt):
     return checkpoint_args(ckpt).get("slat_condition_source", "slat")
 
 
-def checkpoint_requires_source_images(ckpt, flow_target):
-    return flow_target == "slat" and detect_slat_condition_source(ckpt) == "dino"
-
-
 def detect_model_type(ckpt, requested):
     if requested != "auto":
         return requested
@@ -150,17 +144,19 @@ def detect_model_type(ckpt, requested):
 
 def build_model(ckpt, model_type, flow_target):
     args = checkpoint_args(ckpt)
+    if args.get("slat_condition_source", "slat") != "slat":
+        raise ValueError("Image-conditioned student checkpoints are no longer supported")
+    if args.get("ss_flow_arch", "standard") != "standard":
+        raise ValueError("Residual SS checkpoints are no longer supported")
+    if bool(int(args.get("separate_cond", 0))) and args.get("separate_cond_gate") != "token":
+        raise ValueError("This checkpoint does not use token gating; use its historical code revision")
     cond_input_norm = args.get("cond_input_norm")
     normalize_cond_latents = bool(int(args.get("normalize_cond_latents", 0)))
     if cond_input_norm is not None:
         normalize_cond_latents = cond_input_norm == "trellis"
 
-    if flow_target == "slat" and args.get("slat_condition_source", "slat") == "dino":
-        model_cls = MorphDinoSLatFlow
-    elif flow_target == "slat":
+    if flow_target == "slat":
         model_cls = MorphSLatFlow
-    elif args.get("ss_flow_arch", "standard") == "residual_interp":
-        model_cls = MorphResidualSSFlow
     else:
         model_cls = MorphFlow
 
@@ -168,7 +164,7 @@ def build_model(ckpt, model_type, flow_target):
         "model_type": model_type,
         "separate_cond": bool(int(args.get("separate_cond", 0))),
         "use_checkpoint": False,
-        "separate_cond_gate": args.get("separate_cond_gate", "alpha_residual"),
+        "separate_cond_gate": args.get("separate_cond_gate", "token"),
         "cond_resample_tokens": int(args.get("cond_resample_tokens", 0)),
         "cond_resample_depth": int(args.get("cond_resample_depth", 1)),
         "cond_resample_heads": int(args.get("cond_resample_heads", 8)),
@@ -182,17 +178,9 @@ def build_model(ckpt, model_type, flow_target):
         "cond_residual_blocks_64": int(args.get("cond_residual_blocks_64", 0)),
         "cond_residual_blocks_32": int(args.get("cond_residual_blocks_32", 0)),
         "cond_residual_blocks_16": int(args.get("cond_residual_blocks_16", 0)),
-        "residual_interp_gate": args.get("residual_interp_gate", "alpha"),
-        "residual_interp_gate_min": float(args.get("residual_interp_gate_min", 1e-3)),
-        "residual_endpoint_prob": float(args.get("residual_endpoint_prob", 0.0)),
-        "residual_endpoint_weight": float(args.get("residual_endpoint_weight", 1.0)),
-        "residual_endpoint_max_items": int(args.get("residual_endpoint_max_items", 1)),
         "t_schedule": args.get("t_schedule", args.get("slat_t_schedule", "logit_normal")),
         "t_logit_mean": float(args.get("t_logit_mean", args.get("slat_t_logit_mean", 0.0))),
         "t_logit_std": float(args.get("t_logit_std", args.get("slat_t_logit_std", 1.0))),
-        "dino_model": args.get("dino_model", "dinov2_vitl14_reg"),
-        "dino_dim": int(args.get("dino_dim", 1024)),
-        "dino_layer_norm": bool(int(args.get("dino_layer_norm", 1))),
         "use_semantic_token_matching": bool(int(args.get("use_semantic_token_matching", 0))),
         "semantic_match_dim": int(args.get("semantic_match_dim", 128)),
         "semantic_match_temperature": float(args.get("semantic_match_temperature", 0.1)),
@@ -227,27 +215,6 @@ def build_model(ckpt, model_type, flow_target):
     maybe_insert_lora(model, args)
     model.load_state_dict(state_dict, strict=True)
     return model
-
-
-def model_supports_source_images(model):
-    params = set(inspect.signature(model.forward_flow).parameters)
-    return "src1_image" in params and "src2_image" in params
-
-
-def source_image_kwargs(model, batch, device):
-    if not model_supports_source_images(model):
-        return {}
-    if "src1_image" not in batch or "src2_image" not in batch:
-        raise KeyError("This checkpoint requires src1_image/src2_image. Pass --source_images_root.")
-    return {
-        "src1_image": batch["src1_image"].to(device=device, dtype=torch.float32),
-        "src2_image": batch["src2_image"].to(device=device, dtype=torch.float32),
-    }
-
-
-def preload_dino_if_needed(model, device):
-    if hasattr(model, "_get_dino_model"):
-        model._get_dino_model(device)
 
 
 def get_flow_module(model):
@@ -323,10 +290,6 @@ def sample_ss(model, batch, target_ss, steps, device, cfg_scale, mixed_precision
                 )
         x_t = x_t - dt * pred.float()
 
-    if hasattr(model, "residual_to_ss"):
-        src1_ss = batch["src1_ss_latent"].to(device=device, dtype=torch.float32)
-        src2_ss = batch["src2_ss_latent"].to(device=device, dtype=torch.float32)
-        x_t = model.residual_to_ss(x_t, src1_ss, src2_ss, alpha)
     return x_t
 
 
@@ -343,7 +306,6 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
     src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32)
     alpha = batch["alpha"].reshape(x0.shape[0]).to(device=device, dtype=torch.float32)
     t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
-    image_kwargs = source_image_kwargs(model, batch, device)
 
     for i in range(steps):
         t = torch.full((x0.shape[0],), float(t_seq[i].item()), device=device)
@@ -358,7 +320,6 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
                     src1_coords,
                     src2_coords,
                     alpha,
-                    **image_kwargs,
                 )
             else:
                 pred = model.forward_flow_cfg(
@@ -370,7 +331,6 @@ def sample_slat(model, batch, steps, device, cfg_scale, mixed_precision):
                     src2_coords,
                     alpha,
                     guidance_scale=cfg_scale,
-                    **image_kwargs,
                 )
         x_t = x_t - dt * pred.float()
 
@@ -395,7 +355,6 @@ def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_
     src2_coords = batch["src2_coords"].to(device=device, dtype=torch.int32)
     alpha = batch["alpha"].reshape(1).to(device=device, dtype=torch.float32)
     t_seq = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
-    image_kwargs = source_image_kwargs(model, batch, device)
 
     for i in range(steps):
         t = torch.full((1,), float(t_seq[i].item()), device=device)
@@ -410,7 +369,6 @@ def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_
                     src1_coords,
                     src2_coords,
                     alpha,
-                    **image_kwargs,
                 )
             else:
                 pred = model.forward_flow_cfg(
@@ -422,7 +380,6 @@ def sample_slat_on_coords(model, batch, coords, steps, device, cfg_scale, mixed_
                     src2_coords,
                     alpha,
                     guidance_scale=cfg_scale,
-                    **image_kwargs,
                 )
         x_t = x_t - dt * pred.float()
 
@@ -676,14 +633,7 @@ def main():
     slat_ckpt = load_checkpoint(str(slat_checkpoint_path)) if slat_checkpoint_path is not None else None
     slat_model_type = detect_model_type(slat_ckpt, args.trellis_model) if slat_ckpt is not None else None
     pipeline_mode = slat_ckpt is not None
-    needs_source_images = checkpoint_requires_source_images(ckpt, flow_target) or (
-        pipeline_mode and checkpoint_requires_source_images(slat_ckpt, "slat")
-    )
     source_images_root = args.source_images_root
-    if needs_source_images and not source_images_root:
-        source_images_root = checkpoint_args(slat_ckpt if pipeline_mode else ckpt).get("source_images_root")
-    if needs_source_images and not source_images_root:
-        raise ValueError("A DINO-conditioned SLat checkpoint requires --source_images_root.")
 
     if pipeline_mode:
         if flow_target != "ss":
@@ -703,15 +653,8 @@ def main():
     if pipeline_mode:
         print(f"slat_checkpoint: {slat_checkpoint_path}")
     print(f"flow_target: {flow_target}")
-    if checkpoint_requires_source_images(ckpt, flow_target):
-        print(f"slat_condition_source: {detect_slat_condition_source(ckpt)}")
     if pipeline_mode:
         print("pipeline: ss checkpoint -> SS decoder coords -> slat checkpoint -> mesh decoder")
-        if checkpoint_requires_source_images(slat_ckpt, "slat"):
-            print(f"slat_condition_source: {detect_slat_condition_source(slat_ckpt)}")
-    if needs_source_images:
-        print(f"source_images_root: {source_images_root}")
-        print(f"source_image_filename: {args.source_image_filename or '<auto>'}")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"cond_encoder_type: {checkpoint_args(ckpt).get('cond_encoder_type', 'block')}")
     print(f"cond_input_norm: {checkpoint_args(ckpt).get('cond_input_norm', 'legacy')}")
@@ -744,9 +687,6 @@ def main():
         if pipeline_mode
         else None
     )
-    preload_dino_if_needed(model, device)
-    if slat_model is not None:
-        preload_dino_if_needed(slat_model, device)
     ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders("ss" if pipeline_mode else flow_target, device)
 
     dataset = MorphingDistillDataset(
@@ -754,7 +694,7 @@ def main():
         metadata_file=str(metadata_path),
         split="test",
         verbose=False,
-        load_source_images=needs_source_images,
+        load_source_images=False,
         source_images_root=source_images_root,
         source_image_filename=args.source_image_filename,
     )

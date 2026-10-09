@@ -41,7 +41,7 @@ class MorphFlow(SemanticTokenMatchingMixin, nn.Module):
         model_type="text_base",
         separate_cond=False,
         use_checkpoint=False,
-        separate_cond_gate="alpha_residual",
+        separate_cond_gate="token",
         cond_resample_tokens=0,
         cond_resample_depth=1,
         cond_resample_heads=8,

@@ -20,14 +20,12 @@ from eval_validation_latents import (
     DEFAULT_DATASET,
     build_model,
     checkpoint_args,
-    checkpoint_requires_source_images,
     detect_flow_target,
     detect_model_type,
     detect_slat_condition_source,
     ensure_batch_coords,
     load_checkpoint,
     load_decoders,
-    preload_dino_if_needed,
     safe_slug,
     sample_slat_on_coords,
     sample_ss,
@@ -173,12 +171,6 @@ def batch_for_alpha(src1, src2, alpha):
     return batch
 
 
-def attach_source_images(dataset, src1, src2):
-    entry = {"src_1": src1["name"], "src_2": src2["name"]}
-    src1["image"] = dataset._load_source_image(src1["name"], entry, "src1")
-    src2["image"] = dataset._load_source_image(src2["name"], entry, "src2")
-
-
 def alpha_color(alpha):
     alpha = float(alpha)
     src1 = np.array([80, 150, 255], dtype=np.float32)
@@ -230,12 +222,7 @@ def main():
         raise ValueError(
             f"--slat_checkpoint_path must point to a SLat checkpoint, got {detect_flow_target(slat_ckpt)!r}."
         )
-    needs_source_images = slat_ckpt is not None and checkpoint_requires_source_images(slat_ckpt, "slat")
     source_images_root = args.source_images_root
-    if needs_source_images and not source_images_root:
-        source_images_root = checkpoint_args(slat_ckpt).get("source_images_root")
-    if needs_source_images and not source_images_root:
-        raise ValueError("A DINO-conditioned SLat checkpoint requires --source_images_root.")
 
     model_type = detect_model_type(ckpt, args.trellis_model)
     slat_model_type = detect_model_type(slat_ckpt, args.trellis_model) if slat_ckpt is not None else None
@@ -253,8 +240,6 @@ def main():
     src1_name, src2_name, asset_list = resolve_asset_names(dataset, args)
     src1 = load_asset(root, src1_name)
     src2 = load_asset(root, src2_name)
-    if needs_source_images:
-        attach_source_images(dataset, src1, src2)
 
     run_name = (
         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
@@ -272,9 +257,6 @@ def main():
         print(f"slat_checkpoint: {slat_checkpoint_path}")
         print("pipeline: ss checkpoint -> SS decoder coords -> slat checkpoint -> mesh decoder")
         print(f"slat_condition_source: {detect_slat_condition_source(slat_ckpt)}")
-    if needs_source_images:
-        print(f"source_images_root: {source_images_root}")
-        print(f"source_image_filename: {args.source_image_filename or '<auto>'}")
     print(f"flow_target: {flow_target}")
     print(f"ss_flow_arch: {checkpoint_args(ckpt).get('ss_flow_arch', 'standard')}")
     print(f"model_type: {model_type}")
@@ -299,9 +281,6 @@ def main():
         if slat_ckpt is not None
         else None
     )
-    preload_dino_if_needed(model, device)
-    if slat_model is not None:
-        preload_dino_if_needed(slat_model, device)
     ss_decoder, mesh_decoder, sparse_tensor_cls = load_decoders(flow_target, device)
 
     save_slat_glb(
