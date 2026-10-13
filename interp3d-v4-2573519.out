@@ -1,0 +1,75 @@
+
+=== Interp3D dataset v4 ===
+Node=wn49 | GPUs=8 | train_pairs=12500 | val_pairs=500 | test_pairs=500 | endpoint_fraction=0.02
+v3=/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v3
+images=/hpc/scratch/marco.barezzi/3d_dataset/flux_outputs
+out=/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02
+interp=/hpc/scratch/marco.barezzi/morph-benchmark/interp3d/work/Interp3D
+logs=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/dataset_v4_interp3d/job_2573519
+GPU 0: NVIDIA L40S (UUID: GPU-af2744b6-a6a2-8fd8-cf90-9d443186e930)
+GPU 1: NVIDIA L40S (UUID: GPU-ac4ded1c-d9ce-3fad-34cb-11cd48e2a4fc)
+GPU 2: NVIDIA L40S (UUID: GPU-b8de0412-3fcc-81f3-4380-7d05f9ba0c9b)
+GPU 3: NVIDIA L40S (UUID: GPU-c90874bc-4c33-6d82-6dd2-97786e21ac66)
+GPU 4: NVIDIA L40S (UUID: GPU-0afbb086-9315-a135-7a13-54fa81536549)
+GPU 5: NVIDIA L40S (UUID: GPU-113242a8-a192-02a2-1192-24caeb5b6240)
+GPU 6: NVIDIA L40S (UUID: GPU-af95532d-0185-76fc-7f43-4d56d9992b1a)
+GPU 7: NVIDIA L40S (UUID: GPU-e080d89c-9879-b676-f956-0e3270242a80)
+Reusing plan: /hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02/plan.json
+Monitor from login node: python3 /hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/slurm/monitor_interp3d_v4.py status --out /hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02 --watch 30
+=== Serialized DINOv2 cache warmup ===
+Initializing complete Interp3D pipeline on one GPU
+[SPARSE] Backend: spconv, Attention: xformers
+CUDA available: True
+Visible GPUs: 1
+[SPARSE][CONV] spconv algo: native
+[ATTENTION] Using backend: xformers
+DINOv2 initialized successfully
+Interp3D pipeline initialized successfully
+DINOv2 cache verified
+Launching assets shard=0 GPU=0
+Launching assets shard=1 GPU=1
+Launching assets shard=2 GPU=2
+Launching assets shard=3 GPU=3
+Launching assets shard=4 GPU=4
+Launching assets shard=5 GPU=5
+Launching assets shard=6 GPU=6
+Launching assets shard=7 GPU=7
+assets GPU=6 exit_code=0 (1/8)
+assets GPU=3 exit_code=0 (2/8)
+assets GPU=2 exit_code=0 (3/8)
+assets GPU=7 exit_code=0 (4/8)
+assets GPU=4 exit_code=0 (5/8)
+assets GPU=0 exit_code=0 (6/8)
+assets GPU=5 exit_code=0 (7/8)
+assets GPU=1 exit_code=0 (8/8)
+Launching pairs shard=0 GPU=0
+Launching pairs shard=1 GPU=1
+Launching pairs shard=2 GPU=2
+Launching pairs shard=3 GPU=3
+Launching pairs shard=4 GPU=4
+Launching pairs shard=5 GPU=5
+Launching pairs shard=6 GPU=6
+Launching pairs shard=7 GPU=7
+pairs GPU=6 exit_code=0 (1/8)
+pairs GPU=7 exit_code=0 (2/8)
+pairs GPU=5 exit_code=0 (3/8)
+pairs GPU=0 exit_code=0 (4/8)
+pairs GPU=2 exit_code=0 (5/8)
+pairs GPU=4 exit_code=0 (6/8)
+pairs GPU=1 exit_code=0 (7/8)
+pairs GPU=3 exit_code=0 (8/8)
+FINAL: train=50000 val=2000 test=2000 total=54000/54000 missing=0
+=== MorphFlow DataLoader smoke test (train split) ===
+[MorphingDistillDataset] split=train valid=50000 | skipped_schema=0 | skipped_split=0 | skipped_missing=0
+samples: 100000
+Batch keys: ['alpha', 'split', 'src1_coords', 'src1_feats', 'src1_lengths', 'src1_name', 'src1_occupancy', 'src1_ss_latent', 'src2_coords', 'src2_feats', 'src2_lengths', 'src2_name', 'src2_occupancy', 'src2_ss_latent', 'target_coords', 'target_feats', 'target_lengths', 'target_name', 'target_occupancy', 'target_ss_latent']
+src1_feats: (17470, 8)
+src1_coords: (17470, 4)
+src2_feats: (12408, 8)
+src2_coords: (12408, 4)
+target_feats: (11865, 8)
+target_coords: (11865, 4)
+target_ss_latent: (1, 1, 8, 16, 16, 16)
+alpha: tensor([0.1707])
+COMPLETE: /hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02
+Log files: /hpc/archive/G_VBD/marco.barezzi/morphflow_runs/dataset_v4_interp3d/job_2573519

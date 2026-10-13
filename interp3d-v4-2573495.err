@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data/dataset_scripts/generate_interp3d_v4.py", line 749, in <module>
+    main()
+  File "/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data/dataset_scripts/generate_interp3d_v4.py", line 728, in main
+    command_plan(args)
+  File "/hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/data/dataset_scripts/generate_interp3d_v4.py", line 199, in command_plan
+    (split, len(missing), sorted(missing)[:5]))
+RuntimeError: train has 9 missing images, e.g. ['0472_volcanic-anthropomorphic-crane-guardian-standing', '0689_arcane-frogfolk-arms-crossed-tribal', '0986_wild-anthropomorphic-yak-standing-confidently', '2098_jungle-anthropomorphic-macaw-scout-arms', '3981_moonlit-anthropomorphic-cassowary-arms-crossed']

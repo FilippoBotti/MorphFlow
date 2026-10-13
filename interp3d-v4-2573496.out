@@ -1,0 +1,39 @@
+
+=== Interp3D dataset v4 ===
+Node=wn49 | GPUs=8 | train_pairs=12500 | val_pairs=500 | test_pairs=500 | endpoint_fraction=0.02
+v3=/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v3
+images=/hpc/scratch/marco.barezzi/3d_dataset/flux_outputs
+out=/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02
+interp=/hpc/scratch/marco.barezzi/morph-benchmark/interp3d/work/Interp3D
+logs=/hpc/archive/G_VBD/marco.barezzi/morphflow_runs/dataset_v4_interp3d/job_2573496
+GPU 0: NVIDIA L40S (UUID: GPU-af2744b6-a6a2-8fd8-cf90-9d443186e930)
+GPU 1: NVIDIA L40S (UUID: GPU-ac4ded1c-d9ce-3fad-34cb-11cd48e2a4fc)
+GPU 2: NVIDIA L40S (UUID: GPU-b8de0412-3fcc-81f3-4380-7d05f9ba0c9b)
+GPU 3: NVIDIA L40S (UUID: GPU-c90874bc-4c33-6d82-6dd2-97786e21ac66)
+GPU 4: NVIDIA L40S (UUID: GPU-0afbb086-9315-a135-7a13-54fa81536549)
+GPU 5: NVIDIA L40S (UUID: GPU-113242a8-a192-02a2-1192-24caeb5b6240)
+GPU 6: NVIDIA L40S (UUID: GPU-af95532d-0185-76fc-7f43-4d56d9992b1a)
+GPU 7: NVIDIA L40S (UUID: GPU-e080d89c-9879-b676-f956-0e3270242a80)
+WARNING: split train: 9 images missing, excluded: ['0472_volcanic-anthropomorphic-crane-guardian-standing', '0689_arcane-frogfolk-arms-crossed-tribal', '0986_wild-anthropomorphic-yak-standing-confidently', '2098_jungle-anthropomorphic-macaw-scout-arms', '3981_moonlit-anthropomorphic-cassowary-arms-crossed', '5796_heroic-kobold-proud-upright-pose', '6016_mischievous-anthropomorphic-parrot-mage-standing', '7503_battle-worn-elemental-beast-monk', '7508_royal-yeti-alchemist-relaxed-stance']
+SPLIT train: images=6572
+WARNING: split val: 1 images missing, excluded: ['5243_mischievous-minotaur-calm-idle-pose']
+SPLIT val: images=822
+SPLIT test: images=823
+PLAN: /hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02/plan.json pairs: 13500 physical targets: 54000 assets: 8217 virtual train: 100000
+train: pairs=12500 targets=50000 alpha0=500 alpha1=500 interior=49000 assets=6572
+val: pairs=500 targets=2000 alpha0=20 alpha1=20 interior=1960 assets=822
+test: pairs=500 targets=2000 alpha0=20 alpha1=20 interior=1960 assets=823
+Example alpha sequences: [[0.9617, 0.523448, 0.300517, 0.125036], [0.825414, 0.659483, 0.374998, 0.097785], [0.762508, 0.662203, 0.375856, 0.064747], [0.924365, 0.626661, 0.323675, 0.0], [0.887966, 0.645674, 0.353365, 0.042648]]
+Monitor from login node: python3 /hpc/home/marco.barezzi/trellis-singularity/work/MorphFlow/slurm/monitor_interp3d_v4.py status --out /hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_interp3d_12500x4_e02 --watch 30
+=== GPU import sanity check (production job, not a pilot) ===
+[SPARSE] Backend: spconv, Attention: xformers
+CUDA True num_gpus 1
+Launching assets shard=0 GPU=0
+Launching assets shard=1 GPU=1
+Launching assets shard=2 GPU=2
+Launching assets shard=3 GPU=3
+Launching assets shard=4 GPU=4
+Launching assets shard=5 GPU=5
+Launching assets shard=6 GPU=6
+Launching assets shard=7 GPU=7
+assets GPU=0 exit_code=1 (1/8)
