@@ -21,3 +21,30 @@ logs/
 *.swo
 slurm-*.out
 slurm-*.err
+
+# Generated Slurm and HPC logs
+*.out
+*.err
+*.log
+
+# Automatically generated local backup copies
+/slurm/.v4_path_backup_*/
+*.orig
+*.rej
+*.patch
+
+# Model weights and generated datasets
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.glb
+*.tar.gz
+
+# Local runtime and experiment artifacts
+wandb/
+tensorboard/
+.cache/
+.venv/
