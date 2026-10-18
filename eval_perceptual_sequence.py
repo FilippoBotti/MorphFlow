@@ -330,6 +330,21 @@ def uniform_views(args: argparse.Namespace) -> List[Dict[str, float]]:
         raise ValueError("--radius must be > 0")
     if not 0 < args.fov_degrees < 180:
         raise ValueError("--fov_degrees must be between 0 and 180")
+    if getattr(args, "camera_distribution", "orbit") == "hammersley":
+        def radical_inverse(index: int) -> float:
+            value, weight = 0.0, 0.5
+            while index:
+                value += (index % 2) * weight
+                index //= 2
+                weight *= 0.5
+            return value
+        # Same sphere_hammersley_sequence as official TRELLIS/Interp3D.
+        # Convert its [sin(yaw), cos(yaw), z] convention to Blender's
+        # [cos(yaw), sin(yaw), z] without rotating the object.
+        return [{"yaw": math.pi / 2 - 2 * math.pi * radical_inverse(i),
+                 "pitch": math.acos(1 - 2 * i / args.num_views) - math.pi / 2,
+                 "radius": args.radius, "fov": math.radians(args.fov_degrees)}
+                for i in range(args.num_views)]
     return [
         {
             "yaw": 2.0 * math.pi * index / args.num_views,
@@ -867,6 +882,7 @@ def process_sequence(
             "num_views": args.num_views,
             "resolution": args.resolution,
             "pitch_degrees": args.pitch_degrees,
+            "camera_distribution": getattr(args, "camera_distribution", "orbit"),
             "radius": args.radius,
             "fov_degrees": args.fov_degrees,
             "object_up_axis": args.object_up_axis,

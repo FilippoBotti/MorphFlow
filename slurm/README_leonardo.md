@@ -1,9 +1,56 @@
-# MorphFlow v3 su Leonardo
+# MorphFlow su Leonardo
 
 I launcher usano l'ambiente nativo `/leonardo_work/IscrC_MORPHFL/mbarezzi/env.sh`,
 2 nodi Booster, 4 GPU per nodo, 32 CPU e 128 GiB di RAM per nodo.
 Slurm avvia un launcher Accelerate per nodo e ogni launcher crea 4 processi GPU.
-Le notifiche mail `ALL` includono inizio, fine ed errore.
+I launcher v3 includono notifiche mail `ALL` per inizio, fine ed errore.
+
+## SLat v4 Interp3D (13 ottobre 2026)
+
+`train_morphflow_v4_slat_leonardo.sbatch` replica la configurazione di
+`train_morphflow_v4_ss.slurm` dell'ateneo per il target **SLat**, con LR
+`5e-5` per condition, flow adapter e LoRA. Usa 2 nodi Booster x 4 GPU,
+batch 1 per GPU (globale 8), BF16 e 20 epoche dal pretrained TRELLIS.
+Il dataset e' `datasets/morphing_dataset_v4` su `$FAST/$USER`:
+50000 esempi train, 2000 validation e 2000 test; source swap porta il
+training a 100000 esempi virtuali per epoca.
+
+Restano i parametri v4: encoder sparse_conv3d, conditioning separato con
+gate token, LoRA cross-attention rank 32 / alpha 64, scheduler cosine,
+warmup LR 10000, weight decay 5e-5 e 2 DataLoader worker per GPU.
+Il prior ha peso 0.1, warmup 10000, cadenza 4, rollout 25 passi con
+gradiente sugli ultimi 4 e checkpointing; tau [0.05, 0.20], clip 0.10,
+RMS guard peso 1 e limiti [0.25, 2.0]. Semantic matching/cycle/usage,
+gradient balancing, EMA e CFG dropout sono disabilitati.
+
+```bash
+cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
+bash slurm/train_morphflow_v4_slat_leonardo.sbatch --check
+sbatch slurm/train_morphflow_v4_slat_leonardo.sbatch
+# Ripresa dopo il limite di 24 ore; TRAIN_EPOCHS resta il totale (20).
+AUTO_RESUME=1 sbatch slurm/train_morphflow_v4_slat_leonardo.sbatch
+```
+
+Run predefinita: `v4_interp3d_slat_dual_tgate_p25g4_lr5e-5_bs1_leonardo`.
+Log/TensorBoard: `$WORK/$USER/outputs/<run>/`; checkpoint:
+`$WORK/$USER/checkpoints/<run>/`; log Slurm:
+`$WORK/$USER/logs/v4_slat_pr25g4_lr5e-5_bs1_<jobid>.{out,err}`.
+`morphflow_last.pt` viene salvato a fine epoca; snapshot ogni 2 epoche.
+La ripresa e' manuale. Il launcher verifica stato e dimensioni del dataset
+v4 e riusa ambiente, cache offline e avvio multinodo del launcher Leonardo
+comune. Sono disponibili anche `--prepare` e `--comm-check`.
+
+### Ripresa a blocchi di tre epoche (16 ottobre 2026)
+
+Per la ripresa dal checkpoint di epoca 3 sono usati `TRAIN_EPOCHS=20`
+e `STOP_AFTER_EPOCH=6`: il primo mantiene lo scheduler cosine originale,
+il secondo ferma il ciclo dopo validazione e salvataggio dell'epoca 6.
+Il job dipendente usa `STOP_AFTER_EPOCH=9` e `AUTO_RESUME=1` per eseguire
+le epoche 7–9 solo dopo il successo del primo (`afterok`). Entrambi hanno
+limite di 24 ore, checkpoint periodico ogni epoca e ripristino completo di
+modello, optimizer e scheduler da `morphflow_last.pt`.
+Gli ID e la configurazione della sottomissione sono salvati in
+`$WORK/$USER/logs/v4_slat_resume_20261016.json`.
 
 ## Esperimenti encDual (7 ottobre 2026)
 
@@ -96,6 +143,85 @@ Altri override: `RUN_NAME`, `MF_OUT_ROOT`, `MF_DATA_ROOT`, `INIT_FROM`,
 `INIT_FROM=` disabilita l'inizializzazione predefinita. Gli script di ateneo
 restano la sorgente della configurazione baseline SLat.
 
+## Eval e sequenze alpha sul test v4
+
+I due nuovi launcher usano `env.sh`, cache offline e, per default,
+`$FAST/$USER/datasets/morphing_dataset_v4/metadata_test.json`.
+Il test v4 contiene **500 coppie uniche e 2000 target** (quattro alpha per coppia).
+Entrambi richiedono `CHECKPOINT_PATH` per il modello SS e
+`SLAT_CHECKPOINT_PATH` per il modello SLat; l'architettura viene letta dai
+checkpoint. Gli override mantengono i nomi dei launcher precedenti.
+
+```bash
+cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
+export CHECKPOINT_PATH=/percorso/checkpoint_ss.pt
+export SLAT_CHECKPOINT_PATH=/percorso/checkpoint_slat.pt
+
+# Controlli CPU: import, dati/selezione, checkpoint SS/SLat e cache decoder.
+bash slurm/eval_morphflow_v4_leonardo.slurm --check
+NUM_PAIRS=10 NUM_INTERMEDIATE_STEPS=9 \
+    bash slurm/generate_alpha_steps_test_v4_leonardo.slurm --check
+# Se mancano decoder in cache, usare --prepare dal login con gli stessi parametri.
+```
+
+`eval_morphflow_v4_leonardo.slurm` richiama lo stesso evaluator del v3:
+seleziona `NUM_SAMPLES` coppie uniche con seed fisso e un alpha del metadata
+per coppia. Confronta le predizioni con i target Interp3D del v4, usando le
+stesse coppie e alpha in tutta la griglia `CFG_VALUES x SLAT_CFG_VALUES`.
+I default restano 10 coppie, 50 passi SS e SLat, seed 42, BF16,
+`SAVE_LATENTS=0` e CFG `1 1.5 2 2.5 3` per entrambi i flow (25 combinazioni).
+Risorse: 1 GPU, 8 CPU, 32 GiB, 4 ore.
+
+```bash
+NUM_SAMPLES=50 STEPS=50 SLAT_STEPS=50 \
+CFG_VALUES="1 2 3" SLAT_CFG_VALUES="1 2 3" \
+RUN_NAME=v4_test_cfggrid \
+    sbatch slurm/eval_morphflow_v4_leonardo.slurm
+```
+
+Rimangono disponibili `ROOT_DIR`, `METADATA`, `SOURCE_IMAGES_ROOT`,
+`SOURCE_IMAGE_FILENAME`, `PROJECT_DIR`, `EVAL_TYPE`, `RUN_NAME`, `OUTPUT_DIR`,
+`NUM_SAMPLES`, `SEED`, `STEPS`, `SLAT_STEPS`, `CFG_VALUES`, `SLAT_CFG_VALUES`,
+`TRELLIS_MODEL`, `MIXED_PRECISION`, `SAVE_LATENTS` e i due checkpoint.
+`SLAT_CFG_SCALE` e' accettato come CFG SLat singolo se `SLAT_CFG_VALUES`
+non e' impostato. Output predefinito:
+`$WORK/$USER/outputs/eval_test_latents_v4/<RUN_NAME>/job_<id>/cfg_ss_<cfg>_slat_<cfg>/<timestamp>/`.
+Contiene GLB, metriche per campione, `summary.json`, `selected_samples.json`
+e, se richiesti, latenti.
+
+`generate_alpha_steps_test_v4_leonardo.slurm` esegue la pipeline
+SS -> coordinate sparse -> SLat -> mesh su `NUM_PAIRS` coppie di test e
+`NUM_INTERMEDIATE_STEPS` alpha intermedi equispaziati. Sono due conteggi
+distinti da `STEPS` e `SLAT_STEPS`, che controllano l'integrazione dei flow.
+Con `NUM_INTERMEDIATE_STEPS=9` genera alpha `0.9, 0.8, ..., 0.1`;
+alpha 1 indica src1 e alpha 0 indica src2.
+
+```bash
+NUM_PAIRS=10 NUM_INTERMEDIATE_STEPS=9 \
+SELECTION=random SEED=42 STEPS=50 SLAT_STEPS=50 \
+CFG_SCALE=3 SLAT_CFG_SCALE=3 RUN_NAME=v4_test_10pairs_9alpha \
+    sbatch slurm/generate_alpha_steps_test_v4_leonardo.slurm
+```
+
+I default restano 10 coppie, 5 intermedi, `SELECTION=first`,
+`START_INDEX=0`, `DEDUPLICATE_PAIRS=1`, `INCLUDE_ENDPOINTS=0`,
+`DIRECTION=src1_to_src2`, seed 42, 50 passi per flow, CFG 3 per flow,
+`TRELLIS_MODEL=image_large`, BF16, `SAVE_LATENTS=0`, `SAVE_VOXELS=1` e
+`SAVE_SOURCES=1`. `SELECTION` accetta `first`, `random`, `evenly_spaced`;
+`START_INDEX` si applica alla lista dopo la deduplicazione. Se si richiedono
+piu' coppie di quelle disponibili, vengono usate le rimanenti con un avviso.
+`INCLUDE_ENDPOINTS=1` aggiunge due predizioni, alpha 1 e 0; i GLB delle
+sorgenti sono salvati separatamente quando `SAVE_SOURCES=1`.
+`ALPHAS="0.75,0.5,0.25"` permette anche una lista esplicita, che sostituisce
+la griglia automatica e ne determina l'ordine.
+
+Risorse: 1 GPU, 8 CPU, 64 GiB, 8 ore. Output predefinito:
+`$WORK/$USER/outputs/alpha_steps_test_v4/<RUN_NAME>/job_<id>/<timestamp>_test_k..._n..._pipeline/`,
+con `selected_pairs.json`, `summary.json` e una directory per coppia
+contenente sorgenti, GLB generati e metadati della sequenza. Anche qui
+`OUTPUT_DIR`, `ROOT_DIR`, `METADATA`, `PROJECT_DIR` e i parametri delle immagini
+sono modificabili. I log di entrambi i launcher sono in `$WORK/$USER/logs/`.
+
 ## Valutazione v3 su Leonardo
 
 `eval_morphflow_v3_leonardo.slurm` usa lo stesso `eval_validation_latents.py`
@@ -157,7 +283,79 @@ Restano disponibili le variabili del launcher di ateneo: `ROOT_DIR`,
 I checkpoint SLat condizionati con DINO richiedono immagini e cache Torch Hub;
 `--prepare` prepara anche quest'ultima quando necessaria.
 
-## Inferenza da due GLB con encoding multiview
+## Morphing di due GLB a un alpha, con tutte le ricostruzioni
+
+`morph_glb_pair.py` accetta due GLB, checkpoint SS e SLat espliciti, un alpha
+e la cartella di output. Richiama l'encoding e la pipeline di
+`generate_glb_pair.py` con un solo CFG per flow e genera sempre anche gli
+endpoint alpha 1 e 0. Gli endpoint attraversano entrambi i modelli SS/SLat;
+le ricostruzioni dirette encoder/decoder sono salvate separatamente.
+
+```bash
+cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
+sbatch slurm/morph_glb_pair_leonardo.sbatch \
+    /percorso/primo.glb /percorso/secondo.glb \
+    --ss-checkpoint /percorso/checkpoint_ss.pt \
+    --slat-checkpoint /percorso/checkpoint_slat.pt \
+    --alpha 0.35 \
+    --output-dir /leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/morph_personale \
+    --cfg-ss 3 --cfg-slat 3 --steps 50 --slat-steps 50
+```
+
+La convenzione e' **alpha 1 = primo GLB, alpha 0 = secondo GLB**.
+Con alpha 0 o 1 vengono comunque prodotti tutti e cinque i file: il morph
+coincide con la relativa generazione endpoint, senza rigenerarla.
+I GLB finali sono direttamente nella cartella passata a `--output-dir`,
+senza aggiungere timestamp o ID del job:
+
+| File | Contenuto |
+|---|---|
+| `reconstruction_decoder_src1.glb` | Encoding del primo GLB -> mesh decoder TRELLIS |
+| `reconstruction_decoder_src2.glb` | Encoding del secondo GLB -> mesh decoder TRELLIS |
+| `reconstruction_model_src1_alpha1.glb` | Generazione completa del modello ad alpha 1 |
+| `reconstruction_model_src2_alpha0.glb` | Generazione completa del modello ad alpha 0 |
+| `morph.glb` | Generazione completa all'alpha richiesto |
+| `summary.json` | Input, checkpoint, alpha, CFG, seed e percorsi dei risultati |
+
+L'encoding segue la pipeline dataset TRELLIS presente nel checkout: Blender
+normalizza ogni scena nel cubo unitario e renderizza 50 viste a 512px;
+voxelizzazione 64^3; DINOv2 ViT-L/14 con register su immagini 518px;
+token `x_prenorm` proiettati sui voxel, interpolati bilinearmente e mediati
+sulle viste; feature arrotondate a FP16 come nella cache TRELLIS; encoder
+SLat con `sample_posterior=False`. Si passa al modello il latente grezzo:
+la normalizzazione del conditioning viene gestita dal modello secondo il
+checkpoint, e il latente generato viene denormalizzato prima del decoder.
+Per GLB con soli colori ai vertici (`COLOR_0`) e senza materiale, il renderer
+collega esplicitamente il layer colore al materiale Blender: altrimenti
+Blender 3.0/Cycles renderizza grigio. I materiali gia' presenti sono conservati.
+L'encoding versione 2 include questa correzione: per run precedenti usare una
+nuova cartella di output, cosi' render e latenti vengono ricalcolati.
+Rendering, trasformazioni, voxel, latenti e risultati della pipeline restano
+in `pipeline/`. I GLB sono normalizzati, Y-up, con colori ai vertici prodotti
+dal decoder; non ripristinano dimensioni/traslazioni originali o texture UV.
+
+Default: 50 passi per flow, CFG 3 per flow, seed 42, BF16, 50 viste,
+batch DINO 4. Modificabili con `--steps`, `--slat-steps`, `--cfg-ss`,
+`--cfg-slat`, `--seed`, `--mixed-precision`, `--encoding-views`,
+`--dino-batch-size`, `--blender`. Sono accettati anche gli alias
+`--checkpoint_path`, `--slat_checkpoint_path`, `--output_dir`,
+`--cfg_scale`, `--slat_cfg_scale`, `--slat_steps`.
+
+Per verificare dal login, usare **gli stessi argomenti** sostituendo
+`sbatch slurm/morph_glb_pair_leonardo.sbatch` con
+`bash slurm/morph_glb_pair_leonardo.sbatch --check`. `--prepare` prepara le
+cache quando mancano. Queste modalita' non generano mesh. Per esecuzione
+diretta in un ambiente GPU gia' attivo, usare `python morph_glb_pair.py`
+con gli stessi argomenti e `--blender /percorso/blender` (o `BLENDER_BIN`).
+Il launcher Leonardo richiede 1 GPU, 8 CPU, 64 GiB e 4 ore.
+
+La cartella di output ha un lock per evitare scritture concorrenti. A parita'
+di configurazione una riesecuzione riusa encoding e predizioni completati;
+per input/checkpoint o parametri diversi, usare una nuova cartella.
+Gli errori della generazione sono riportati in `last_error.json` e nel log
+Slurm; `summary.json` viene pubblicato solo quando tutti i risultati esistono.
+
+## Inferenza da due GLB con encoding multiview e griglia CFG
 
 `generate_glb_pair.py` accetta due GLB arbitrari, checkpoint SS/SLat espliciti
 (SS standard e conditioning SLat) e una griglia cartesiana di CFG.

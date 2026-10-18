@@ -18,6 +18,8 @@ ENCODER = "slat_enc_swin8_B_64l8_fp16"
 SS_DECODER = "ss_dec_conv3d_16l8_fp16"
 MESH_DECODER = "slat_dec_mesh_swin8_B_64l8m256c_fp16"
 REPO = "microsoft/TRELLIS-image-large"
+# v2 preserves GLB vertex colors when Blender imports an empty material slot.
+ENCODING_VERSION = 2
 
 
 def number_list(value):
@@ -97,7 +99,10 @@ def sweep(args):
 
 
 def tag(value):
-    return format(value, ".8g").replace(".", "p")
+    # Preserve familiar short names, but never merge distinct alpha values
+    # (e.g. 0.999999999 and 1) into the same cached prediction.
+    short = format(value, ".8g")
+    return (short if float(short) == value else repr(float(value))).replace(".", "p")
 
 
 def preflight(args):
@@ -146,7 +151,7 @@ def encode_asset(args, source, label, encoder):
     root = args.output_dir / "encoding" / label
     root.mkdir(parents=True, exist_ok=True)
     identity = {"asset": file_identity(source, digest=True), "views": args.encoding_views,
-                "encoder": ENCODER, "feature_model": "dinov2_vitl14_reg", "version": 1}
+                "encoder": ENCODER, "feature_model": "dinov2_vitl14_reg", "version": ENCODING_VERSION}
     cache = root / "slat.pt"
     if cache.is_file():
         saved = torch.load(cache, map_location="cpu", weights_only=True)
@@ -184,6 +189,7 @@ def run(args, metadata):
     torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda")
     identity = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "mode"}
+    identity["encoding_version"] = ENCODING_VERSION
     identity["files"] = [file_identity(p, digest=p.suffix.lower() == ".glb")
                          for p in (args.src1, args.src2, args.ss_checkpoint, args.slat_checkpoint)]
     manifest = args.output_dir / "run.json"

@@ -15,6 +15,10 @@
 #SBATCH --mail-user=marco.barezzi@unipr.it
 #SBATCH --mail-type=BEGIN,END,FAIL
 
+# Legacy Parma launcher: uniform-alpha textured-GLB adaptation.
+# The Interp3D paper protocol on Leonardo is implemented in
+# slurm/benchmark_threeway_textured_leonardo.slurm (one node, one GPU).
+# This legacy launcher is not directly comparable with paper metrics.
 # Multi-GPU, resumable benchmark:
 #   MorphFlow vs MorphAny3D vs Interp3D
 #   SAME uniform alpha schedule for every method
@@ -367,6 +371,7 @@ run_phase plan "$ORIGINAL_ENV" "$TRELLIS_REPO_HOST" "cpu" \
         --source-image-filename "$SOURCE_IMAGE_FILENAME" \
         --num-pairs "$N" \
         --k "$K" \
+        --alpha-schedule uniform \
         --seed "$SEED"
 
 # -------------------------------
@@ -392,6 +397,7 @@ if [[ "${REUSE_MORPHANY3D:-0}" != "1" ]]; then
     run_sharded morphany3d "$MORPHANY_ENV" "$MORPHANY_REPO" \
         python "$SCRIPT_IN" morphany3d \
             --run-root /benchmark \
+            --steps "$STEPS" --slat-steps "$SLAT_STEPS" \
             --tfsa-cache-mode "$MORPHANY_TFSA_CACHE_MODE" \
             --tfsa-ram-gb "$MORPHANY_TFSA_RAM_GB_PER_WORKER" \
             --tfsa-min-node-free-gb "$MORPHANY_TFSA_MIN_NODE_FREE_GB" \
@@ -402,7 +408,8 @@ fi
 
 if [[ "${REUSE_INTERP3D:-0}" != "1" ]]; then
     run_sharded interp3d "$INTERP_ENV" "$INTERP_REPO" \
-        python "$SCRIPT_IN" interp3d --run-root /benchmark
+        python "$SCRIPT_IN" interp3d --run-root /benchmark \
+            --steps "$STEPS" --slat-steps "$SLAT_STEPS"
 else
     echo "[$(date -Is)] REUSE Interp3D generation" | tee -a "$RUN_ROOT/progress.log"
 fi
@@ -432,6 +439,8 @@ for METHOD in ${EVAL_METHODS:-morphflow morphany3d interp3d}; do
             --stage all \
             --skip-invalid-pairs \
             --num-views "$NUM_VIEWS" \
+            --fid-num-views "$NUM_VIEWS" \
+            --render-backend blender \
             --resolution "$RENDER_RESOLUTION" \
             --appearance materials \
             --lpips-net "$LPIPS_NET" \

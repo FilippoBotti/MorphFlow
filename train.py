@@ -61,6 +61,8 @@ def build_parser():
     parser.add_argument("--train_bs", type=int, default=1, help="Batch size per GPU/process")
     parser.add_argument("--val_bs", type=int, default=1)
     parser.add_argument("--train_epochs", type=int, default=100)
+    parser.add_argument("--stop_after_epoch", type=int, default=None,
+                        help="Stop after this completed epoch, preserving the train_epochs LR schedule.")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--val_every", type=int, default=1)
@@ -1569,7 +1571,16 @@ def train(args):
     # systematically land on prior_off updates.
     prior_debug_counter = 0
 
-    for epoch in range(start_epoch, args.train_epochs + 1):
+    end_epoch = args.train_epochs
+    if args.stop_after_epoch is not None:
+        if args.stop_after_epoch < 1:
+            raise ValueError("--stop_after_epoch must be positive.")
+        end_epoch = min(end_epoch, args.stop_after_epoch)
+        accelerator.print(
+            f"Stop after epoch {end_epoch}; LR schedule remains {args.train_epochs} epochs."
+        )
+
+    for epoch in range(start_epoch, end_epoch + 1):
         running_loss = 0.0
 
         progress_bar = tqdm(

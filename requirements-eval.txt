@@ -2,3 +2,4 @@
 clean-fid>=0.1.35,<1
 lpips>=0.1.4,<0.2
 matplotlib>=3.5,<4
+pytorch-fid==0.3.0

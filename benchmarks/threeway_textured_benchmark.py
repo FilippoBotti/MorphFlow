@@ -7,9 +7,10 @@ Design goals
 * MorphFlow consumes canonical source latents;
 * MorphAny3D and Interp3D consume the corresponding source images;
 * K intermediate states per pair;
-* generation saves raw TRELLIS meshes first;
-* ONE common TRELLIS texture-baking path converts every raw mesh to a textured GLB;
-* eval_textured_benchmark.py wraps eval_perceptual_sequence.py and adds full-path metrics + FID;
+* generation saves raw TRELLIS meshes and their genuine Gaussian appearance;
+* paper evaluation renders the Gaussian appearance from shared spherical views;
+* optional common TRELLIS texture baking produces textured GLB artifacts;
+* eval_textured_benchmark.py adds full-path metrics and trajectory FID;
 * resumable outputs and append-only progress log.
 
 This script intentionally has several modes because the three methods live in
@@ -20,24 +21,28 @@ runs each mode in the correct environment.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
+import fcntl
 import json
 import os
 import random
 import re
 import shutil
+import struct
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 
 METHODS = ("morphflow", "morphany3d", "interp3d")
 DEFAULT_N = 100
-DEFAULT_K = 10
+DEFAULT_K = 5
 DEFAULT_SEED = 42
 
 
@@ -132,7 +137,7 @@ def torch_load_cpu(path: Path) -> Any:
 
 
 class HybridTFSACache:
-    """Bounded CPU-RAM cache with transparent spill to node-local storage.
+    """Bounded CPU-RAM cache with transparent spill to explicit scratch storage.
 
     MorphAny3D's attention modules only require mapping-style ``in``, assignment,
     and ``get``.  Keeping this object alive across alpha steps avoids the
@@ -162,6 +167,21 @@ class HybridTFSACache:
     def __setitem__(self, key: Any, value: Any) -> None:
         if key in self:
             return
+        # torch.save snapshots values at the time of the write. CPU tensors may
+        # otherwise alias views modified by the next attention call. Compact
+        # clones also make logical tensor bytes a real upper bound on storage.
+        def snapshot(obj: Any) -> Any:
+            import torch
+            if torch.is_tensor(obj):
+                return obj.detach().to(device="cpu").clone(memory_format=torch.contiguous_format)
+            if isinstance(obj, dict):
+                return {name: snapshot(item) for name, item in obj.items()}
+            if isinstance(obj, list):
+                return [snapshot(item) for item in obj]
+            if isinstance(obj, tuple):
+                return tuple(snapshot(item) for item in obj)
+            return obj
+        value = snapshot(value)
         size = object_nbytes(value)
         if self.max_ram_bytes > 0 and self.ram_bytes + size <= self.max_ram_bytes:
             self._ram[key] = value
@@ -214,6 +234,9 @@ class HybridTFSACache:
 
     @staticmethod
     def _morph_idx(key: Any) -> Optional[int]:
+        if isinstance(key, str):
+            match = re.search(r"_morphing(\d+)(?:_|\.)", key)
+            return int(match.group(1)) if match else None
         if isinstance(key, tuple) and len(key) >= 2 and key[0] in {"ss", "slat", "slat_coords"}:
             try:
                 return int(key[1])
@@ -282,6 +305,89 @@ class HybridTFSACache:
         }
 
 
+class _ModuleProxy:
+    """Override selected module attributes without changing global torch/os."""
+
+    def __init__(self, module: Any, **overrides: Any):
+        self._module = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+
+class TFSAFileCacheAdapter:
+    """Translate upstream TFSA file I/O into a bounded mapping cache.
+
+    Only the two attention modules and morphing pipeline receive private module
+    proxies. Endpoint caches, raw outputs, and every other torch/os user retain
+    normal file semantics. The upstream attention calculations stay unchanged.
+    """
+
+    _name = re.compile(r"(?:(?:ss|slat)_sa_morphing\d+_step\d+_block\d+|(?:feat_)?coords_morphing\d+)\.pt\Z")
+
+    def __init__(self, cache: HybridTFSACache, work_dir: Path, min_free_bytes: int = 0):
+        import torch
+        self.cache = cache
+        self.work_dir = Path(work_dir).absolute()
+        self.min_free_bytes = max(0, int(min_free_bytes))
+        self.pressure_relief_triggered = False
+        self._torch = torch
+        self._exists = os.path.exists
+
+    def _key(self, path: Any) -> Optional[str]:
+        try:
+            path = Path(os.fspath(path)).absolute()
+        except TypeError:
+            return None
+        return path.name if path.parent == self.work_dir and self._name.fullmatch(path.name) else None
+
+    def exists(self, path: Any) -> bool:
+        key = self._key(path)
+        return key in self.cache if key is not None else self._exists(path)
+
+    def save(self, value: Any, path: Any, *args: Any, **kwargs: Any) -> None:
+        key = self._key(path)
+        if key is None:
+            return self._torch.save(value, path, *args, **kwargs)
+        if self.min_free_bytes and self.cache.max_ram_bytes:
+            available = node_mem_available_bytes()
+            if available and available < self.min_free_bytes:
+                self.cache.spill_all_ram()
+                self.cache.max_ram_bytes = 0
+                self.pressure_relief_triggered = True
+        self.cache[key] = value
+
+    def load(self, path: Any, *args: Any, **kwargs: Any) -> Any:
+        key = self._key(path)
+        if key is None:
+            return self._torch.load(path, *args, **kwargs)
+        if key not in self.cache:
+            raise FileNotFoundError(path)
+        # Upstream TFSA always stores detached CPU tensors and loads them before
+        # explicitly moving to CUDA; no alternate map_location is used here.
+        return self.cache.get(key)
+
+    @contextmanager
+    def install(self, modules: Optional[Sequence[Any]] = None):
+        if modules is None:
+            import importlib
+            modules = [importlib.import_module(name) for name in (
+                "trellis.modules.attention.modules",
+                "trellis.modules.sparse.attention.modules",
+                "trellis.pipelines.trellis_image_to_3d",
+            )]
+        saved = [(module, module.torch, module.os) for module in modules]
+        try:
+            for module, original_torch, original_os in saved:
+                module.torch = _ModuleProxy(original_torch, save=self.save, load=self.load)
+                module.os = _ModuleProxy(original_os, path=_ModuleProxy(original_os.path, exists=self.exists))
+            yield self
+        finally:
+            for module, original_torch, original_os in saved:
+                module.torch, module.os = original_torch, original_os
+
+
 def safe_slug(value: str, limit: int = 36) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
     if not value:
@@ -297,11 +403,19 @@ def alpha_dir(alpha: float) -> str:
     return f"alpha_{float(alpha):.6f}".replace(".", "p")
 
 
-def canonical_alphas(k: int) -> List[float]:
+def canonical_alphas(k: int, schedule: str = "beta", beta_shape: float = 5.0) -> List[float]:
     if k < 1:
         raise ValueError("K must be >= 1")
     # Canonical MorphFlow convention: alpha=1 -> src1, alpha=0 -> src2.
-    values = np.linspace(1.0, 0.0, k + 2, dtype=np.float64)[1:-1]
+    values = np.linspace(0.0, 1.0, k + 2, dtype=np.float64)[1:-1]
+    if schedule == "beta":
+        from scipy.stats import beta
+        if beta_shape <= 0:
+            raise ValueError("--beta-shape must be positive")
+        values = beta.ppf(values, beta_shape, beta_shape)
+    elif schedule != "uniform":
+        raise ValueError(f"Unknown alpha schedule: {schedule}")
+    values = 1.0 - values
     return [float(round(x, 10)) for x in values.tolist()]
 
 
@@ -366,7 +480,16 @@ def append_timing(run_root: Path, method: str, args: argparse.Namespace, payload
     append_jsonl(timing_jsonl(run_root, method, args), row)
 
 
-def save_raw_mesh(mesh: Any, path: Path, metadata: Optional[Mapping[str, Any]] = None) -> None:
+GAUSSIAN_TENSOR_FIELDS = ("_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation", "_opacity")
+
+
+def raw_asset_ready(path: Path) -> bool:
+    # Old benchmark outputs contain geometry alone and cannot support textured
+    # evaluation. The marker is written only after the full asset is durable.
+    return path.is_file() and path.with_suffix(".appearance.json").is_file()
+
+
+def save_raw_mesh(mesh: Any, path: Path, metadata: Optional[Mapping[str, Any]] = None, gaussian: Any = None) -> None:
     import torch
 
     if not getattr(mesh, "success", True):
@@ -378,9 +501,49 @@ def save_raw_mesh(mesh: Any, path: Path, metadata: Optional[Mapping[str, Any]] =
         "vertex_attrs": attrs.detach().float().cpu() if attrs is not None else None,
         "res": int(getattr(mesh, "res", 64)),
         "metadata": dict(metadata or {}),
+        "format_version": 2,
+    }
+    if gaussian is None:
+        raise ValueError("Textured evaluation requires the Gaussian appearance decoded from the same SLat")
+    payload["gaussian"] = {
+        "init_params": gaussian.init_params,
+        "active_sh_degree": int(gaussian.active_sh_degree),
+        "tensors": {
+            name: getattr(gaussian, name).detach().float().cpu() if getattr(gaussian, name) is not None else None
+            for name in GAUSSIAN_TENSOR_FIELDS
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    write_json(path.with_suffix(".appearance.json"), {"format_version": 2, "appearance": "trellis_gaussian"})
+
+
+def load_raw_gaussian(path: Path, device: str = "cuda") -> Any:
+    from trellis.representations import Gaussian
+    payload = torch_load_cpu(path)
+    if "gaussian" not in payload:
+        raise ValueError(f"Missing genuine Gaussian appearance in {path}; regenerate this asset")
+    state = payload["gaussian"]
+    gaussian = Gaussian(**state["init_params"], device=device)
+    for name in GAUSSIAN_TENSOR_FIELDS:
+        value = state["tensors"][name]
+        setattr(gaussian, name, value.to(device) if value is not None else None)
+    gaussian.active_sh_degree = int(state["active_sh_degree"])
+    return gaussian
+
+
+def decode_slat_gaussian(decoder: Any, sparse_tensor_cls: Any, feats: Any, coords: Any, device: Any) -> Any:
+    import torch
+    coords = coords.to(device=device, dtype=torch.int32)
+    if coords.shape[1] == 3:
+        coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1)
+    coords = coords.clone()
+    coords[:, 0] = 0
+    sparse = sparse_tensor_cls(feats=feats.to(device=device, dtype=torch.float32), coords=coords)
+    with torch.no_grad():
+        return decoder(sparse)[0]
 
 
 def decode_slat_mesh(mesh_decoder: Any, sparse_tensor_cls: Any, feats: Any, coords: Any, device: Any) -> Any:
@@ -400,6 +563,50 @@ def decode_slat_mesh(mesh_decoder: Any, sparse_tensor_cls: Any, feats: Any, coor
         return mesh_decoder(sparse)[0]
 
 
+def select_test_pairs(dataset: Any, num_pairs: int, seed: int) -> Tuple[List[Tuple[int, Dict[str, Any]]], int]:
+    """Select unique test pairs without ever filtering unavailable benchmark inputs.
+
+    Metadata may contain multiple target states for each source pair. They are
+    not ground truth for this evaluation, so only source latents and source
+    images are required. Indexes refer to the original unfiltered metadata.
+    """
+    if int(num_pairs) < 0:
+        raise ValueError("--num-pairs must be >= 0; zero selects the entire test set")
+    unique: List[Tuple[int, Dict[str, Any]]] = []
+    seen = set()
+    for index, entry in enumerate(dataset.metadata):
+        required = ("src_1", "src_2", "target")
+        missing_keys = [key for key in required if key not in entry]
+        if missing_keys:
+            raise ValueError(f"Invalid test metadata row {index}: missing {missing_keys}")
+        if not dataset._entry_allowed_by_split(entry):
+            raise ValueError(f"Metadata row {index} is outside the strict test split; use test-only metadata")
+        key = (str(entry["src_1"]), str(entry["src_2"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append((index, dict(entry)))
+    available = len(unique)
+    requested = available if int(num_pairs) == 0 else int(num_pairs)
+    if requested < 1 or requested > available:
+        raise RuntimeError(f"Requested N={num_pairs}, but {available} unique test pairs are available")
+    positions = np.random.default_rng(seed).choice(available, size=requested, replace=False).tolist()
+    chosen = [unique[int(position)] for position in positions]
+    failures: List[str] = []
+    for index, entry in chosen:
+        paths = dataset._paths_for_entry(entry)
+        for key in ("src1_feats", "src1_coords", "src1_ss_latent", "src2_feats", "src2_coords", "src2_ss_latent"):
+            if not paths[key].is_file():
+                failures.append(f"metadata row {index}: missing {key}: {paths[key]}")
+        for prefix, asset in (("src1", str(entry["src_1"])), ("src2", str(entry["src_2"]))):
+            if dataset._find_source_image_path(asset, entry, prefix) is None:
+                failures.append(f"metadata row {index}: missing {prefix} image for {asset}")
+    if failures:
+        raise FileNotFoundError(
+            f"Selected test set has {len(failures)} missing inputs; no pairs were dropped.\n" + "\n".join(failures[:30])
+        )
+    return chosen, available
+
+
 def command_plan(args: argparse.Namespace) -> None:
     from data.morph_dataset import MorphingDistillDataset
 
@@ -407,6 +614,19 @@ def command_plan(args: argparse.Namespace) -> None:
     run_root.mkdir(parents=True, exist_ok=True)
     plan_path = run_root / "plan.json"
     if plan_path.exists() and not args.overwrite:
+        existing = read_json(plan_path)
+        expected_requested_n = existing.get("requested_num_pairs", existing.get("num_pairs"))
+        if int(args.num_pairs) != int(expected_requested_n):
+            raise ValueError(f"Existing plan requested {expected_requested_n} pairs, received {args.num_pairs}; use a fresh run root")
+        requested = {"seed": int(args.seed), "k_intermediate": int(args.k),
+                     "data_root": str(Path(args.data_root).resolve()), "metadata": str(args.metadata),
+                     "source_images_root": str(Path(args.source_images_root).resolve()),
+                     "alphas": canonical_alphas(args.k, args.alpha_schedule, args.beta_shape)}
+        if "source_image_filename" in existing:
+            requested["source_image_filename"] = args.source_image_filename
+        mismatches = {key: (existing.get(key), value) for key, value in requested.items() if existing.get(key) != value}
+        if mismatches:
+            raise ValueError(f"Existing plan differs from requested benchmark: {mismatches}; use a fresh run root")
         log(f"PLAN already exists, keeping it: {plan_path}", run_root)
         return
 
@@ -416,29 +636,15 @@ def command_plan(args: argparse.Namespace) -> None:
         split="test",
         strict_split=True,
         load_occupancy=False,
-        skip_missing=True,
+        skip_missing=False,
         verbose=True,
         load_source_images=False,
         source_images_root=args.source_images_root,
         source_image_filename=args.source_image_filename,
     )
 
-    unique: List[Tuple[int, Dict[str, Any]]] = []
-    seen = set()
-    for idx, entry in enumerate(dataset.metadata):
-        key = (str(entry["src_1"]), str(entry["src_2"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((idx, dict(entry)))
-
-    if len(unique) < args.num_pairs:
-        raise RuntimeError(f"Requested N={args.num_pairs}, but only {len(unique)} unique test pairs are available")
-
-    rng = np.random.default_rng(args.seed)
-    chosen_positions = rng.choice(len(unique), size=args.num_pairs, replace=False).tolist()
-    chosen = [unique[int(pos)] for pos in chosen_positions]
-    alphas = canonical_alphas(args.k)
+    chosen, available_pairs = select_test_pairs(dataset, args.num_pairs, args.seed)
+    alphas = canonical_alphas(args.k, args.alpha_schedule, args.beta_shape)
 
     pairs = []
     for pair_id, (metadata_index, entry) in enumerate(chosen):
@@ -467,7 +673,11 @@ def command_plan(args: argparse.Namespace) -> None:
     payload = {
         "created_utc": utc_now(),
         "seed": int(args.seed),
-        "num_pairs": int(args.num_pairs),
+        "num_pairs": len(chosen),
+        "requested_num_pairs": int(args.num_pairs),
+        "available_test_pairs": available_pairs,
+        "metadata_index_basis": "unfiltered",
+        "source_image_filename": args.source_image_filename,
         "k_intermediate": int(args.k),
         "split": "test",
         "data_root": str(Path(args.data_root).resolve()),
@@ -475,6 +685,20 @@ def command_plan(args: argparse.Namespace) -> None:
         "source_images_root": str(Path(args.source_images_root).resolve()),
         "alpha_convention": "alpha=1 -> src1; alpha=0 -> src2",
         "alphas": alphas,
+        "alpha_schedule": args.alpha_schedule,
+        "beta_shape": args.beta_shape if args.alpha_schedule == "beta" else None,
+        "evaluation_protocol": {
+            "source": "https://arxiv.org/html/2601.14103v1#A2.SS2",
+            "scope": "Interp3D metric definitions on the MorphFlow held-out test split; not Interp3DData table reproduction",
+            "paper_sequence_states": 7,
+            "paper_beta_shape": 5,
+            "upstream_code_beta_shape": 6,
+            "render_backend": "gaussian",
+            "perceptual_views": 64,
+            "fid_views_per_state": 1000,
+            "fid_intermediate_selection": "two seeded random states without replacement, shared across methods",
+            "morphflow_noise_policy": "fixed pair seed across alpha and CFG cells; separate SS and SLat noise streams",
+        },
         "interp3d_internal_t": [float(round(1.0 - a, 10)) for a in alphas],
         "pairs": pairs,
     }
@@ -521,6 +745,10 @@ def command_morphflow(args: argparse.Namespace) -> None:
     ss_model = build_model(ss_ckpt, ss_model_type, "ss").to(device).eval()
     slat_model = build_model(slat_ckpt, slat_model_type, "slat").to(device).eval()
     ss_decoder, mesh_decoder, sparse_cls = load_decoders("ss", device)
+    from trellis.models import from_pretrained as trellis_from_pretrained
+    gaussian_decoder = trellis_from_pretrained(
+        "microsoft/TRELLIS-image-large/ckpts/slat_dec_gs_swin8_B_64l8gs32_fp16"
+    ).to(device).eval()
 
     dataset = MorphingDistillDataset(
         root=args.data_root,
@@ -528,7 +756,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
         split="test",
         strict_split=True,
         load_occupancy=False,
-        skip_missing=True,
+        skip_missing=plan.get("metadata_index_basis") != "unfiltered",
         verbose=False,
         load_source_images=False,
         source_images_root=args.source_images_root,
@@ -569,14 +797,14 @@ def command_morphflow(args: argparse.Namespace) -> None:
         src1_raw = ref_pair / "src1_raw.pt"
         src2_raw = ref_pair / "src2_raw.pt"
         ref_start = time.perf_counter()
-        if not src1_raw.exists():
+        if not raw_asset_ready(src1_raw):
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src1["feats"], src1["coords"], device)
-            save_raw_mesh(mesh, src1_raw, {"kind": "reference", "asset": pair["src1"]})
+            save_raw_mesh(mesh, src1_raw, {"kind": "reference", "asset": pair["src1"]}, gaussian=decode_slat_gaussian(gaussian_decoder, sparse_cls, src1["feats"], src1["coords"], device))
             del mesh
             torch.cuda.empty_cache()
-        if not src2_raw.exists():
+        if not raw_asset_ready(src2_raw):
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, src2["feats"], src2["coords"], device)
-            save_raw_mesh(mesh, src2_raw, {"kind": "reference", "asset": pair["src2"]})
+            save_raw_mesh(mesh, src2_raw, {"kind": "reference", "asset": pair["src2"]}, gaussian=decode_slat_gaussian(gaussian_decoder, sparse_cls, src2["feats"], src2["coords"], device))
             del mesh
             torch.cuda.empty_cache()
         cuda_sync()
@@ -586,13 +814,16 @@ def command_morphflow(args: argparse.Namespace) -> None:
         for step_idx, alpha in enumerate(plan["alphas"]):
             step_out = pair_out / alpha_dir(alpha)
             raw_path = step_out / "mesh_raw.pt"
-            if raw_path.exists() and not args.overwrite:
+            if raw_asset_ready(raw_path) and not args.overwrite:
                 steps_skipped_output += 1
                 log(f"[MorphFlow] pair={pair_id:04d} step={step_idx + 1}/{plan['k_intermediate']} skip existing", run_root)
                 continue
 
-            ss_seed = step_seed(plan["seed"], pair_id, step_idx, 0)
-            slat_seed = step_seed(plan["seed"], pair_id, step_idx, 10_000)
+            # Morphing evaluates a trajectory. Independent noise at every alpha
+            # measures resampling jitter and unfairly inflates LPIPS/PPL relative
+            # to the two baselines, which both reuse their pair noise stream.
+            ss_seed = pair_seed(plan["seed"], pair_id)
+            slat_seed = ss_seed + 10_000
             seed_everything(ss_seed)
             batch = batch_for_alpha(src1, src2, float(alpha))
             cuda_sync()
@@ -621,6 +852,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
             if pred_slat is None:
                 raise RuntimeError(f"MorphFlow produced empty SLat coords for pair={pair_id}, alpha={alpha}")
             mesh = decode_slat_mesh(mesh_decoder, sparse_cls, pred_slat.feats, pred_slat.coords, device)
+            gaussian = decode_slat_gaussian(gaussian_decoder, sparse_cls, pred_slat.feats, pred_slat.coords, device)
             cuda_sync()
             step_compute = time.perf_counter() - compute_start
             intermediate_compute_seconds += step_compute
@@ -637,6 +869,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
                     "ss_seed": ss_seed,
                     "slat_seed": slat_seed,
                 },
+                gaussian=gaussian,
             )
             serialization_seconds += time.perf_counter() - serial_start
             append_jsonl(shard_jsonl(run_root, args), {"method": "morphflow", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
@@ -647,7 +880,7 @@ def command_morphflow(args: argparse.Namespace) -> None:
                 f"compute={step_compute:.2f}s rss={gib(rss):.2f}GiB",
                 run_root,
             )
-            del pred_ss, pred_coords, pred_slat, mesh, batch
+            del pred_ss, pred_coords, pred_slat, mesh, gaussian, batch
             torch.cuda.empty_cache()
 
         cuda_sync()
@@ -747,6 +980,19 @@ def copy_directory_files(src: Path, dst: Path) -> int:
     return copied
 
 
+def morphany_tfsa_spill_directory(args: argparse.Namespace, cache_root: Path, pair_dir: str) -> Path:
+    """Use explicit spill storage only when requested, always scoped per pair.
+
+    The final tfsa_spill component prevents clearing endpoint caches even if a
+    caller deliberately selects the persistent method cache as its spill root.
+    """
+    if not pair_dir or Path(pair_dir).name != pair_dir or pair_dir in {".", ".."}:
+        raise ValueError(f"Unsafe pair directory for TFSA cache: {pair_dir!r}")
+    configured = getattr(args, "tfsa_spill_root", "")
+    parent = Path(configured).resolve() if configured else Path(cache_root)
+    return parent / pair_dir / "tfsa_spill"
+
+
 def command_morphany3d(args: argparse.Namespace) -> None:
     import torch
     from PIL import Image
@@ -766,11 +1012,14 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
+    pipeline.sparse_structure_sampler_params["steps"] = args.steps
+    pipeline.slat_sampler_params["steps"] = args.slat_steps
     log(
         "MorphAny3D generation start | "
         f"pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)} | "
         f"tfsa_cache_mode={args.tfsa_cache_mode} | tfsa_ram_limit={args.tfsa_ram_gb:.2f} GiB | "
-        f"min_node_free={args.tfsa_min_node_free_gb:.2f} GiB | local_cache={local_cache_root}",
+        f"min_node_free={args.tfsa_min_node_free_gb:.2f} GiB | local_cache={local_cache_root} | "
+        f"tfsa_spill_root={getattr(args, 'tfsa_spill_root', '') or cache_root}",
         run_root,
     )
 
@@ -788,7 +1037,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
         tar_cache.mkdir(parents=True, exist_ok=True)
 
         raw_paths = [pair_out / alpha_dir(a) / "mesh_raw.pt" for a in plan["alphas"]]
-        if all(path.is_file() for path in raw_paths) and not args.overwrite:
+        if all(raw_asset_ready(path) for path in raw_paths) and not args.overwrite:
             log(f"[MorphAny3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} skip complete pair", run_root)
             append_timing(
                 run_root,
@@ -903,25 +1152,23 @@ def command_morphany3d(args: argparse.Namespace) -> None:
             work_dir.mkdir(parents=True, exist_ok=True)
             cache_prep_seconds = time.perf_counter() - prep_start
 
-            # Upstream MorphAny3D uses torch.save/torch.load directly for TFSA.
-            # Keep those exact file semantics, but place the working set on the
-            # node tmpfs (/runtime-tmp -> host /dev/shm) and prune obsolete alpha
-            # states after every step.  If the retained state exceeds the RAM
-            # budget or node MemAvailable crosses the guard threshold, migrate
-            # the retained state to shared scratch and continue there.
-            tfsa_cache = None  # kept for compatibility with older timing schema
+            # Route only TFSA files into a genuinely bounded CPU-RAM cache.
+            # Default overflow storage remains persistent. A launcher may choose
+            # its explicitly provisioned node-local directory independently of
+            # endpoint-cache staging; never infer storage capacity from /tmp.
+            # The current and preceding alpha coexist until the alpha completes.
+            spill_dir = morphany_tfsa_spill_directory(args, cache_root, pair["pair_dir"])
+            shutil.rmtree(spill_dir, ignore_errors=True)
+            ram_budget = int(args.tfsa_ram_gb * (1024 ** 3)) if args.tfsa_cache_mode == "hybrid" else 0
+            tfsa_cache = HybridTFSACache(ram_budget, spill_dir)
+            adapter = TFSAFileCacheAdapter(tfsa_cache, work_dir, int(args.tfsa_min_node_free_gb * (1024 ** 3)))
             active_work_dir = work_dir
-            scratch_work_dir = cache_root / pair["pair_dir"] / "work_fallback"
-            using_ram_file_cache = local_pair is not None
-            tfsa_peak_ram_bytes = 0
-            tfsa_peak_spill_bytes = 0
-            tfsa_spill_written_bytes = 0
             tfsa_pruned_bytes = 0
 
             for step_idx, alpha in enumerate(plan["alphas"]):
                 step_out = pair_out / alpha_dir(alpha)
                 raw_path = step_out / "mesh_raw.pt"
-                output_exists = raw_path.exists() and not args.overwrite
+                output_exists = raw_asset_ready(raw_path) and not args.overwrite
 
                 # If an incomplete pair is resumed, MorphAny3D must still replay
                 # earlier alphas to rebuild the previous-state TFSA cache chain.
@@ -948,37 +1195,17 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                         min_node_available = available
                     else:
                         min_node_available = min(min_node_available, available)
-                if (
-                    using_ram_file_cache
-                    and available > 0
-                    and available < int(args.tfsa_min_node_free_gb * (1024 ** 3))
-                ):
-                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.rmtree(scratch_work_dir, ignore_errors=True)
-                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
-                    tfsa_spill_written_bytes += copy_directory_files(active_work_dir, scratch_work_dir)
-                    shutil.rmtree(active_work_dir, ignore_errors=True)
-                    active_work_dir = scratch_work_dir
-                    params["save_cache_path"] = str(active_work_dir)
-                    using_ram_file_cache = False
-                    pressure_relief_triggered = True
-                    log(
-                        f"[MorphAny3D] pair={pair_id:04d} RAM pressure guard triggered before step "
-                        f"{step_idx + 1}: MemAvailable={gib(available):.2f} GiB; "
-                        "TFSA file cache migrated to shared scratch",
-                        run_root,
-                    )
-
                 seed_everything(pseed)
                 cuda_sync()
                 compute_start = time.perf_counter()
-                outputs = pipeline.run_morphing(
-                    src_pre,
-                    tar_pre,
-                    morphing_params=params,
-                    seed=pseed,
-                    formats=["mesh"],
-                )
+                with adapter.install():
+                    outputs = pipeline.run_morphing(
+                        src_pre,
+                        tar_pre,
+                        morphing_params=params,
+                        seed=pseed,
+                        formats=["mesh", "gaussian"],
+                    )
                 cuda_sync()
                 step_compute = time.perf_counter() - compute_start
                 intermediate_compute_seconds += step_compute
@@ -1004,6 +1231,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                             "alpha": float(alpha),
                             "seed": pseed,
                         },
+                        gaussian=outputs["gaussian"][0],
                     )
                     serialization_seconds += time.perf_counter() - serial_start
                     append_jsonl(
@@ -1024,43 +1252,12 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
                 del outputs, mesh
 
-                tfsa_pruned_bytes += prune_morphany_file_cache(active_work_dir, step_idx + 1)
-                retained_bytes = directory_size_bytes(active_work_dir)
-                if using_ram_file_cache:
-                    tfsa_peak_ram_bytes = max(tfsa_peak_ram_bytes, retained_bytes)
-                else:
-                    tfsa_peak_spill_bytes = max(tfsa_peak_spill_bytes, retained_bytes)
-
-                # A retained state larger than the configured per-worker RAM budget
-                # is migrated after the step. During a step both previous and current
-                # state may transiently coexist, so the true tmpfs peak can be up to
-                # roughly 2x the retained-state size.
-                ram_budget = int(args.tfsa_ram_gb * (1024 ** 3))
-                if using_ram_file_cache and ram_budget > 0 and retained_bytes > ram_budget:
-                    shutil.rmtree(scratch_work_dir, ignore_errors=True)
-                    scratch_work_dir.mkdir(parents=True, exist_ok=True)
-                    tfsa_spill_written_bytes += copy_directory_files(active_work_dir, scratch_work_dir)
-                    shutil.rmtree(active_work_dir, ignore_errors=True)
-                    active_work_dir = scratch_work_dir
-                    using_ram_file_cache = False
-                    pressure_relief_triggered = True
-                    retained_bytes = directory_size_bytes(active_work_dir)
-                    tfsa_peak_spill_bytes = max(tfsa_peak_spill_bytes, retained_bytes)
-                    log(
-                        f"[MorphAny3D] pair={pair_id:04d} TFSA retained state "
-                        f"{gib(retained_bytes):.2f} GiB exceeded per-worker RAM budget "
-                        f"{args.tfsa_ram_gb:.2f} GiB; migrated to shared scratch",
-                        run_root,
-                    )
-
-                stats = {
-                    "ram_gib": gib(retained_bytes) if using_ram_file_cache else 0.0,
-                    "peak_ram_gib": gib(tfsa_peak_ram_bytes),
-                    "spill_gib": 0.0 if using_ram_file_cache else gib(retained_bytes),
-                    "peak_spill_gib": gib(tfsa_peak_spill_bytes),
-                    "spill_written_gib": gib(tfsa_spill_written_bytes),
-                    "spill_read_gib": 0.0,
-                }
+                retained_before_prune = tfsa_cache.ram_bytes + tfsa_cache.spill_bytes
+                tfsa_cache.prune_to_morphing_idx(step_idx + 1)
+                retained_after_prune = tfsa_cache.ram_bytes + tfsa_cache.spill_bytes
+                tfsa_pruned_bytes += max(0, retained_before_prune - retained_after_prune)
+                stats = tfsa_cache.stats()
+                pressure_relief_triggered = adapter.pressure_relief_triggered
                 rss = process_rss_bytes()
                 peak_rss = max(peak_rss, rss)
                 available = node_mem_available_bytes()
@@ -1076,13 +1273,8 @@ def command_morphany3d(args: argparse.Namespace) -> None:
 
             cuda_sync()
             sequence_end_to_end_seconds = time.perf_counter() - pair_wall_start
-            cache_stats = {
-                "peak_ram_gib": gib(tfsa_peak_ram_bytes),
-                "peak_spill_gib": gib(tfsa_peak_spill_bytes),
-                "spill_written_gib": gib(tfsa_spill_written_bytes),
-                "spill_read_gib": 0.0,
-                "pruned_gib": gib(tfsa_pruned_bytes),
-            }
+            cache_stats = tfsa_cache.stats()
+            cache_stats["pruned_gib"] = gib(tfsa_pruned_bytes)
             timing_valid = steps_generated == int(plan["k_intermediate"]) and steps_skipped_output == 0
             append_timing(
                 run_root,
@@ -1110,7 +1302,7 @@ def command_morphany3d(args: argparse.Namespace) -> None:
                     "tfsa_spill_written_gib": float(cache_stats.get("spill_written_gib", 0.0)),
                     "tfsa_spill_read_gib": float(cache_stats.get("spill_read_gib", 0.0)),
                     "tfsa_pruned_gib": float(cache_stats.get("pruned_gib", 0.0)),
-                    "tfsa_backend": "tmpfs_files" if not pressure_relief_triggered else "tmpfs_then_scratch_files",
+                    "tfsa_backend": "bounded_ram_with_scratch_spill" if args.tfsa_cache_mode == "hybrid" else "scratch_files",
                     "process_peak_rss_gib": gib(peak_rss),
                     "node_min_mem_available_gib": gib(min_node_available),
                     "ram_pressure_guard_triggered": bool(pressure_relief_triggered),
@@ -1126,6 +1318,8 @@ def command_morphany3d(args: argparse.Namespace) -> None:
         finally:
             pipeline.preprocess_image = original_preprocess
             pipeline.get_cond = original_get_cond
+            if tfsa_cache is not None:
+                tfsa_cache.clear()
             if local_pair is not None:
                 shutil.rmtree(local_pair, ignore_errors=True)
             try:
@@ -1162,15 +1356,19 @@ def command_interp3d(args: argparse.Namespace) -> None:
     method_root = run_root / "interp3d"
     method_root.mkdir(parents=True, exist_ok=True)
 
-    # For a fair K-step comparison, keep Interp3D's interpolation algorithm but
-    # evaluate it at the same uniform source->target schedule as the other methods.
-    def uniform_alpha_list(coords0: Any, coords1: Any, steps: int = 5):
-        return torch.linspace(0.0, 1.0, steps, device=coords0.device)
+    # Honor the explicit shared plan. The paper specifies Beta(5,5), while
+    # current upstream hard-codes Beta(6,6); do not silently change coefficients.
+    def shared_alpha_list(coords0: Any, coords1: Any, steps: int = 7):
+        if steps != int(plan["k_intermediate"]) + 2:
+            raise ValueError("Interp3D requested a schedule inconsistent with plan.json")
+        return torch.tensor([0.0] + [1.0 - float(a) for a in plan["alphas"]] + [1.0], device=coords0.device)
 
-    interp_module.adaptive_alpha_list_by_chamfer = uniform_alpha_list
+    interp_module.adaptive_alpha_list_by_chamfer = shared_alpha_list
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
+    pipeline.sparse_structure_sampler_params["steps"] = args.steps
+    pipeline.slat_sampler_params["steps"] = args.slat_steps
 
     def reset_interp3d_attention_state():
         # Interp3D leaves its flow-model self-attention in "interpolate"
@@ -1207,7 +1405,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
                     attn.alpha = 0.5
                 if hasattr(attn, "step_id"):
                     attn.step_id = 0
-    log(f"Interp3D generation start | uniform schedule | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
+    log(f"Interp3D generation start | shared plan schedule | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | K={plan['k_intermediate']} | {shard_tag(args)}", run_root)
 
     for pidx, pair in enumerate(pairs):
         reset_interp3d_attention_state()
@@ -1220,7 +1418,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
         pair_out = method_root / pair["pair_dir"]
         pair_out.mkdir(parents=True, exist_ok=True)
 
-        all_exist = all((pair_out / alpha_dir(a) / "mesh_raw.pt").is_file() for a in plan["alphas"])
+        all_exist = all(raw_asset_ready(pair_out / alpha_dir(a) / "mesh_raw.pt") for a in plan["alphas"])
         if all_exist and not args.overwrite:
             log(f"[Interp3D {shard_tag(args)}] pair {pidx + 1}/{len(pairs)} skip complete pair", run_root)
             append_timing(
@@ -1252,7 +1450,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
             tar_img,
             num_search_iterations=int(plan["k_intermediate"]) + 2,
             seed=pseed,
-            formats=["mesh"],
+            formats=["mesh", "gaussian"],
         )
         cuda_sync()
         intermediate_compute_seconds = time.perf_counter() - compute_start
@@ -1270,12 +1468,12 @@ def command_interp3d(args: argparse.Namespace) -> None:
         steps_skipped_output = 0
         for step_idx, (alpha, item) in enumerate(zip(plan["alphas"], middle)):
             raw_path = pair_out / alpha_dir(alpha) / "mesh_raw.pt"
-            if raw_path.exists() and not args.overwrite:
+            if raw_asset_ready(raw_path) and not args.overwrite:
                 steps_skipped_output += 1
                 continue
             mesh = item["mesh"][0]
             serial_start = time.perf_counter()
-            save_raw_mesh(mesh, raw_path, {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed})
+            save_raw_mesh(mesh, raw_path, {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "seed": pseed}, gaussian=item["gaussian"][0])
             serialization_seconds += time.perf_counter() - serial_start
             steps_generated += 1
             append_jsonl(shard_jsonl(run_root, args), {"method": "interp3d", "pair_id": pair_id, "step": step_idx, "alpha": float(alpha), "raw": str(raw_path)})
@@ -1313,7 +1511,7 @@ def command_interp3d(args: argparse.Namespace) -> None:
         del outputs, middle
         torch.cuda.empty_cache()
 
-    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "schedule": "uniform", "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
+    write_json(method_root / f"generation_status_{shard_tag(args)}.json", {"status": "complete", "finished_utc": utc_now(), "schedule": plan.get("alpha_schedule", "uniform"), "pairs": len(pairs), "shard_index": args.shard_index, "num_shards": args.num_shards})
     log(f"Interp3D generation complete | {shard_tag(args)}", run_root)
 
 
@@ -1334,39 +1532,135 @@ def load_raw_as_trellis_mesh(path: Path, device: str = "cuda") -> Any:
     return MeshExtractResult(vertices=vertices, faces=faces, vertex_attrs=attrs, res=int(payload.get("res", 64)))
 
 
-def hardlink_or_copy(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() or dst.is_symlink():
-        return
+def glb_validation_error(path: Path) -> Optional[str]:
+    """Validate the GLB container, JSON scene, and referenced embedded buffer.
+
+    A file existing after an interrupted export is not a completed artifact.
+    Parsing the chunk boundaries also catches truncation beyond the header.
+    This CPU-only check does not import TRELLIS or load geometry into memory.
+    """
     try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
+        with path.open("rb") as handle:
+            actual_size = path.stat().st_size
+            header = handle.read(12)
+            if len(header) != 12:
+                return "truncated GLB header"
+            magic, version, declared_size = struct.unpack("<4sII", header)
+            if magic != b"glTF" or version != 2:
+                return "not a GLB version 2 file"
+            if declared_size != actual_size or actual_size < 20:
+                return f"GLB byte length mismatch: header={declared_size}, actual={actual_size}"
+            offset, document, binary_size = 12, None, 0
+            while offset < actual_size:
+                chunk_header = handle.read(8)
+                if len(chunk_header) != 8:
+                    return "truncated GLB chunk header"
+                chunk_size, chunk_type = struct.unpack("<II", chunk_header)
+                offset += 8
+                if chunk_size == 0 or chunk_size % 4 or offset + chunk_size > actual_size:
+                    return "invalid or truncated GLB chunk"
+                if document is None:
+                    if chunk_type != 0x4E4F534A:
+                        return "first GLB chunk is not JSON"
+                    document = json.loads(handle.read(chunk_size).decode("utf-8"))
+                else:
+                    if chunk_type == 0x004E4942:
+                        binary_size += chunk_size
+                    handle.seek(chunk_size, os.SEEK_CUR)
+                offset += chunk_size
+            if not isinstance(document, dict) or document.get("asset", {}).get("version") != "2.0":
+                return "missing glTF 2.0 asset metadata"
+            if not document.get("meshes"):
+                return "GLB contains no mesh"
+            for buffer in document.get("buffers", []):
+                if "uri" not in buffer and int(buffer.get("byteLength", 0)) > binary_size:
+                    return "embedded buffer is truncated or missing"
+    except (OSError, ValueError, TypeError, AttributeError, UnicodeError, struct.error) as exc:
+        return str(exc)
+    return None
+
+
+def glb_ready(path: Path) -> bool:
+    return glb_validation_error(path) is None
+
+
+@contextmanager
+def artifact_lock(path: Path) -> Iterable[None]:
+    """Serialize shared reference baking even when CFG roots use symlinks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def temporary_glb_path(path: Path) -> Path:
+    # Keep the .glb suffix because trimesh chooses its exporter from it.
+    return path.with_name(f".{path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp.glb")
+
+
+def atomic_export_glb(exporter: Callable[[Path], Any], path: Path, overwrite: bool = False) -> bool:
+    """Export then validate and rename; return False only for a valid reuse."""
+    with artifact_lock(path):
+        if not overwrite and glb_ready(path):
+            return False
+        temporary = temporary_glb_path(path)
+        try:
+            exporter(temporary)
+            error = glb_validation_error(temporary)
+            if error:
+                raise ValueError(f"Invalid GLB export for {path}: {error}")
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
+def hardlink_or_copy(src: Path, dst: Path, overwrite: bool = False) -> None:
+    if not glb_ready(src):
+        raise ValueError(f"Invalid source GLB {src}: {glb_validation_error(src)}")
+    def transfer(temporary: Path) -> None:
+        try:
+            os.link(src, temporary)
+        except OSError:
+            shutil.copy2(src, temporary)
+    atomic_export_glb(transfer, dst, overwrite=overwrite)
 
 
 def texture_one(raw_path: Path, glb_path: Path, args: argparse.Namespace, run_root: Path, label: str) -> None:
-    import torch
-    if glb_path.is_file() and not args.overwrite:
-        return
-    from trellis.utils import postprocessing_utils
+    def export(temporary: Path) -> None:
+        import torch
+        from trellis.utils import postprocessing_utils
+        if not raw_asset_ready(raw_path):
+            raise FileNotFoundError(f"Missing complete raw mesh and Gaussian appearance: {raw_path}")
+        log(f"[TEXTURE] start {label}", run_root)
+        mesh = load_raw_as_trellis_mesh(raw_path, "cuda")
+        gaussian = load_raw_gaussian(raw_path, "cuda")
+        textured = postprocessing_utils.to_glb(
+            gaussian,
+            mesh,
+            simplify=args.simplify,
+            fill_holes=bool(args.fill_holes),
+            texture_size=args.texture_size,
+            verbose=bool(args.texture_verbose),
+        )
+        textured.export(temporary)
+        # Release CUDA buffers between the thousands of exports in a full run.
+        del textured, mesh, gaussian
+        torch.cuda.empty_cache()
+    if atomic_export_glb(export, glb_path, overwrite=bool(args.overwrite)):
+        log(f"[TEXTURE] done  {label} -> {glb_path}", run_root)
 
-    mesh = load_raw_as_trellis_mesh(raw_path, "cuda")
-    glb_path.parent.mkdir(parents=True, exist_ok=True)
-    log(f"[TEXTURE] start {label}", run_root)
-    textured = postprocessing_utils.to_glb(
-        mesh,
-        mesh,
-        simplify=args.simplify,
-        fill_holes=bool(args.fill_holes),
-        texture_size=args.texture_size,
-        verbose=bool(args.texture_verbose),
-    )
-    textured.export(glb_path)
-    log(f"[TEXTURE] done  {label} -> {glb_path}", run_root)
-    # to_glb keeps several large CUDA buffers alive through local references.
-    # Release them immediately so thousands of GLBs can be baked in one process.
-    del textured, mesh
-    torch.cuda.empty_cache()
+
+def selected_methods(args: argparse.Namespace) -> Tuple[str, ...]:
+    methods = tuple(getattr(args, "methods", None) or METHODS)
+    if not methods or len(set(methods)) != len(methods) or any(method not in METHODS for method in methods):
+        raise ValueError(f"--methods must contain distinct methods chosen from {METHODS}")
+    return methods
 
 
 def command_texture(args: argparse.Namespace) -> None:
@@ -1375,12 +1669,13 @@ def command_texture(args: argparse.Namespace) -> None:
 
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    methods = selected_methods(args)
     pairs = shard_pairs(plan, args.shard_index, args.num_shards)
     refs_raw = run_root / "references_raw"
     refs_glb = run_root / "references_textured"
     refs_glb.mkdir(parents=True, exist_ok=True)
 
-    total = len(pairs) * (2 + len(METHODS) * int(plan["k_intermediate"]))
+    total = len(pairs) * (2 + len(methods) * int(plan["k_intermediate"]))
     done = 0
     log(f"Common texture-baking start | {shard_tag(args)} | pairs_this_shard={len(pairs)}/{plan['num_pairs']} | expected GLBs={total} | texture={args.texture_size}px | simplify={args.simplify}", run_root)
 
@@ -1394,12 +1689,12 @@ def command_texture(args: argparse.Namespace) -> None:
         texture_one(pair_ref_raw / "src2_raw.pt", src2_glb, args, run_root, f"reference {pair['pair_id']:04d} src2")
         done += 1
 
-        for method in METHODS:
+        for method in methods:
             pair_out = run_root / method / pair["pair_dir"]
             if not pair_out.is_dir():
                 raise FileNotFoundError(f"Missing generated pair directory: {pair_out}")
-            hardlink_or_copy(src1_glb, pair_out / "src1.glb")
-            hardlink_or_copy(src2_glb, pair_out / "src2.glb")
+            hardlink_or_copy(src1_glb, pair_out / "src1.glb", overwrite=bool(args.overwrite))
+            hardlink_or_copy(src2_glb, pair_out / "src2.glb", overwrite=bool(args.overwrite))
 
             sequence = [{"kind": "source", "alpha": 1.0, "path": str(pair_out / "src1.glb"), "name": pair["src1"]}]
             steps = []
@@ -1436,7 +1731,7 @@ def command_texture(args: argparse.Namespace) -> None:
                     "num_generated_steps": int(plan["k_intermediate"]),
                     "steps": steps,
                     "sequence": sequence,
-                    "appearance": "common TRELLIS mesh-color texture baking",
+                    "appearance": "common TRELLIS Gaussian appearance texture baking",
                 },
             )
             log(f"[TEXTURE] manifests ready {method} pair={pair['pair_id']:04d} | progress={done}/{total}", run_root)
@@ -1448,11 +1743,12 @@ def command_texture(args: argparse.Namespace) -> None:
             "shard_index": int(args.shard_index),
             "num_shards": int(args.num_shards),
             "pairs": len(pairs),
+            "methods": list(methods),
             "finished_utc": utc_now(),
             "texture_size": args.texture_size,
             "simplify": args.simplify,
             "fill_holes": bool(args.fill_holes),
-            "appearance_source": "MeshExtractResult.vertex_attrs -> common TRELLIS to_glb(mesh, mesh)",
+            "appearance_source": "SLat Gaussian appearance -> common TRELLIS to_glb(gaussian, mesh)",
         },
     )
     torch.cuda.empty_cache()
@@ -1462,29 +1758,40 @@ def command_texture(args: argparse.Namespace) -> None:
 def command_texture_status(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
-    missing: List[str] = []
+    methods = selected_methods(args)
+    invalid: List[str] = []
+    checked = 0
+    def check(path: Path) -> None:
+        nonlocal checked
+        checked += 1
+        error = glb_validation_error(path)
+        if error:
+            invalid.append(f"{path}: {error}")
     for pair in plan["pairs"]:
         ref = run_root / "references_textured" / pair["pair_dir"]
         for name in ("src1.glb", "src2.glb"):
-            if not (ref / name).is_file():
-                missing.append(str(ref / name))
-        for method in METHODS:
+            check(ref / name)
+        for method in methods:
             pair_root = run_root / method / pair["pair_dir"]
+            for name in ("src1.glb", "src2.glb"):
+                check(pair_root / name)
             for alpha in plan["alphas"]:
                 path = pair_root / alpha_dir(alpha) / "pred_final.glb"
-                if not path.is_file():
-                    missing.append(str(path))
-    if missing:
-        sample = "\n".join(missing[:20])
-        raise FileNotFoundError(f"Texture phase incomplete: {len(missing)} GLBs missing. First entries:\n{sample}")
-    write_json(run_root / "texture_status.json", {
+                check(path)
+    if invalid:
+        sample = "\n".join(invalid[:20])
+        raise FileNotFoundError(f"Texture phase incomplete: {len(invalid)}/{checked} GLBs missing or invalid. First entries:\n{sample}")
+    status_name = "texture_status.json" if methods == METHODS else f"texture_status_{'_'.join(methods)}.json"
+    write_json(run_root / status_name, {
         "status": "complete",
         "finished_utc": utc_now(),
         "num_pairs": int(plan["num_pairs"]),
         "k_intermediate": int(plan["k_intermediate"]),
-        "appearance_source": "MeshExtractResult.vertex_attrs -> common TRELLIS to_glb(mesh, mesh)",
+        "methods": list(methods),
+        "checked_glbs": checked,
+        "appearance_source": "SLat Gaussian appearance -> common TRELLIS to_glb(gaussian, mesh)",
     })
-    log("Texture completeness check passed", run_root)
+    log(f"Texture completeness check passed | methods={','.join(methods)} | valid GLBs={checked}", run_root)
 
 
 def read_jsonl_rows(path: Path) -> List[Dict[str, Any]]:
@@ -1599,7 +1906,9 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "num_pairs": plan["num_pairs"],
         "k_intermediate": plan["k_intermediate"],
         "alphas": plan["alphas"],
-        "metric_source": "eval_textured_benchmark.py over final textured GLBs; common uniform alpha schedule; appearance=materials",
+        "metric_source": "eval_textured_benchmark.py; common explicit alpha schedule; genuine SLat Gaussian appearance",
+        "evaluation_protocol": plan.get("evaluation_protocol", {}),
+        "alpha_schedule": plan.get("alpha_schedule", "uniform"),
         "methods": {},
     }
     generation_timings = aggregate_generation_timings(run_root)
@@ -1616,6 +1925,8 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "ppl_reference_anchored",
         # Interp3D-style endpoint-manifold FID.
         "fid_endpoint_manifold",
+        "fid_endpoint_manifold_mean_per_state",
+        "fid_endpoint_manifold_pooled",
         # Original internal-only diagnostics retained for completeness.
         "lpips_adjacent_mean",
         "ppl_sum",
@@ -1686,9 +1997,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--metadata", default="metadata_test.json")
     plan.add_argument("--source-images-root", required=True)
     plan.add_argument("--source-image-filename", default="")
-    plan.add_argument("--num-pairs", type=int, default=DEFAULT_N)
+    plan.add_argument("--num-pairs", type=int, default=DEFAULT_N, help="Number of unique test pairs; 0 evaluates all test pairs without dropping missing inputs")
     plan.add_argument("--k", type=int, default=DEFAULT_K)
     plan.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    plan.add_argument("--alpha-schedule", choices=["beta", "uniform"], default="beta")
+    plan.add_argument("--beta-shape", type=float, default=5.0)
 
     mf = sub.add_parser("morphflow")
     common_run(mf)
@@ -1698,8 +2011,8 @@ def build_parser() -> argparse.ArgumentParser:
     mf.add_argument("--source-image-filename", default="")
     mf.add_argument("--checkpoint-path", required=True)
     mf.add_argument("--slat-checkpoint-path", required=True)
-    mf.add_argument("--steps", type=int, default=50)
-    mf.add_argument("--slat-steps", type=int, default=50)
+    mf.add_argument("--steps", type=int, default=25)
+    mf.add_argument("--slat-steps", type=int, default=25)
     mf.add_argument("--cfg-scale", type=float, default=3.0)
     mf.add_argument("--slat-cfg-scale", type=float, default=3.0)
     mf.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="fp16")
@@ -1707,12 +2020,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ma = sub.add_parser("morphany3d")
     common_run(ma)
+    ma.add_argument("--steps", type=int, default=25)
+    ma.add_argument("--slat-steps", type=int, default=25)
     ma.add_argument("--tfsa-cache-mode", choices=["hybrid", "disk"], default="hybrid")
     ma.add_argument(
         "--tfsa-ram-gb",
         type=float,
         default=4.0,
-        help="Per-worker TFSA CPU-RAM budget in hybrid mode; overflow spills to node-local storage.",
+        help="Per-worker TFSA CPU-RAM budget in hybrid mode; overflow uses --tfsa-spill-root or persistent method cache.",
     )
     ma.add_argument(
         "--tfsa-min-node-free-gb",
@@ -1723,14 +2038,22 @@ def build_parser() -> argparse.ArgumentParser:
     ma.add_argument(
         "--local-cache-root",
         default="",
-        help="Node-local directory for staged endpoint caches and TFSA spill files.",
+        help="Node-local directory for staged endpoint caches and upstream work files; select overflow storage separately with --tfsa-spill-root.",
+    )
+    ma.add_argument(
+        "--tfsa-spill-root",
+        default="",
+        help="Explicit TFSA overflow storage; uses a private per-pair subdirectory. Default: run-root/method_cache/morphany3d.",
     )
 
     ip = sub.add_parser("interp3d")
     common_run(ip)
+    ip.add_argument("--steps", type=int, default=25)
+    ip.add_argument("--slat-steps", type=int, default=25)
 
     tx = sub.add_parser("texture")
     common_run(tx)
+    tx.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     tx.add_argument("--texture-size", type=int, default=1024)
     tx.add_argument("--simplify", type=float, default=0.95)
     tx.add_argument("--fill-holes", type=int, choices=[0, 1], default=1)
@@ -1738,6 +2061,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ts = sub.add_parser("texture-status")
     common_run(ts)
+    ts.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
 
     ag = sub.add_parser("aggregate")
     common_run(ag)

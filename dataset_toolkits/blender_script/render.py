@@ -166,6 +166,36 @@ def init_scene() -> None:
     for image in bpy.data.images:
         bpy.data.images.remove(image, do_unlink=True)
 
+def ensure_vertex_color_materials():
+    """Render COLOR_0 on GLBs whose primitives have no explicit material.
+
+    Blender 3.0 imports these colors as a layer but leaves the material slot
+    empty (common for trimesh GLB exports). Cycles otherwise renders gray.
+    Keep all imported materials/textures; only fill missing material slots.
+    """
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH' or not obj.data.vertex_colors:
+            continue
+        mesh = obj.data
+        if mesh.materials and all(material is not None for material in mesh.materials):
+            continue
+        layer = mesh.vertex_colors.active or mesh.vertex_colors[0]
+        material = bpy.data.materials.new(name=f'{obj.name}_VertexColor')
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        color = nodes.new('ShaderNodeVertexColor')
+        color.layer_name = layer.name
+        bsdf = next(node for node in nodes if node.type == 'BSDF_PRINCIPLED')
+        material.node_tree.links.new(color.outputs['Color'], bsdf.inputs['Base Color'])
+        if not mesh.materials:
+            mesh.materials.append(material)
+        else:
+            for index in range(len(mesh.materials)):
+                if mesh.materials[index] is None:
+                    mesh.materials[index] = material
+        print(f'[INFO] Vertex colors enabled: {obj.name}, layer={layer.name}')
+
+
 def init_camera():
     cam = bpy.data.objects.new('Camera', bpy.data.cameras.new('Camera'))
     bpy.context.collection.objects.link(cam)
@@ -455,6 +485,7 @@ def main(arg):
     else:
         init_scene()
         load_object(arg.object)
+        ensure_vertex_color_materials()
         if arg.split_normal:
             split_mesh_normal()
         # delete_custom_normals()

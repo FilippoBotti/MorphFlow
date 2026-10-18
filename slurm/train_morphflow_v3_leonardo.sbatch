@@ -356,6 +356,9 @@ train_args=(
     --checkpoint_every "${CHECKPOINT_EVERY:-$DEFAULT_CHECKPOINT_EVERY}"
     --checkpoint_half_epoch "${CHECKPOINT_HALF_EPOCH:-$DEFAULT_CHECKPOINT_HALF_EPOCH}"
 )
+if [[ -n "${STOP_AFTER_EPOCH:-}" ]]; then
+    train_args+=(--stop_after_epoch "$STOP_AFTER_EPOCH")
+fi
 # The frozen prior needs source images even for a latent-conditioned student.
 if [[ -n "$RESUME_FROM" ]]; then
     train_args+=(--resume_from "$RESUME_FROM" --resume_strict 1 --resume_optimizer 1)
