@@ -167,6 +167,52 @@ class AteneoLayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Incomplete method"):
             ateneo.summarize(args)
 
+    def test_dense_layout_and_summary_keep_the_paper_protocol_separate(self):
+        self.prepare()
+        manifest = self.manifest()
+        self.assertEqual(manifest["configuration"]["K"], "5")
+        self.assertEqual(manifest["weighted_dense_protocol"]["num_sequence_frames"], 50)
+        dense = self.root / "weighted_50"
+        references = dense / "shared/references_raw"
+        self.assertTrue(references.is_symlink())
+        self.assertEqual(references.resolve(), self.root / "shared/references_raw")
+        (dense / "shared/plan.json").write_text("{}")
+        alphas = [i/49 for i in range(48, 0, -1)]
+        for ss in ("2", "3"):
+            for slat in ("1.5", "2"):
+                args = argparse.Namespace(run_root=str(self.root), cfg=ss, slat_cfg=slat, evaluation="weighted50")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ateneo.cell(args)
+                directory = dense / ("cfg_ss_{}_slat_{}".format(ss, slat))
+                self.assertEqual((directory / "plan.json").resolve(), dense / "shared/plan.json")
+                aggregate = {k: {"mean": .2} for k in ("weighted_endpoint_lpips_mean", "weighted_endpoint_lpips_auc", "weighted_endpoint_lpips_full_mean", "weighted_endpoint_lpips_full_auc")}
+                methods = {m: {"num_pairs": 2, "missing_pairs": [], "aggregate_across_pairs": aggregate} for m in ("morphflow", "morphany3d", "interp3d")}
+                ateneo.write_json(directory / "final_metrics.json", {"num_pairs": 2, "methods": methods,
+                    "metric_mode": "weighted-endpoints-only", "k_intermediate": 48, "alphas": alphas})
+                (directory / "final_metrics.csv").write_text("method,metric,mean\nmorphflow,weighted_endpoint_lpips_full_mean,.2\n")
+        args = argparse.Namespace(run_root=str(self.root), require_complete=True, evaluation="weighted50")
+        with contextlib.redirect_stdout(io.StringIO()):
+            ateneo.summarize(args)
+        self.assertEqual(json.loads((dense / "cfg_grid_metrics.json").read_text())["completed_configurations"], 4)
+        self.assertFalse((self.root / "cfg_grid_metrics.json").exists())
+        path = dense / "cfg_ss_2_slat_1.5/final_metrics.json"
+        broken = json.loads(path.read_text())
+        broken["k_intermediate"] = 5
+        ateneo.write_json(path, broken)
+        with self.assertRaisesRegex(ValueError, "48-intermediate"):
+            ateneo.summarize(args)
+
+    def test_dense_disabled_cannot_create_dense_cfg_cells(self):
+        self.env["WEIGHTED_DENSE"] = "0"
+        self.prepare()
+        self.assertFalse((self.root / "weighted_50").exists())
+        args = argparse.Namespace(run_root=str(self.root), cfg="2", slat_cfg="1.5", evaluation="weighted50")
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            ateneo.cell(args)
+        self.env["WEIGHTED_DENSE"] = "2"
+        with self.assertRaisesRegex(ValueError, "WEIGHTED_DENSE"):
+            ateneo.requested_configuration(self.env)
+
 
 if __name__ == "__main__":
     unittest.main()

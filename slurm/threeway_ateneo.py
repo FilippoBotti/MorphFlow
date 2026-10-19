@@ -71,6 +71,8 @@ def requested_configuration(env):
         raise ValueError("Invalid texture size or simplify ratio")
     if env.get("FILL_HOLES", "1") not in {"0", "1"}:
         raise ValueError("FILL_HOLES must be 0 or 1")
+    if env.get("WEIGHTED_DENSE", "1") not in {"0", "1"}:
+        raise ValueError("WEIGHTED_DENSE must be 0 or 1")
     configuration = dict(PROTOCOL)
     configuration.update({
         "N": n, "SEED": int(env.get("SEED", "42")),
@@ -79,6 +81,7 @@ def requested_configuration(env):
         "MIXED_PRECISION": env.get("MIXED_PRECISION", "bf16"),
         "TEXTURE_SIZE": texture_size, "SIMPLIFY": simplify,
         "FILL_HOLES": int(env.get("FILL_HOLES", "1")),
+        "WEIGHTED_DENSE": int(env.get("WEIGHTED_DENSE", "1")),
         "SOURCE_IMAGE_FILENAME": env.get("SOURCE_IMAGE_FILENAME", ""),
     })
     for key in ("PROJECT_DIR", "DATA_ROOT_HOST", "SOURCE_IMAGES_ROOT_HOST", "CHECKPOINT_PATH",
@@ -185,6 +188,7 @@ def prepare(args):
         for name in splits:
             if name in inputs and digest(root / "input_snapshot" / name) != inputs[name]:
                 raise ValueError("Frozen split changed: {}".format(name))
+        prepare_dense_layout(root, config)
         print("Resume verified; using the existing immutable checkpoint snapshots.")
         return
     checkpoints = {
@@ -221,7 +225,15 @@ def prepare(args):
             "fid_endpoint_manifold_pooled": "FID pooled over all pairs; diagnostic only",
         },
         "scope": "Interp3D-style counts and metric definitions on the selected held-out test set; both explicit FID interpretations.",
+        "weighted_dense_protocol": {
+            "enabled": bool(config["WEIGHTED_DENSE"]), "num_intermediates": 48,
+            "num_sequence_frames": 50, "alpha_schedule": "uniform",
+            "alphas": "i/49, i=48..1; canonical source frames at alpha=1 and alpha=0",
+            "num_views": 64, "metric_mode": "weighted-endpoints-only",
+            "scope": "Additional source-proximity metric; separate from the unchanged Interp3D protocol",
+        },
     })
+    prepare_dense_layout(root, config)
     print("Prepared {} unique test pairs, {} CFG cells; all intermediate GLBs required.".format(
         actual, len(config["CFG_VALUES"]) * len(config["SLAT_CFG_VALUES"])))
 
@@ -239,6 +251,27 @@ def relative_link(destination, source):
         destination.symlink_to(expected)
 
 
+def prepare_dense_layout(root, configuration):
+    if not configuration["WEIGHTED_DENSE"]:
+        return
+    shared = root / "weighted_50" / "shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    for name in ("references_raw", "references_textured"):
+        (root / "shared" / name).mkdir(parents=True, exist_ok=True)
+        relative_link(shared / name, root / "shared" / name)
+    for method in ("morphany3d", "interp3d"):
+        (shared / method).mkdir(exist_ok=True)
+
+
+def evaluation_root(args, manifest):
+    root = Path(args.run_root).resolve()
+    if getattr(args, "evaluation", "interp3d") == "weighted50":
+        if not manifest["configuration"].get("WEIGHTED_DENSE", 0):
+            raise ValueError("The dense 50-frame evaluation was not enabled in this run")
+        return root / "weighted_50"
+    return root
+
+
 def cell(args):
     root = Path(args.run_root).resolve()
     cfg, slat = cfg_values(args.cfg), cfg_values(args.slat_cfg)
@@ -247,6 +280,7 @@ def cell(args):
     manifest = json.loads((root / "run_manifest.json").read_text())
     if cfg[0] not in manifest["configuration"]["CFG_VALUES"] or slat[0] not in manifest["configuration"]["SLAT_CFG_VALUES"]:
         raise ValueError("CFG not present in the immutable run manifest")
+    root = evaluation_root(args, manifest)
     target = root / ("cfg_ss_{}_slat_{}".format(cfg[0], slat[0]))
     target.mkdir(exist_ok=True)
     shared = root / "shared"
@@ -265,6 +299,8 @@ def cell(args):
 def summarize(args):
     root = Path(args.run_root).resolve()
     manifest = json.loads((root / "run_manifest.json").read_text())
+    dense = getattr(args, "evaluation", "interp3d") == "weighted50"
+    root = evaluation_root(args, manifest)
     expected_pairs = manifest["evaluated_pairs"]
     expected_cells = len(manifest["configuration"]["CFG_VALUES"]) * len(manifest["configuration"]["SLAT_CFG_VALUES"])
     cells, rows = [], []
@@ -272,11 +308,17 @@ def summarize(args):
         data = json.loads(path.read_text())
         if data["num_pairs"] != expected_pairs:
             raise ValueError("Incomplete cell: {}".format(path))
+        if dense and (data.get("metric_mode") != "weighted-endpoints-only" or
+                      data.get("k_intermediate") != 48):
+            raise ValueError("Expected the separate dense 48-intermediate metric in {}".format(path))
         for method in ("morphflow", "morphany3d", "interp3d"):
             metrics = data["methods"][method]
             if metrics["num_pairs"] != expected_pairs or metrics.get("missing_pairs"):
                 raise ValueError("Incomplete method: {} {}".format(path, method))
-            for key in ("fid_endpoint_manifold", "fid_endpoint_manifold_mean_per_state", "ppl_full_normalized_reference_endpoints", "pdv_full"):
+            required = (("weighted_endpoint_lpips_mean", "weighted_endpoint_lpips_auc",
+                         "weighted_endpoint_lpips_full_mean", "weighted_endpoint_lpips_full_auc") if dense else
+                        ("fid_endpoint_manifold", "fid_endpoint_manifold_mean_per_state", "ppl_full_normalized_reference_endpoints", "pdv_full"))
+            for key in required:
                 if not math.isfinite(metrics["aggregate_across_pairs"][key]["mean"]):
                     raise ValueError("Nonfinite metric {} in {}".format(key, path))
         cells.append({"configuration": path.parent.name, "metrics": data})
@@ -302,6 +344,7 @@ def main():
     parser.add_argument("--cfg")
     parser.add_argument("--slat-cfg")
     parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument("--evaluation", choices=("interp3d", "weighted50"), default="interp3d")
     args = parser.parse_args()
     if args.command in {"count", "grid"}:
         manifest = json.loads((Path(args.run_root) / "run_manifest.json").read_text())

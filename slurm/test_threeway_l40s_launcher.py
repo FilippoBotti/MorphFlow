@@ -88,9 +88,17 @@ def selected(plan):
     return [pair for pair in plan['pairs'] if pair['pair_id'] % count == shard]
 
 def complete_glbs(root, method, pair):
-    return all((root / method / pair['pair_dir'] / ('alpha_' + str(i)) / 'pred_final.glb').is_file() for i in range(5))
+    return all((root / method / pair['pair_dir'] / ('alpha_' + str(i)) / 'pred_final.glb').is_file()
+               for i in range(len(plan_for(root)['alphas'])))
+
+def dense_metrics():
+    return dict((key, value) for key, value in METRICS.items() if key.startswith('weighted_endpoint_'))
 
 METRICS = {
+    'weighted_endpoint_lpips_mean': {'mean': .15, 'std': .01, 'median': .15},
+    'weighted_endpoint_lpips_auc': {'mean': .06, 'std': .004, 'median': .06},
+    'weighted_endpoint_lpips_full_mean': {'mean': .144, 'std': .0096, 'median': .144},
+    'weighted_endpoint_lpips_full_auc': {'mean': .062, 'std': .004, 'median': .062},
     'fid_endpoint_manifold': {'mean': 12., 'std': 1., 'median': 12.},
     'fid_endpoint_manifold_mean_per_state': {'mean': 15., 'std': 2., 'median': 15.},
     'fid_endpoint_manifold_pooled': {'mean': 7., 'std': 0., 'median': 7.},
@@ -118,17 +126,41 @@ elif command[:2] == ['python', '-c']:
             assert 'from_pretrained' in command[2]
             assert os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES')
         print('Fake import/device check verified')
+elif len(command) > 1 and Path(command[1]).name == 'weighted_endpoint_report.py':
+    assert not os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES')
+    root = translate(option('--run-root'))
+    completed = list(root.glob('cfg_ss_*/final_metrics.json'))
+    assert completed
+    for directory in [root] + [p.parent for p in completed]:
+        output = directory / 'weighted_endpoint_lpips'
+        output.mkdir(exist_ok=True)
+        (output / 'evolution.png').write_bytes(b'fake CPU weighted LPIPS report')
+        (output / 'evolution.pdf').write_bytes(b'fake CPU weighted LPIPS report')
+        (output / 'curves.csv').write_text('alpha,weighted_lpips_mean\n0.5,0.15\n')
+        (output / 'summary.csv').write_text('method,weighted_endpoint_lpips_mean\nmorphflow,0.15\n')
+        write_json(output / 'summary.json', dict(formula='alpha*d1+(1-alpha)*d2'))
 elif command[2] == 'check-fid-weights':
     print('/opt/trellis/torch-home/hub/checkpoints/fake-fid.pth')
 elif command[2] == 'plan':
     root = translate(option('--run-root'))
-    manifest = json.loads((root.parent / 'run_manifest.json').read_text())
+    run_root = translate('/benchmark')
+    manifest = json.loads((run_root / 'run_manifest.json').read_text())
     assert int(option('--num-pairs')) == manifest['configuration']['N']
-    assert option('--k') == '5' and option('--alpha-schedule') == 'beta' and option('--beta-shape') == '5'
-    assert translate(option('--metadata')).read_bytes() == (root.parent / 'input_snapshot/metadata_test.json').read_bytes()
+    dense = '--protocol' in command and option('--protocol') == 'weighted-endpoints-50'
+    if dense:
+        assert option('--k') == '48' and option('--alpha-schedule') == 'uniform'
+        assert '--beta-shape' not in command
+        alphas = [index/49 for index in range(48, 0, -1)]
+    else:
+        assert option('--k') == '5' and option('--alpha-schedule') == 'beta' and option('--beta-shape') == '5'
+        alphas = [.7, .6, .5, .4, .3]
+    assert translate(option('--metadata')).read_bytes() == (run_root / 'input_snapshot/metadata_test.json').read_bytes()
     count = manifest['evaluated_pairs']
     pairs = [dict(pair_id=i, pair_dir='pair_{:04d}_a_to_b'.format(i)) for i in range(count)]
-    write_json(root / 'plan.json', dict(num_pairs=count, pairs=pairs, alphas=[.7, .6, .5, .4, .3]))
+    write_json(root / 'plan.json', dict(num_pairs=count, pairs=pairs, alphas=alphas,
+        k_intermediate=len(alphas), num_sequence_frames=len(alphas)+2,
+        sequence_alphas=[1.0]+alphas+[0.0],
+        metric_mode='weighted-endpoints-only' if dense else 'all'))
 elif command[2] in {'morphflow', 'morphany3d', 'interp3d'}:
     method = command[2]
     root = translate(option('--run-root'))
@@ -152,16 +184,17 @@ elif command[2] in {'morphflow', 'morphany3d', 'interp3d'}:
     for pair in selected(plan):
         output = root / method / pair['pair_dir']
         output.mkdir(parents=True, exist_ok=True)
-        (output / 'raw.done').write_text('five appearance-aware intermediates')
+        (output / 'raw.done').write_text(str(len(plan['alphas']))+' appearance-aware intermediates')
     timing = root / 'timings' / (method + '_shard_' + option('--shard-index') + '.jsonl')
     timing.parent.mkdir(parents=True, exist_ok=True)
     timing.write_text('{}\n')
 elif command[2] == 'texture':
     root = translate(option('--run-root'))
-    for pair in selected(plan_for(root)):
+    plan = plan_for(root)
+    for pair in selected(plan):
         for method in methods():
             assert (root / method / pair['pair_dir'] / 'raw.done').is_file()
-            for index in range(5):
+            for index in range(len(plan['alphas'])):
                 output = root / method / pair['pair_dir'] / ('alpha_' + str(index)) / 'pred_final.glb'
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(b'fake baked GLB')
@@ -171,37 +204,52 @@ elif command[2] == 'texture-status':
     assert all(complete_glbs(root, method, pair) for method in methods() for pair in plan['pairs'])
     write_json(root / 'texture_status.json', dict(complete=True, methods=methods()))
 elif command[2] == 'shard':
-    assert option('--fid-aggregation') == 'both'
-    assert option('--num-views') == '64' and option('--fid-num-views') == '1000'
+    dense = '--metric-mode' in command
+    if dense:
+        assert option('--metric-mode') == 'weighted-endpoints-only'
+        assert not any(value.startswith('--fid-') for value in command)
+    else:
+        assert option('--fid-aggregation') == 'both' and option('--fid-num-views') == '1000'
+    assert option('--num-views') == '64'
     assert option('--camera-distribution') == 'hammersley' and option('--render-backend') == 'gaussian'
     assert option('--lpips-net') == 'vgg'
     assert option('--reference-cache-root') == '/benchmark/shared/reference_metrics'
     method_root = translate(option('--run-dir'))
     plan = plan_for(method_root.parent)
+    assert (len(plan['alphas']) == 48) == dense
     pairs = selected(plan)
     assert all(complete_glbs(method_root.parent, method_root.name, pair) for pair in pairs)
     output = translate(option('--output-dir'))
     write_json(output / ('fake_shard_' + option('--shard-index') + '.json'), [pair['pair_id'] for pair in pairs])
 elif command[2] == 'merge':
-    assert option('--fid-aggregation') == 'both'
+    dense = '--metric-mode' in command
+    if dense:
+        assert option('--metric-mode') == 'weighted-endpoints-only'
+        assert not any(value.startswith('--fid-') for value in command)
+    else:
+        assert option('--fid-aggregation') == 'both'
     output = translate(option('--output-dir'))
     expected = int(option('--expected-num-pairs'))
     assignments = [json.loads(path.read_text()) for path in output.glob('fake_shard_*.json')]
     ids = [i for group in assignments for i in group]
     assert sorted(ids) == list(range(expected)), (ids, expected)
     assert len(ids) == len(set(ids))
-    write_json(output / 'metrics_batch.json', dict(num_pairs=expected, missing_pairs=[], aggregate_across_pairs=METRICS))
+    write_json(output / 'metrics_batch.json', dict(num_pairs=expected, missing_pairs=[],
+               aggregate_across_pairs=dense_metrics() if dense else METRICS))
 elif command[2] == 'aggregate':
     root = translate(option('--run-root'))
     plan = plan_for(root)
-    data = dict(num_pairs=plan['num_pairs'], methods={})
+    data = dict(num_pairs=plan['num_pairs'], methods={}, k_intermediate=len(plan['alphas']),
+                alphas=plan['alphas'], sequence_alphas=plan['sequence_alphas'],
+                num_sequence_frames=plan['num_sequence_frames'], metric_mode=plan['metric_mode'])
     for method in methods():
         data['methods'][method] = json.loads((root / 'metrics' / method / 'metrics_batch.json').read_text())
     write_json(root / 'final_metrics.json', data)
     with (root / 'final_metrics.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=['method', 'metric', 'mean', 'std', 'median'])
         writer.writeheader()
-        writer.writerows(dict(method=method, metric=metric, **value) for method in methods() for metric, value in METRICS.items())
+        writer.writerows(dict(method=method, metric=metric, **value) for method in methods()
+                         for metric, value in data['methods'][method]['aggregate_across_pairs'].items())
     write_json(root / 'generation_timings.json', {})
     (root / 'generation_timings.csv').write_text('method,seconds\nmorphflow,1\n')
 else:
@@ -220,7 +268,7 @@ class LauncherTests(unittest.TestCase):
         for filename in ("benchmark_threeway_interp3d_l40s.slurm", "threeway_ateneo.py", "prepare_threeway_interp3d_l40s.sh"):
             shutil.copyfile(str(SLURM_DIR / filename), str(self.project / "slurm" / filename))
         (self.project / "benchmarks").mkdir()
-        for filename in ("threeway_textured_benchmark.py", "eval_textured_benchmark.py"):
+        for filename in ("threeway_textured_benchmark.py", "eval_textured_benchmark.py", "weighted_endpoint_report.py"):
             (self.project / "benchmarks" / filename).write_text("# mocked GPU work\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -273,6 +321,7 @@ class LauncherTests(unittest.TestCase):
             "MIXED_PRECISION": "bf16", "TEXTURE_SIZE": "1024", "SIMPLIFY": "0.95", "FILL_HOLES": "1",
             "SOURCE_IMAGE_FILENAME": "", "METADATA": "metadata_test.json",
             "DATASET_NAME": "morphing_dataset_v4", "SOURCE_IMAGES_NAME": "flux_outputs",
+            "WEIGHTED_DENSE": "0",
         })
         self.env.pop("FAKE_FAIL_GENERATION", None)
         Path(self.env["SIF"]).write_bytes(b"fake container")
@@ -380,6 +429,93 @@ class LauncherTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual({row["configuration"] for row in rows}, {"cfg_ss_2_slat_1.5", "cfg_ss_5_slat_1.5"})
         self.assertTrue((Path(self.env["FINAL_ARCHIVE"]) / "cfg_grid_metrics.csv").is_file())
+        report_calls = [row for row in calls if len(row['command']) > 1 and Path(row['command'][1]).name == 'weighted_endpoint_report.py']
+        self.assertEqual(len(report_calls), 2)
+        self.assertTrue((self.run_root / 'weighted_endpoint_lpips/evolution.png').is_file())
+        self.assertTrue((Path(self.env['FINAL_ARCHIVE']) / 'weighted_endpoint_lpips/evolution.pdf').is_file())
+        self.assertIn('weighted_endpoint_lpips_mean', {row['metric'] for row in rows})
+
+    def test_dense_weighted_fifty_frames_adds_separate_workload_without_repeating_baselines_per_cfg(self):
+        self.env['WEIGHTED_DENSE'] = '1'
+        self.assert_success(self.run_launcher(timeout=45))
+        calls = self.calls()
+        grouped = {}
+        for call in calls:
+            grouped.setdefault(self.operation(call), []).append(call)
+        self.assertEqual(len(grouped['plan']), 2)
+        plans = {row['command'][row['command'].index('--run-root')+1]: row['command']
+                 for row in grouped['plan']}
+        ordinary = plans['/benchmark/shared']
+        dense = plans['/benchmark/weighted_50/shared']
+        self.assertEqual(ordinary[ordinary.index('--k')+1], '5')
+        self.assertEqual(ordinary[ordinary.index('--alpha-schedule')+1], 'beta')
+        self.assertEqual(dense[dense.index('--k')+1], '48')
+        self.assertEqual(dense[dense.index('--alpha-schedule')+1], 'uniform')
+        self.assertEqual(dense[dense.index('--protocol')+1], 'weighted-endpoints-50')
+        self.assertEqual(len(grouped['morphflow']), 32)  # 2 workloads × 2 CFG × 8 GPUs
+        self.assertEqual(len(grouped['texture']), 48)
+        self.assertEqual(len(grouped['shard']), 64)
+        self.assertEqual(len(grouped['merge']), 8)
+        self.assertEqual(len(grouped['aggregate']), 4)
+        for method in ('morphany3d', 'interp3d'):
+            workers = grouped[method]
+            self.assertEqual(len(workers), 16)  # Each baseline generated once per workload.
+            by_root = {}
+            for row in workers:
+                command = row['command']
+                by_root.setdefault(command[command.index('--run-root')+1], []).append(row)
+            self.assertEqual(set(by_root), {'/benchmark/shared', '/benchmark/weighted_50/shared'})
+            for workload_workers in by_root.values():
+                self.assertEqual(len(workload_workers), 8)
+                self.assertEqual({row['gpu'] for row in workload_workers},
+                                 {'GPU-test-'+str(index) for index in range(8)})
+        dense_root = self.run_root / 'weighted_50'
+        plan = json.loads((dense_root / 'shared/plan.json').read_text())
+        self.assertEqual(len(plan['alphas']), 48)
+        self.assertEqual(len(plan['sequence_alphas']), 50)
+        self.assertEqual(plan['sequence_alphas'][0], 1)
+        self.assertEqual(plan['sequence_alphas'][-1], 0)
+        self.assertAlmostEqual(plan['alphas'][0], 48/49)
+        self.assertAlmostEqual(plan['alphas'][-1], 1/49)
+        self.assertEqual((dense_root / 'shared/references_raw').resolve(),
+                         (self.run_root / 'shared/references_raw').resolve())
+        self.assertEqual((dense_root / 'shared/references_textured').resolve(),
+                         (self.run_root / 'shared/references_textured').resolve())
+        for root, k in ((self.run_root, 5), (dense_root, 48)):
+            for cfg in ('2', '5'):
+                cell = root / ('cfg_ss_'+cfg+'_slat_1.5')
+                self.assertEqual(len(list((cell/'morphflow').glob('pair_*/alpha_*/pred_final.glb'))), 10*k)
+                for name in ('plan.json', 'morphany3d', 'interp3d', 'metrics/morphany3d', 'metrics/interp3d'):
+                    self.assertTrue((cell/name).is_symlink())
+                    self.assertFalse(os.path.isabs(os.readlink(str(cell/name))))
+            for method in ('morphany3d', 'interp3d'):
+                self.assertEqual(len(list((root/'shared'/method).glob('pair_*/alpha_*/pred_final.glb'))), 10*k)
+            grid = json.loads((root/'cfg_grid_metrics.json').read_text())
+            self.assertEqual((grid['completed_configurations'], grid['expected_configurations']), (2, 2))
+        for row in grouped['shard'] + grouped['merge']:
+            command = row['command']
+            location = command[command.index('--output-dir')+1]
+            if location.startswith('/benchmark/weighted_50/'):
+                self.assertEqual(command[command.index('--metric-mode')+1], 'weighted-endpoints-only')
+                self.assertFalse(any(argument.startswith('--fid-') for argument in command))
+            else:
+                self.assertNotIn('--metric-mode', command)
+                self.assertEqual(command[command.index('--fid-aggregation')+1], 'both')
+        with (dense_root/'cfg_grid_metrics.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual({row['metric'] for row in rows},
+                         {'weighted_endpoint_lpips_mean', 'weighted_endpoint_lpips_auc',
+                          'weighted_endpoint_lpips_full_mean', 'weighted_endpoint_lpips_full_auc'})
+        report_calls = [row for row in calls if len(row['command']) > 1 and
+                        Path(row['command'][1]).name == 'weighted_endpoint_report.py']
+        self.assertEqual(len(report_calls), 4)
+        dense_archive = Path(self.env['FINAL_ARCHIVE'])/'weighted_50'
+        self.assertTrue((dense_archive/'cfg_grid_metrics.csv').is_file())
+        self.assertTrue((dense_archive/'weighted_endpoint_lpips/evolution.pdf').is_file())
+        for cfg in ('2', '5'):
+            archived_cell = dense_archive/('cfg_ss_'+cfg+'_slat_1.5')
+            self.assertTrue((archived_cell/'final_metrics.json').is_file())
+            self.assertTrue((archived_cell/'weighted_endpoint_lpips/evolution.png').is_file())
 
     def test_insufficient_cuda_allocation_fails_before_generation(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-test-0,GPU-test-1"

@@ -563,6 +563,89 @@ def plot_weighted_endpoints(rows, output_dir):
     plt.close(fig)
 
 
+def compute_weighted_endpoint_metrics(
+    args: argparse.Namespace, output_dir: Path, frames: Sequence[Frame], model=None, device=None,
+) -> Dict[str, Any]:
+    """Evaluate only source proximity, including the two canonical references.
+
+    ``frames`` contains generated intermediates. No adjacent-frame LPIPS, PPL,
+    PDV or FID is computed. The legacy mean/AUC refer to intermediates only;
+    explicitly named ``full`` metrics include the actual reference endpoints.
+    """
+    if model is None or device is None:
+        import lpips
+        device = resolve_device(args.device)
+        model = lpips.LPIPS(net=args.lpips_net, spatial=False).to(device).eval()
+    alphas = np.asarray([frame.alpha for frame in frames], dtype=np.float64)
+    if len(frames) < 2 or not np.all((alphas > 0) & (alphas < 1)) or not np.all(np.diff(alphas) < 0):
+        raise ValueError("Weighted endpoint evaluation requires distinct, descending intermediate alphas in (0,1)")
+    pairs = []
+    for view in range(args.num_views):
+        for frame in frames:
+            for source in ("src1", "src2"):
+                pairs.append((image_path(output_dir, frame.key, view), image_path(output_dir, source, view)))
+        # One symmetric source distance also supplies the unweighted endpoint
+        # diagnostics. Distances of a canonical source to itself are exactly 0.
+        pairs.append((image_path(output_dir, "src1", view), image_path(output_dir, "src2", view)))
+    distances = np.asarray(batched_lpips(model, pairs, device, args.lpips_batch_size), dtype=np.float64)
+    if distances.shape != (args.num_views * (2 * len(frames) + 1),):
+        raise ValueError("LPIPS returned an unexpected number of source distances")
+    distances = distances.reshape(args.num_views, 2 * len(frames) + 1)
+    middle = distances[:, :-1].reshape(args.num_views, len(frames), 2)
+    cross = distances[:, -1]
+    d1 = np.column_stack((np.zeros(args.num_views), middle[:, :, 0], cross))
+    d2 = np.column_stack((cross, middle[:, :, 1], np.zeros(args.num_views)))
+    full_alphas = np.concatenate(([1.0], alphas, [0.0]))
+    curve, weighted = weighted_endpoint_curve(full_alphas, d1, d2)
+    names = ["src1"] + [str(frame.mesh) for frame in frames] + ["src2"]
+    per_view, endpoint_rows = [], []
+    for view in range(args.num_views):
+        per_view.append({
+            "view": view,
+            "weighted_endpoint_lpips_mean": float(weighted[view, 1:-1].mean()),
+            "weighted_endpoint_lpips_auc": float(np.trapz(weighted[view, 1:-1][::-1], alphas[::-1])),
+            "weighted_endpoint_lpips_full_mean": float(weighted[view].mean()),
+            "weighted_endpoint_lpips_full_auc": float(np.trapz(weighted[view, ::-1], full_alphas[::-1])),
+        })
+        for i, alpha in enumerate(full_alphas):
+            endpoint_rows.append({
+                "view": view, "frame": i, "alpha": float(alpha), "mesh": names[i],
+                "lpips_src1": float(d1[view, i]), "lpips_src2": float(d2[view, i]),
+                "weighted_lpips": float(weighted[view, i]),
+            })
+    aggregate = {}
+    for field in per_view[0]:
+        if field == "view":
+            continue
+        values = np.asarray([row[field] for row in per_view])
+        aggregate[field] = {"mean": float(values.mean()), "std": float(values.std(ddof=0)),
+                            "median": float(np.median(values))}
+    result = {
+        "metric_direction": "lower_is_better", "metric_mode": "weighted-endpoints-only",
+        "lpips_backbone": args.lpips_net, "device": str(device), "num_views": args.num_views,
+        "num_generated_frames": len(frames), "num_sequence_frames": len(full_alphas),
+        "sequence_order": "src1 -> src2 (alpha descending)",
+        "alphas": full_alphas.tolist(), "intermediate_alphas": alphas.tolist(),
+        "weighted_endpoint_curve": curve, "weighted_endpoint_includes_reference_endpoints": True,
+        "definitions": {
+            "weighted_endpoint_lpips": "alpha*LPIPS(frame,src1)+(1-alpha)*LPIPS(frame,src2); identical camera views",
+            "weighted_endpoint_lpips_mean": "mean across generated intermediates only, then views; canonical endpoints excluded",
+            "weighted_endpoint_lpips_auc": "trapezoidal integral over observed intermediate alpha interval; endpoints excluded; no extrapolation",
+            "weighted_endpoint_lpips_full_mean": "mean across generated intermediates and the two actual canonical source endpoints, then views",
+            "weighted_endpoint_lpips_full_auc": "trapezoidal integral on [0,1] including the two actual canonical source endpoints",
+            "endpoint_policy": "actual canonical source renders, identical to the reference images; weighted LPIPS is exactly zero at alpha=1 and alpha=0",
+            "interpretation": "additional source proximity diagnostic; not the Interp3D paper protocol or a standalone smoothness or realism metric",
+        },
+        "aggregate_across_views": aggregate,
+    }
+    _write_batch_csv(output_dir / "per_view.csv", per_view)
+    _write_batch_csv(output_dir / "weighted_endpoint_lpips.csv", curve)
+    _write_batch_csv(output_dir / "weighted_endpoint_lpips_per_view.csv", endpoint_rows)
+    plot_weighted_endpoints(curve, output_dir)
+    write_json(output_dir / "metrics.json", result)
+    return result
+
+
 def compute_metrics(
     args: argparse.Namespace,
     output_dir: Path,
@@ -799,6 +882,8 @@ def print_summary(result: Mapping[str, Any]) -> None:
     keys = [
         "weighted_endpoint_lpips_mean",
         "weighted_endpoint_lpips_auc",
+        "weighted_endpoint_lpips_full_mean",
+        "weighted_endpoint_lpips_full_auc",
         "lpips_adjacent_mean",
         "ppl_sum",
         "ppl_normalized_reference_endpoints",
@@ -809,6 +894,8 @@ def print_summary(result: Mapping[str, Any]) -> None:
     print("\n===== PERCEPTUAL SEQUENCE METRICS =====")
     print(f"frames: {result['num_generated_frames']} | views: {result['num_views']} | LPIPS: {result['lpips_backbone']}")
     for key in keys:
+        if key not in agg:
+            continue
         stats = agg[key]
         print(f"{key:38s} {stats['mean']:.6f} +/- {stats['std']:.6f}")
     print("=======================================")
@@ -910,7 +997,8 @@ def process_sequence(
     if args.stage in ("all", "prepare"):
         render_records(args, output_dir, src1, src2, frames)
     if args.stage in ("all", "metrics"):
-        result = compute_metrics(
+        compute = compute_weighted_endpoint_metrics if getattr(args, "metric_mode", "interp3d") == "weighted-endpoints-only" else compute_metrics
+        result = compute(
             args,
             output_dir,
             frames,

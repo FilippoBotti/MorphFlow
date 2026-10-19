@@ -610,11 +610,16 @@ def select_test_pairs(dataset: Any, num_pairs: int, seed: int) -> Tuple[List[Tup
 def command_plan(args: argparse.Namespace) -> None:
     from data.morph_dataset import MorphingDistillDataset
 
+    protocol = getattr(args, "protocol", "interp3d")
+    if protocol == "weighted-endpoints-50" and (args.k != 48 or args.alpha_schedule != "uniform"):
+        raise ValueError("weighted-endpoints-50 requires --k 48 --alpha-schedule uniform (48 intermediates + 2 canonical sources)")
     run_root = Path(args.run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     plan_path = run_root / "plan.json"
     if plan_path.exists() and not args.overwrite:
         existing = read_json(plan_path)
+        if existing.get("protocol", "interp3d") != protocol:
+            raise ValueError("Existing plan uses a different protocol; use a fresh run root")
         expected_requested_n = existing.get("requested_num_pairs", existing.get("num_pairs"))
         if int(args.num_pairs) != int(expected_requested_n):
             raise ValueError(f"Existing plan requested {expected_requested_n} pairs, received {args.num_pairs}; use a fresh run root")
@@ -679,6 +684,9 @@ def command_plan(args: argparse.Namespace) -> None:
         "metadata_index_basis": "unfiltered",
         "source_image_filename": args.source_image_filename,
         "k_intermediate": int(args.k),
+        "protocol": protocol,
+        "metric_mode": "weighted-endpoints-only" if protocol == "weighted-endpoints-50" else "interp3d",
+        "num_sequence_frames": int(args.k) + 2,
         "split": "test",
         "data_root": str(Path(args.data_root).resolve()),
         "metadata": str(args.metadata),
@@ -702,6 +710,18 @@ def command_plan(args: argparse.Namespace) -> None:
         "interp3d_internal_t": [float(round(1.0 - a, 10)) for a in alphas],
         "pairs": pairs,
     }
+    if protocol == "weighted-endpoints-50":
+        payload["sequence_alphas"] = [1.0] + alphas + [0.0]
+        payload["evaluation_protocol"] = {
+            "scope": "Additional weighted source-proximity evaluation on the same held-out MorphFlow test pairs; separate from the Interp3D paper protocol",
+            "name": "weighted-endpoints-50", "metric_mode": "weighted-endpoints-only",
+            "sequence_states": 50, "generated_intermediate_states": 48,
+            "alpha_schedule": "uniform", "sequence_alphas": payload["sequence_alphas"],
+            "perceptual_views": 64, "lpips_backbone": "vgg", "render_backend": "gaussian",
+            "canonical_endpoints": "true source renders reused as sequence endpoints; weighted distance exactly zero at alpha 1 and 0",
+            "fid": "not computed; official FID/PPL/PDV remain in the separate 7-state Interp3D run",
+            "morphflow_noise_policy": "fixed pair seed across alpha and CFG cells; separate SS and SLat noise streams",
+        }
     write_json(plan_path, payload)
     log(f"PLAN written: {plan_path} | pairs={len(pairs)} | K={args.k} | seed={args.seed}", run_root)
 
@@ -1899,6 +1919,7 @@ def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
 def command_aggregate(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root).resolve()
     plan = load_plan(run_root)
+    weighted_only = plan.get("metric_mode") == "weighted-endpoints-only"
     metrics_root = run_root / "metrics"
     combined: Dict[str, Any] = {
         "created_utc": utc_now(),
@@ -1909,12 +1930,33 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "metric_source": "eval_textured_benchmark.py; common explicit alpha schedule; genuine SLat Gaussian appearance",
         "evaluation_protocol": plan.get("evaluation_protocol", {}),
         "alpha_schedule": plan.get("alpha_schedule", "uniform"),
+        "protocol": plan.get("protocol", "interp3d"),
+        "metric_mode": plan.get("metric_mode", "interp3d"),
+        "weighted_endpoint_lpips_definition": {
+            "formula": "alpha * LPIPS(frame, src1) + (1-alpha) * LPIPS(frame, src2)",
+            "alpha_convention": "alpha=1 selects src1; alpha=0 selects src2",
+            "aggregation": "equal frame weight after averaging views, then equal pair weight",
+            "auc": "trapezoidal integral over the observed alpha interval, without extrapolation",
+            "interpretation": "source proximity; additional diagnostic, not a standalone smoothness or realism metric",
+        },
         "methods": {},
     }
+    if weighted_only:
+        combined["num_sequence_frames"] = plan["k_intermediate"] + 2
+        combined["sequence_alphas"] = [1.0] + plan["alphas"] + [0.0]
+        combined["weighted_endpoint_lpips_definition"].update({
+            "curve": "all 50 states: two actual canonical source endpoints plus 48 uniformly spaced intermediates",
+            "mean": "weighted_endpoint_lpips_mean averages the 48 generated intermediates only",
+            "auc": "weighted_endpoint_lpips_auc integrates over the observed intermediate interval, excluding canonical endpoints",
+            "full_mean": "weighted_endpoint_lpips_full_mean averages all 50 states, including zero distance at canonical endpoints",
+            "full_auc": "weighted_endpoint_lpips_full_auc integrates the complete curve on [0,1] including canonical endpoints",
+        })
     generation_timings = aggregate_generation_timings(run_root)
     combined["generation_timings"] = generation_timings
     rows: List[Dict[str, Any]] = []
     headline = (
+        "weighted_endpoint_lpips_mean",
+        "weighted_endpoint_lpips_auc",
         # Paper-style full trajectory, INCLUDING src1/src2 endpoints.
         "lpips_adjacent_full_mean",
         "ppl_full_sum",
@@ -1933,12 +1975,20 @@ def command_aggregate(args: argparse.Namespace) -> None:
         "ppl_normalized_reference_endpoints",
         "pdv",
     )
+    if weighted_only:
+        headline = ("weighted_endpoint_lpips_mean", "weighted_endpoint_lpips_auc",
+                    "weighted_endpoint_lpips_full_mean", "weighted_endpoint_lpips_full_auc")
 
     for method in METHODS:
         path = metrics_root / method / "metrics_batch.json"
         if not path.is_file():
             raise FileNotFoundError(f"Missing batch metrics for {method}: {path}")
         data = read_json(path)
+        if weighted_only and (data.get("metric_mode") != "weighted-endpoints-only" or
+                              data.get("num_generated_frames") != 48 or data.get("num_sequence_frames") != 50 or
+                              data.get("num_views_per_pair") != 64 or data.get("lpips_backbone") != "vgg" or
+                              data.get("alphas") != [1.0] + plan["alphas"] + [0.0]):
+            raise ValueError(f"Weighted 50-state evaluation is incomplete or uses a different protocol: {path}")
         combined["methods"][method] = data
         agg = data.get("aggregate_across_pairs", {})
         for metric in headline:
@@ -2002,6 +2052,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--seed", type=int, default=DEFAULT_SEED)
     plan.add_argument("--alpha-schedule", choices=["beta", "uniform"], default="beta")
     plan.add_argument("--beta-shape", type=float, default=5.0)
+    plan.add_argument("--protocol", choices=["interp3d", "weighted-endpoints-50"], default="interp3d",
+                      help="Use a separate run root for the additional 50-state weighted LPIPS evaluation")
 
     mf = sub.add_parser("morphflow")
     common_run(mf)

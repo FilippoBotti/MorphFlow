@@ -78,6 +78,40 @@ def completed_fid_metrics(result: Mapping[str, Any], mode: str) -> bool:
     return True
 
 
+WEIGHTED_METRICS = (
+    "weighted_endpoint_lpips_mean", "weighted_endpoint_lpips_auc",
+    "weighted_endpoint_lpips_full_mean", "weighted_endpoint_lpips_full_auc",
+)
+
+
+def completed_weighted_metrics(result: Mapping[str, Any]) -> bool:
+    """Require the endpoint-inclusive curve and all explicitly named summaries."""
+    try:
+        if result.get("metric_mode") != "weighted-endpoints-only" or not result.get("weighted_endpoint_includes_reference_endpoints"):
+            return False
+        n = int(result["num_generated_frames"])
+        curve = result["weighted_endpoint_curve"]
+        alphas = np.asarray(result["alphas"], dtype=np.float64)
+        if n < 2 or result["num_sequence_frames"] != n + 2 or len(curve) != n + 2 or len(alphas) != n + 2:
+            return False
+        if not np.isfinite(alphas).all() or not np.all(np.diff(alphas) < 0) or alphas[0] != 1 or alphas[-1] != 0:
+            return False
+        values = np.asarray([row["weighted_lpips_mean"] for row in curve], dtype=np.float64)
+        if not np.isfinite(values).all() or not np.allclose([row["alpha"] for row in curve], alphas):
+            return False
+        if any(int(row["num_views"]) != result["num_views"] for row in curve) or not np.allclose(values[[0, -1]], 0):
+            return False
+        expected = (values[1:-1].mean(), np.trapz(values[1:-1][::-1], alphas[1:-1][::-1]),
+                    values.mean(), np.trapz(values[::-1], alphas[::-1]))
+        for metric, value in zip(WEIGHTED_METRICS, expected):
+            stats = result["aggregate_across_views"][metric]
+            if not all(math.isfinite(float(stats[field])) for field in ("mean", "std", "median")) or not np.isclose(stats["mean"], value):
+                return False
+    except (KeyError, TypeError, ValueError, IndexError):
+        return False
+    return True
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -152,6 +186,7 @@ def evaluation_signature(args: argparse.Namespace, src1: Path, src2: Path, frame
                "fid_num_views": args.fid_num_views, "fid_states": args.fid_num_intermediate_states,
                "fid_seed": args.fid_selection_seed, "render_backend": args.render_backend,
                "fid_aggregation": getattr(args, "fid_aggregation", "both"),
+               "metric_mode": getattr(args, "metric_mode", "interp3d"),
                "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                "metrics_sha256": hashlib.sha256(Path(base.__file__).read_bytes()).hexdigest()}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -518,8 +553,12 @@ def evaluate_shard(args: argparse.Namespace) -> None:
 
     lpips_device = base.resolve_device(args.device)
     lpips_model = lpips.LPIPS(net=args.lpips_net, spatial=False).to(lpips_device).eval()
-    inception_model, inception_transform, inception_weights = load_inception(lpips_device)
-    print(f"FID Inception weights: {inception_weights}", flush=True)
+    weighted_only = getattr(args, "metric_mode", "interp3d") == "weighted-endpoints-only"
+    if weighted_only:
+        print("Weighted endpoint LPIPS only: canonical sources + intermediates; no PPL/PDV/FID", flush=True)
+    else:
+        inception_model, inception_transform, inception_weights = load_inception(lpips_device)
+        print(f"FID Inception weights: {inception_weights}", flush=True)
 
     completed: List[str] = []
     skipped: List[Dict[str, str]] = []
@@ -537,9 +576,10 @@ def evaluate_shard(args: argparse.Namespace) -> None:
                 raise ValueError(f"Non-uniform alpha schedule: {alpha_info['deltas']}")
             signature = evaluation_signature(args, src1, src2, frames)
             metrics_path = pair_output / "metrics.json"
-            if not args.overwrite and args.stage != "prepare" and metrics_path.is_file() and (pair_output / "fid_features.npz").is_file():
+            if not args.overwrite and args.stage != "prepare" and metrics_path.is_file() and (weighted_only or (pair_output / "fid_features.npz").is_file()):
                 previous = base.read_json(metrics_path)
-                if previous.get("evaluation_signature") == signature and completed_fid_metrics(previous, args.fid_aggregation):
+                complete = completed_weighted_metrics(previous) if weighted_only else completed_fid_metrics(previous, args.fid_aggregation)
+                if previous.get("evaluation_signature") == signature and complete:
                     completed.append(sequence_dir.name)
                     print("  reuse completed pair metrics", flush=True)
                     continue
@@ -554,7 +594,8 @@ def evaluate_shard(args: argparse.Namespace) -> None:
                 if args.stage == "prepare":
                     completed.append(sequence_dir.name)
                     continue
-                result = base.compute_metrics(args, pair_output, frames, model=lpips_model, device=lpips_device)
+                compute = base.compute_weighted_endpoint_metrics if weighted_only else base.compute_metrics
+                result = compute(args, pair_output, frames, model=lpips_model, device=lpips_device)
                 result["sequence_name"] = sequence_dir.name
                 result["render_backend"] = "gaussian"
             else:
@@ -565,6 +606,13 @@ def evaluate_shard(args: argparse.Namespace) -> None:
                 if result is None:
                     result = base.read_json(pair_output / "metrics.json")
                 result["render_backend"] = "blender"
+
+            if weighted_only:
+                result["evaluation_signature"] = signature
+                write_json(pair_output / "metrics.json", result)
+                completed.append(sequence_dir.name)
+                print(f"  weighted LPIPS (intermediate/full)={result['aggregate_across_views']['weighted_endpoint_lpips_mean']['mean']:.6f}/{result['aggregate_across_views']['weighted_endpoint_lpips_full_mean']['mean']:.6f}", flush=True)
+                continue
 
             full_aggregate, full_transitions, full_per_view = full_path_metrics(
                 args, pair_output, frames, lpips_model, lpips_device
@@ -634,6 +682,7 @@ def evaluate_shard(args: argparse.Namespace) -> None:
             "render_backend": args.render_backend,
             "fid_num_views": args.fid_num_views,
             "fid_aggregation": args.fid_aggregation,
+            "metric_mode": getattr(args, "metric_mode", "interp3d"),
         },
     )
 
@@ -674,6 +723,9 @@ def frechet_distance(reference: np.ndarray, generated: np.ndarray) -> float:
 
 
 def merge_outputs(args: argparse.Namespace) -> None:
+    if getattr(args, "metric_mode", "interp3d") == "weighted-endpoints-only":
+        merge_weighted_outputs(args)
+        return
     # Namespace callers predating this option retain the historical behavior.
     # The public CLI defaults to both and never silently accepts legacy-only
     # pair files as a complete dual-interpretation evaluation.
@@ -799,6 +851,54 @@ def merge_outputs(args: argparse.Namespace) -> None:
     print("; ".join(f"{metric} = {aggregate[metric]['mean']}" for metric in requested_metrics) + f"; pooled diagnostic FID = {fid}")
 
 
+def merge_weighted_outputs(args: argparse.Namespace) -> None:
+    """Merge dense LPIPS curves without opening feature files or loading FID."""
+    output_root = Path(args.output_dir).resolve()
+    pair_dirs = sorted(path for path in output_root.glob(args.pair_glob) if path.is_dir())
+    if not pair_dirs:
+        raise FileNotFoundError(f"No pair outputs found in {output_root}")
+    results, pair_rows, missing = [], [], []
+    for pair_dir in pair_dirs:
+        path = pair_dir / "metrics.json"
+        if not path.is_file():
+            missing.append(pair_dir.name)
+            continue
+        result = base.read_json(path)
+        if not completed_weighted_metrics(result):
+            raise RuntimeError(f"Incomplete endpoint-inclusive weighted LPIPS metrics: {pair_dir.name}")
+        if results:
+            first = results[0]
+            for field in ("num_views", "lpips_backbone", "num_generated_frames", "num_sequence_frames", "alphas", "render_backend"):
+                if result.get(field) != first.get(field):
+                    raise RuntimeError(f"Inconsistent weighted LPIPS protocol ({field}): {pair_dir.name}")
+        result["sequence_name"] = pair_dir.name
+        results.append(result)
+        row = {"sequence": pair_dir.name, "num_generated_frames": result["num_generated_frames"],
+               "num_sequence_frames": result["num_sequence_frames"], "num_views": result["num_views"]}
+        row.update({metric: result["aggregate_across_views"][metric]["mean"] for metric in WEIGHTED_METRICS})
+        pair_rows.append(row)
+    if args.expected_num_pairs is not None and len(results) != args.expected_num_pairs:
+        raise RuntimeError(f"Expected {args.expected_num_pairs} evaluated pairs, found {len(results)}")
+    if missing and not args.allow_incomplete:
+        raise RuntimeError(f"Incomplete weighted LPIPS evaluation: missing metrics for {missing[:20]}")
+    if not results:
+        raise RuntimeError("No complete pair results to merge")
+    first = results[0]
+    result = {
+        "metric_direction": "lower_is_better", "metric_mode": "weighted-endpoints-only",
+        "aggregation": "equal pair weight after averaging identical views; legacy mean/AUC use intermediates; full mean/AUC include canonical endpoints",
+        "num_pairs": len(results), "num_views_per_pair": first["num_views"],
+        "num_generated_frames": first["num_generated_frames"], "num_sequence_frames": first["num_sequence_frames"],
+        "lpips_backbone": first["lpips_backbone"], "render_backend": first.get("render_backend", "blender"),
+        "alphas": first["alphas"], "weighted_endpoint_includes_reference_endpoints": True,
+        "definitions": first["definitions"], "pairs": pair_rows,
+        "aggregate_across_pairs": base._aggregate_pair_results(results), "global_metrics": {}, "missing_pairs": missing,
+    }
+    write_json(output_root / "metrics_batch.json", result)
+    write_csv(output_root / "per_pair.csv", pair_rows)
+    print(f"Merged {len(results)} weighted LPIPS pairs, without FID -> {output_root / 'metrics_batch.json'}")
+
+
 def check_fid_weights(_args: argparse.Namespace) -> None:
     path = inception_cache_path()
     if not path.is_file():
@@ -809,6 +909,8 @@ def check_fid_weights(_args: argparse.Namespace) -> None:
 def add_eval_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--metric-mode", choices=["interp3d", "weighted-endpoints-only"], default="interp3d",
+                        help="Preserve Interp3D metrics, or compute source-weighted LPIPS only (with canonical endpoint curves and no FID/PPL)")
     parser.add_argument("--pair-glob", default="pair_*")
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -850,6 +952,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     merge = sub.add_parser("merge", help="Merge pair outputs and compute pooled FID")
     merge.add_argument("--output-dir", required=True)
+    merge.add_argument("--metric-mode", choices=["interp3d", "weighted-endpoints-only"], default="interp3d")
     merge.add_argument("--pair-glob", default="pair_*")
     merge.add_argument("--fid-min-samples", type=int, default=512)
     merge.add_argument("--allow-incomplete", action="store_true")

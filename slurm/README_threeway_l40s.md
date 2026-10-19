@@ -12,17 +12,12 @@ Mail Slurm BEGIN, END e FAIL a `marco.barezzi@unipr.it`.
 Aggiornare il checkout MorphFlow sull'Ateneo con **tutti** i file modificati
 di questo lavoro: launcher, helper, benchmark driver, evaluator e
 `eval_perceptual_sequence.py`. I soli file `.slurm` non bastano.
-I checkpoint devono essere gia' disponibili su quel filesystem.
-Il pacchetto `threeway_l40s_20261018.tar.gz` contiene questi file e il codice
-di inferenza MorphFlow; si estrae nella radice del checkout. Include un manifest
-SHA256 dei file per verificare il trasferimento:
-
-```bash
-tar -xzf threeway_l40s_20261018.tar.gz -C "$HOME/trellis-singularity/work/MorphFlow"
-```
+I checkpoint devono essere gia' disponibili su quel filesystem. Pubblicare tutti
+i file modificati e nuovi nel repository, quindi fare `git pull` sull'Ateneo.
 
 ```bash
 cd "$HOME/trellis-singularity/work/MorphFlow"
+git pull
 cp slurm/threeway_interp3d_l40s.env.example threeway_l40s.env
 # Modificare CHECKPOINT_PATH, SLAT_CHECKPOINT_PATH e RUN_NAME nel file.
 set -a
@@ -35,6 +30,27 @@ bash slurm/prepare_threeway_interp3d_l40s.sh --prepare
 # Verifica offline, checkpoint SS/SLat e piano completo senza inferenza GPU.
 bash slurm/benchmark_threeway_interp3d_l40s.slurm --check
 
+sbatch --export=ALL slurm/benchmark_threeway_interp3d_l40s.slurm
+```
+
+Per la coppia migliore disponibile al 19 ottobre 2026 (SS epoca 13, SLat epoca 9),
+eseguire **dal login Ateneo**; i file sorgente sono snapshot immutabili:
+
+```bash
+DEST=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/checkpoints/v4_ss13_slat9
+mkdir -p "$DEST"
+rsync -avP \
+  mbarezzi@login.leonardo.cineca.it:/leonardo_work/IscrC_MORPHFL/mbarezzi/checkpoints/ateneo_v4_ss13_slat9_20261019/ \
+  "$DEST/"
+
+cd "$HOME/trellis-singularity/work/MorphFlow"
+unset CONFIG_FILE RUN_ROOT FINAL_ARCHIVE
+export CHECKPOINT_PATH="$DEST/ss_best.pt"
+export SLAT_CHECKPOINT_PATH="$DEST/slat_best.pt"
+export RUN_NAME=v4_ss13_slat9_interp3d_weighted50
+export N=0 CFG_VALUES="2 3 5" SLAT_CFG_VALUES="1.5 2 2.5" WEIGHTED_DENSE=1
+# La preparazione e' necessaria solo se dipendenze/pesi non sono ancora presenti.
+bash slurm/prepare_threeway_interp3d_l40s.sh --prepare
 sbatch --export=ALL slurm/benchmark_threeway_interp3d_l40s.slurm
 ```
 
@@ -118,9 +134,92 @@ il test v4 scelto, non i valori della tabella su Interp3DData. PDV resta una
 metrica aggiuntiva. I conteggi di frame/passi/viste del paper sono fissi nel
 launcher: override incompatibili vengono rifiutati prima di generare.
 
+## LPIPS pesata sulle due sorgenti
+
+Per ogni intermedio viene calcolata anche
+`alpha * LPIPS(frame, src1) + (1-alpha) * LPIPS(frame, src2)`, con alpha=1
+corrispondente a src1. Vengono conservate sia le due distanze originali sia
+i contributi pesati. Il valore e' mediato prima sulle 64 viste, poi sui cinque
+intermedi e infine sulle coppie con uguale peso. Il campo
+`weighted_endpoint_lpips_mean` compare in `final_metrics.csv` e
+`cfg_grid_metrics.csv`; `weighted_endpoint_lpips_auc` e' l'integrale trapezoidale
+nel solo intervallo alpha campionato, senza estrapolazione agli endpoint.
+Si tratta di una misura di vicinanza alle sorgenti, aggiuntiva al protocollo
+Interp3D, che non misura da sola fluidita' o realismo.
+
+Il launcher produce automaticamente, dopo ogni CFG completato:
+
+- `cfg_ss_.../weighted_endpoint_lpips/evolution.{png,pdf}`: confronto dei tre
+  modelli lungo il passaggio, distanze dalle due sorgenti e contributi pesati;
+- `weighted_endpoint_lpips/evolution.{png,pdf}` nella radice: confronto di tutti
+  i CFG MorphFlow con i due baseline, riportati una volta;
+- `curves.csv`, `summary.csv`, `summary.json` nelle stesse directory: valori
+  per alpha, medie e variabilita' tra le coppie;
+- per ciascuna coppia/metodo, i file gia' prodotti dall'evaluator
+  `metrics/<metodo>/pair_.../weighted_endpoint_lpips.{csv,png,pdf}` e
+  `weighted_endpoint_lpips_per_view.csv` conservano l'evoluzione individuale.
+
+L'asse del confronto va da src1 a src2 usando progresso=1-alpha. Mostra soltanto
+gli intermedi realmente campionati; nessun endpoint a distanza zero e' aggiunto
+artificialmente. Le bande dei confronti descrivono la variabilita' tra coppie,
+quelle dei grafici individuali la variabilita' tra camere.
+I grafici e CSV aggregati vengono copiati anche nell'archivio compatto.
+Il report riusa esclusivamente i risultati LPIPS gia' calcolati, senza inferenza,
+nuovi render o ricalcolo FID. Si puo' rigenerare separatamente nell'env metriche:
+
+```bash
+python benchmarks/weighted_endpoint_report.py --run-root /benchmark
+# Opzionale: anche un confronto dei tre modelli per ciascuna coppia.
+python benchmarks/weighted_endpoint_report.py --run-root /benchmark --per-pair-plots
+```
+
+`/benchmark` e' il mount del container: su host usare il percorso RUN_ROOT
+reale se si esegue Python direttamente in un ambiente con NumPy e Matplotlib.
+
+## Sequenza aggiuntiva da 50 frame
+
+`WEIGHTED_DENSE=1` (default) aggiunge, dopo il confronto Interp3D, una valutazione
+distinta in `weighted_50/`. La prima valutazione conserva i cinque intermedi
+Beta(5,5), LPIPS/PPL e i due FID. La seconda genera **48 intermedi uniformi**, con
+alpha `48/49, 47/49, ..., 1/49`, e usa le due sorgenti canoniche come primo e ultimo
+frame: **50 frame totali**. Sono gli stessi due endpoint per tutti gli approcci.
+Si usano sempre 25 passi SS, 25 SLat, 64 viste comuni e VGG LPIPS. Questa seconda
+valutazione calcola esclusivamente le distanze LPIPS dalle sorgenti: nessun FID,
+PPL o distanza fra intermedi viene ricalcolato sulla sequenza densa.
+
+| Campo | Frame usati |
+| --- | --- |
+| `weighted_endpoint_lpips_mean` | media sui 48 intermedi, dopo viste e coppie |
+| `weighted_endpoint_lpips_auc` | integrale nel solo intervallo degli intermedi |
+| `weighted_endpoint_lpips_full_mean` | media su tutti i 50 frame |
+| `weighted_endpoint_lpips_full_auc` | integrale sull'intero intervallo alpha [0,1] |
+
+La distanza pesata agli endpoint e' zero per definizione: ciascun frame coincide
+con la sorgente avente peso uno. Le distanze dall'altra sorgente vengono comunque
+misurate. La media sui 50 frame vale quindi `48/50` della media sui soli intermedi;
+la riduzione dovuta ai due zeri non e' un miglioramento del modello. Le AUC delle
+due valutazioni coprono intervalli diversi e vanno confrontate fra approcci a
+parita' di protocollo, non direttamente fra 5 e 48 intermedi.
+
+I report PNG/PDF mostrano tutti i 50 punti, distanze originali e contributi pesati:
+
+```text
+weighted_50/cfg_grid_metrics.{csv,json}
+weighted_50/weighted_endpoint_lpips/evolution.{png,pdf}
+weighted_50/cfg_ss_.../weighted_endpoint_lpips/{curves.csv,pairs.csv,summary.csv,evolution.png,evolution.pdf}
+weighted_50/cfg_ss_.../morphflow/pair_.../alpha_.../pred_final.glb
+weighted_50/shared/{morphany3d,interp3d}/pair_.../alpha_.../pred_final.glb
+```
+
+Vengono salvati tutti i 48 intermedi GLB per ogni coppia/modello/CFG. I baseline
+sono generati e valutati una sola volta per protocollo; sorgenti e cache dei render
+di riferimento sono condivise anche fra i due protocolli. I riepiloghi densi
+vengono copiati nell'archivio sotto `weighted_50/`. Per eseguire soltanto il
+protocollo precedente impostare `WEIGHTED_DENSE=0` e scegliere un nuovo RUN_NAME.
+
 ## GLB, parallelismo e output
 
-I baseline vengono generati, esportati e valutati una sola volta. Ogni CFG
+I baseline vengono generati, esportati e valutati una sola volta per protocollo. Ogni CFG
 MorphFlow ha la propria generazione/GLB/metriche. Le fasi vengono ripartite per
 `pair_id % worker_count`, con una GPU per processo; una barriera impedisce di
 sovrapporre fasi pesanti. Un errore termina i worker rimanenti e blocca le fasi
@@ -165,8 +264,12 @@ logs/job_<jobid>_<timestamp>/<phase>_g<shard>.{out,err}
 progress.log
 ```
 
-Con 500 coppie e nove CFG vengono salvati **27.500 GLB intermedi**
-(`500*5*(9+2)`), oltre ai 1000 endpoint condivisi e ai relativi link.
+Con 500 coppie e nove CFG vengono salvati **27.500 GLB intermedi** per il
+protocollo Interp3D (`500*5*(9+2)`), piu' **264.000 GLB intermedi** per quello
+denso (`500*48*(9+2)`), oltre ai 1000 endpoint condivisi e ai relativi link.
+La parte densa richiede 9,6 volte le generazioni/baking degli intermedi del solo
+protocollo precedente. La ripresa conserva quanto completato anche in caso di
+raggiungimento del limite temporale del job.
 RUN_ROOT conserva anche raw, PNG e feature: scegliere lo scratch con spazio
 adeguato per l'intero output, non una directory temporanea del container.
 Solo i riepiloghi compatti vengono copiati in

@@ -67,6 +67,8 @@ export MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 export K="${K:-5}" STEPS="${STEPS:-25}" SLAT_STEPS="${SLAT_STEPS:-25}"
 export BETA_SHAPE="${BETA_SHAPE:-5}" NUM_VIEWS="${NUM_VIEWS:-64}" FID_NUM_VIEWS="${FID_NUM_VIEWS:-1000}"
 export LPIPS_NET="${LPIPS_NET:-vgg}" FID_AGGREGATION="${FID_AGGREGATION:-both}" RENDER_BACKEND="${RENDER_BACKEND:-gaussian}"
+# Independent, additional 50-frame source-proximity evaluation (48 uniform intermediates).
+export WEIGHTED_DENSE="${WEIGHTED_DENSE:-1}"
 export TEXTURE_SIZE="${TEXTURE_SIZE:-1024}" SIMPLIFY="${SIMPLIFY:-0.95}" FILL_HOLES="${FILL_HOLES:-1}"
 LPIPS_BATCH_SIZE="${LPIPS_BATCH_SIZE:-4}"
 FID_BATCH_SIZE="${FID_BATCH_SIZE:-8}"
@@ -285,70 +287,116 @@ run_container plan "$ORIGINAL_ENV" "$SNAPSHOT/TRELLIS" cpu python "$SCRIPT_IN" p
     --run-root /benchmark/shared --data-root "/inputs/$DATASET_NAME" \
     --metadata /benchmark/input_snapshot/metadata_test.json --source-images-root "/inputs/$SOURCE_IMAGES_NAME" \
     --source-image-filename "$SOURCE_IMAGE_FILENAME" --num-pairs "$N" --k "$K" --seed "$SEED" --alpha-schedule beta --beta-shape "$BETA_SHAPE"
+if [[ "$WEIGHTED_DENSE" == 1 ]]; then
+    run_container plan_weighted50 "$ORIGINAL_ENV" "$SNAPSHOT/TRELLIS" cpu python "$SCRIPT_IN" plan \
+        --run-root /benchmark/weighted_50/shared --data-root "/inputs/$DATASET_NAME" \
+        --metadata /benchmark/input_snapshot/metadata_test.json --source-images-root "/inputs/$SOURCE_IMAGES_NAME" \
+        --source-image-filename "$SOURCE_IMAGE_FILENAME" --num-pairs "$N" --k 48 --seed "$SEED" \
+        --protocol weighted-endpoints-50 --alpha-schedule uniform
+fi
 if [[ "$MODE" == --check ]]; then
     echo "CHECK PASSED: $ACTUAL_PAIRS pairs, checkpoint types, frozen code, three isolated forks and metric/export dependencies."
     exit 0
 fi
 
 evaluate_method() {
-    local cell_in="$1" method="$2" output_in="$3" phase="$4"
+    local cell_in="$1" method="$2" output_in="$3" phase="$4" metric_mode="$5"
+    local metric_args=() merge_args=()
+    if [[ "$metric_mode" == weighted-endpoints-only ]]; then
+        metric_args=(--metric-mode weighted-endpoints-only)
+        merge_args=(--metric-mode weighted-endpoints-only)
+    else
+        metric_args=(--fid-num-views "$FID_NUM_VIEWS" --fid-batch-size "$FID_BATCH_SIZE" --fid-selection-seed "$SEED" --fid-aggregation both)
+        merge_args=(--fid-aggregation both --fid-min-samples 512)
+    fi
     run_sharded "${phase}_shard" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$EVAL_IN" shard \
         --run-dir "$cell_in/$method" --output-dir "$output_in" --stage all \
-        --num-views "$NUM_VIEWS" --fid-num-views "$FID_NUM_VIEWS" --resolution 512 \
+        --num-views "$NUM_VIEWS" --resolution 512 \
         --camera-distribution hammersley --render-backend gaussian --appearance materials --lpips-net vgg \
-        --lpips-batch-size "$LPIPS_BATCH_SIZE" --fid-batch-size "$FID_BATCH_SIZE" --fid-selection-seed "$SEED" \
-        --fid-aggregation both --reference-cache-root /benchmark/shared/reference_metrics --device cuda
+        --lpips-batch-size "$LPIPS_BATCH_SIZE" "${metric_args[@]}" \
+        --reference-cache-root /benchmark/shared/reference_metrics --device cuda
     run_container "${phase}_merge" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$EVAL_IN" merge \
-        --output-dir "$output_in" --fid-aggregation both --fid-min-samples 512 --expected-num-pairs "$ACTUAL_PAIRS"
+        --output-dir "$output_in" "${merge_args[@]}" --expected-num-pairs "$ACTUAL_PAIRS"
 }
 
-BASELINES_DONE=0
+run_evaluation_grid() {
+local evaluation="$1" base_in="$2" phase_prefix="$3" metric_mode="$4"
+local BASELINES_DONE=0 cfg slat_cfg CELL_HOST CELL_NAME CELL_IN PHASE_NAME method
 while read -r cfg slat_cfg; do
-    CELL_HOST="$("$HOST_PYTHON" "$HELPER_HOST" cell --run-root "$RUN_ROOT" --cfg "$cfg" --slat-cfg "$slat_cfg")"
+    CELL_HOST="$("$HOST_PYTHON" "$HELPER_HOST" cell --run-root "$RUN_ROOT" --evaluation "$evaluation" --cfg "$cfg" --slat-cfg "$slat_cfg")"
     CELL_NAME="$(basename "$CELL_HOST")"
-    CELL_IN="/benchmark/$CELL_NAME"
-    run_sharded "${CELL_NAME}_generation" "$ORIGINAL_ENV" "$SNAPSHOT/TRELLIS" python "$SCRIPT_IN" morphflow \
+    CELL_IN="$base_in/$CELL_NAME"
+    PHASE_NAME="${phase_prefix}${CELL_NAME}"
+    run_sharded "${PHASE_NAME}_generation" "$ORIGINAL_ENV" "$SNAPSHOT/TRELLIS" python "$SCRIPT_IN" morphflow \
         --run-root "$CELL_IN" --data-root "/inputs/$DATASET_NAME" --metadata /benchmark/input_snapshot/metadata_test.json \
         --source-images-root "/inputs/$SOURCE_IMAGES_NAME" --source-image-filename "$SOURCE_IMAGE_FILENAME" \
         --checkpoint-path /checkpoints/ss/checkpoint.pt --slat-checkpoint-path /checkpoints/slat/checkpoint.pt \
         --steps "$STEPS" --slat-steps "$SLAT_STEPS" --cfg-scale "$cfg" --slat-cfg-scale "$slat_cfg" \
         --mixed-precision "$MIXED_PRECISION" --trellis-model image_large
     if (( BASELINES_DONE == 0 )); then
-        run_sharded morphany3d_generation "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" morphany3d \
-            --run-root /benchmark/shared --steps "$STEPS" --slat-steps "$SLAT_STEPS" --tfsa-cache-mode hybrid \
+        run_sharded "${phase_prefix}morphany3d_generation" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" morphany3d \
+            --run-root "$base_in/shared" --steps "$STEPS" --slat-steps "$SLAT_STEPS" --tfsa-cache-mode hybrid \
             --tfsa-ram-gb "$MORPHANY_TFSA_RAM_GB_PER_WORKER" --tfsa-min-node-free-gb "$MORPHANY_TFSA_MIN_NODE_FREE_GB" \
             --local-cache-root /runtime-tmp/morphany3d --tfsa-spill-root /runtime-tmp/tfsa-spill
-        run_sharded interp3d_generation "$INTERP_ENV" "$SNAPSHOT/Interp3D" python "$SCRIPT_IN" interp3d \
-            --run-root /benchmark/shared --steps "$STEPS" --slat-steps "$SLAT_STEPS"
-        run_sharded shared_glbs "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
-            --run-root /benchmark/shared --methods morphany3d interp3d --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
-        run_container shared_glb_audit "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status \
-            --run-root /benchmark/shared --methods morphany3d interp3d
+        run_sharded "${phase_prefix}interp3d_generation" "$INTERP_ENV" "$SNAPSHOT/Interp3D" python "$SCRIPT_IN" interp3d \
+            --run-root "$base_in/shared" --steps "$STEPS" --slat-steps "$SLAT_STEPS"
+        run_sharded "${phase_prefix}shared_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
+            --run-root "$base_in/shared" --methods morphany3d interp3d --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
+        run_container "${phase_prefix}shared_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status \
+            --run-root "$base_in/shared" --methods morphany3d interp3d
         for method in morphany3d interp3d; do
-            evaluate_method /benchmark/shared "$method" "/benchmark/shared/metrics/$method" "$method"
+            evaluate_method "$base_in/shared" "$method" "$base_in/shared/metrics/$method" "${phase_prefix}${method}" "$metric_mode"
         done
         BASELINES_DONE=1
     fi
-    run_sharded "${CELL_NAME}_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
+    run_sharded "${PHASE_NAME}_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
         --run-root "$CELL_IN" --methods morphflow --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
-    run_container "${CELL_NAME}_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status --run-root "$CELL_IN"
-    evaluate_method "$CELL_IN" morphflow "$CELL_IN/metrics/morphflow" "${CELL_NAME}_metrics"
+    run_container "${PHASE_NAME}_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status --run-root "$CELL_IN"
+    evaluate_method "$CELL_IN" morphflow "$CELL_IN/metrics/morphflow" "${PHASE_NAME}_metrics" "$metric_mode"
     # Baseline timing files exist after their first generation phase.
-    "$HOST_PYTHON" "$HELPER_HOST" cell --run-root "$RUN_ROOT" --cfg "$cfg" --slat-cfg "$slat_cfg" >/dev/null
-    run_container "${CELL_NAME}_aggregate" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" aggregate --run-root "$CELL_IN"
-    "$HOST_PYTHON" "$HELPER_HOST" summarize --run-root "$RUN_ROOT"
+    "$HOST_PYTHON" "$HELPER_HOST" cell --run-root "$RUN_ROOT" --evaluation "$evaluation" --cfg "$cfg" --slat-cfg "$slat_cfg" >/dev/null
+    run_container "${PHASE_NAME}_aggregate" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" aggregate --run-root "$CELL_IN"
+    "$HOST_PYTHON" "$HELPER_HOST" summarize --run-root "$RUN_ROOT" --evaluation "$evaluation"
+    run_container "${PHASE_NAME}_weighted_lpips" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu \
+        python /workspace/MorphFlow/benchmarks/weighted_endpoint_report.py --run-root "$base_in"
 done < "$GRID_FILE"
-"$HOST_PYTHON" "$HELPER_HOST" summarize --run-root "$RUN_ROOT" --require-complete
+"$HOST_PYTHON" "$HELPER_HOST" summarize --run-root "$RUN_ROOT" --evaluation "$evaluation" --require-complete
+}
+
+run_evaluation_grid interp3d /benchmark "" all
+if [[ "$WEIGHTED_DENSE" == 1 ]]; then
+    run_evaluation_grid weighted50 /benchmark/weighted_50 weighted50_ weighted-endpoints-only
+fi
 
 # Compact reports in archive; all raw assets, GLBs, images and features remain in RUN_ROOT.
-cp "$RUN_ROOT/run_manifest.json" "$RUN_ROOT/cfg_grid_metrics.csv" "$RUN_ROOT/cfg_grid_metrics.json" "$RUN_ROOT/checkpoint_metadata.json" "$FINAL_ARCHIVE/"
-for file in "$RUN_ROOT"/cfg_ss_*/final_metrics.{json,csv} "$RUN_ROOT"/cfg_ss_*/generation_timings.{json,csv} "$RUN_ROOT"/cfg_ss_*/texture_status.json; do
+cp "$RUN_ROOT/run_manifest.json" "$RUN_ROOT/checkpoint_metadata.json" "$FINAL_ARCHIVE/"
+archive_evaluation() {
+local source_root="$1" archive_root="$2" file directory destination
+mkdir -p "$archive_root"
+cp "$source_root/cfg_grid_metrics.csv" "$source_root/cfg_grid_metrics.json" "$archive_root/"
+cp -R "$source_root/weighted_endpoint_lpips" "$archive_root/"
+cp "$source_root/shared/plan.json" "$archive_root/plan.json"
+for file in "$source_root"/cfg_ss_*/final_metrics.{json,csv} "$source_root"/cfg_ss_*/generation_timings.{json,csv} "$source_root"/cfg_ss_*/texture_status.json; do
     [[ -f "$file" ]] || continue
-    destination="$FINAL_ARCHIVE/$(basename "$(dirname "$file")")"
+    destination="$archive_root/$(basename "$(dirname "$file")")"
     mkdir -p "$destination"
     cp "$file" "$destination/"
 done
+for directory in "$source_root"/cfg_ss_*/weighted_endpoint_lpips; do
+    [[ -d "$directory" ]] || continue
+    destination="$archive_root/$(basename "$(dirname "$directory")")"
+    mkdir -p "$destination"
+    cp -R "$directory" "$destination/"
+done
+}
+archive_evaluation "$RUN_ROOT" "$FINAL_ARCHIVE"
+if [[ "$WEIGHTED_DENSE" == 1 ]]; then
+    archive_evaluation "$RUN_ROOT/weighted_50" "$FINAL_ARCHIVE/weighted_50"
+    echo "Dense 50-frame reports: $RUN_ROOT/weighted_50/cfg_grid_metrics.csv"
+    echo "Dense evolution: $RUN_ROOT/weighted_50/weighted_endpoint_lpips/evolution.png"
+fi
 echo "DONE: $RUN_ROOT/cfg_grid_metrics.csv"
 echo "GLBs: $RUN_ROOT/cfg_ss_*/morphflow/pair_*/alpha_*/pred_final.glb"
 echo "Baselines: $RUN_ROOT/shared/{morphany3d,interp3d}/pair_*/alpha_*/pred_final.glb"
 echo "Archive reports: $FINAL_ARCHIVE"
+echo "Weighted LPIPS comparison: $RUN_ROOT/weighted_endpoint_lpips/evolution.png"
