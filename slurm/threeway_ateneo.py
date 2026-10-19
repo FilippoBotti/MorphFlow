@@ -73,6 +73,8 @@ def requested_configuration(env):
         raise ValueError("FILL_HOLES must be 0 or 1")
     if env.get("WEIGHTED_DENSE", "1") not in {"0", "1"}:
         raise ValueError("WEIGHTED_DENSE must be 0 or 1")
+    if env.get("EXPORT_GLB", "0") not in {"0", "1"}:
+        raise ValueError("EXPORT_GLB must be 0 or 1")
     configuration = dict(PROTOCOL)
     configuration.update({
         "N": n, "SEED": int(env.get("SEED", "42")),
@@ -82,6 +84,7 @@ def requested_configuration(env):
         "TEXTURE_SIZE": texture_size, "SIMPLIFY": simplify,
         "FILL_HOLES": int(env.get("FILL_HOLES", "1")),
         "WEIGHTED_DENSE": int(env.get("WEIGHTED_DENSE", "1")),
+        "EXPORT_GLB": int(env.get("EXPORT_GLB", "0")),
         "SOURCE_IMAGE_FILENAME": env.get("SOURCE_IMAGE_FILENAME", ""),
     })
     for key in ("PROJECT_DIR", "DATA_ROOT_HOST", "SOURCE_IMAGES_ROOT_HOST", "CHECKPOINT_PATH",
@@ -225,6 +228,11 @@ def prepare(args):
             "fid_endpoint_manifold_pooled": "FID pooled over all pairs; diagnostic only",
         },
         "scope": "Interp3D-style counts and metric definitions on the selected held-out test set; both explicit FID interpretations.",
+        "asset_export": {
+            "glb_enabled": bool(config["EXPORT_GLB"]),
+            "raw_mesh_and_gaussian": True,
+            "glb_can_be_baked_later": True,
+        },
         "weighted_dense_protocol": {
             "enabled": bool(config["WEIGHTED_DENSE"]), "num_intermediates": 48,
             "num_sequence_frames": 50, "alpha_schedule": "uniform",
@@ -234,8 +242,9 @@ def prepare(args):
         },
     })
     prepare_dense_layout(root, config)
-    print("Prepared {} unique test pairs, {} CFG cells; all intermediate GLBs required.".format(
-        actual, len(config["CFG_VALUES"]) * len(config["SLAT_CFG_VALUES"])))
+    print("Prepared {} unique test pairs, {} CFG cells; {}.".format(
+        actual, len(config["CFG_VALUES"]) * len(config["SLAT_CFG_VALUES"]),
+        "all intermediate GLBs required" if config["EXPORT_GLB"] else "raw mesh/Gaussian assets retained; GLB baking deferred"))
 
 
 def relative_link(destination, source):

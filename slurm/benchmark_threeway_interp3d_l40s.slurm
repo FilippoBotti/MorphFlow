@@ -18,7 +18,8 @@
 # Parma/Ateneo: eight independent pair shards, one GPU per worker.
 # Configure through CONFIG_FILE or environment variables; see the .env.example.
 # --check validates snapshots, all selected test inputs and CPU imports.
-# Default --run additionally generates, bakes ALL GLBs, evaluates BOTH FIDs.
+# Default --run saves mesh/Gaussian raw assets and evaluates BOTH FIDs.
+# EXPORT_GLB=1 additionally bakes every GLB; the default defers baking.
 set -euo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }
 MODE="${1:---run}"
@@ -69,6 +70,7 @@ export BETA_SHAPE="${BETA_SHAPE:-5}" NUM_VIEWS="${NUM_VIEWS:-64}" FID_NUM_VIEWS=
 export LPIPS_NET="${LPIPS_NET:-vgg}" FID_AGGREGATION="${FID_AGGREGATION:-both}" RENDER_BACKEND="${RENDER_BACKEND:-gaussian}"
 # Independent, additional 50-frame source-proximity evaluation (48 uniform intermediates).
 export WEIGHTED_DENSE="${WEIGHTED_DENSE:-1}"
+export EXPORT_GLB="${EXPORT_GLB:-0}"
 export TEXTURE_SIZE="${TEXTURE_SIZE:-1024}" SIMPLIFY="${SIMPLIFY:-0.95}" FILL_HOLES="${FILL_HOLES:-1}"
 LPIPS_BATCH_SIZE="${LPIPS_BATCH_SIZE:-4}"
 FID_BATCH_SIZE="${FID_BATCH_SIZE:-8}"
@@ -273,9 +275,15 @@ for spec in "main|$ORIGINAL_ENV|$SNAPSHOT/TRELLIS" "morphany3d|$MORPHANY_ENV|$SN
             'import torch; from trellis.pipelines import TrellisImageTo3DPipeline; p=TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large"); p.cuda(); print("Complete baseline pipeline/DINO cache OK", torch.cuda.get_device_name(0)); del p; torch.cuda.empty_cache()'
     fi
 done
-run_container preflight_export "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" "$preflight_gpu" python -c \
-    'import sys; import lpips, pytorch_fid, scipy, xatlas, pyvista, pymeshfix, igraph, cv2, diff_gaussian_rasterization; from trellis.utils import postprocessing_utils; import nvdiffrast.torch as dr; dr.RasterizeCudaContext() if sys.argv[1]=="gpu" else None; print("Gaussian renderer, GLB baking and metric imports OK")' \
-    "$([[ "$MODE" == --run ]] && echo gpu || echo cpu)"
+if [[ "$EXPORT_GLB" == 1 ]]; then
+    run_container preflight_export "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" "$preflight_gpu" python -c \
+        'import sys; import lpips, pytorch_fid, scipy, xatlas, pyvista, pymeshfix, igraph, cv2, diff_gaussian_rasterization; from trellis.utils import postprocessing_utils; import nvdiffrast.torch as dr; dr.RasterizeCudaContext() if sys.argv[1]=="gpu" else None; print("Gaussian renderer, GLB baking and metric imports OK")' \
+        "$([[ "$MODE" == --run ]] && echo gpu || echo cpu)"
+else
+    run_container preflight_metrics "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" "$preflight_gpu" python -c \
+        'import lpips, pytorch_fid, scipy, diff_gaussian_rasterization; from trellis.utils import render_utils; print("Gaussian renderer and metric imports OK; GLB baking deferred")' \
+        "$([[ "$MODE" == --run ]] && echo gpu || echo cpu)"
+fi
 run_container fid_weights "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$EVAL_IN" check-fid-weights
 run_container checkpoint_check "$ORIGINAL_ENV" "$SNAPSHOT/TRELLIS" cpu python -c \
     'import json, torch; from pathlib import Path; from eval_validation_latents import detect_flow_target; paths=["/checkpoints/ss/checkpoint.pt","/checkpoints/slat/checkpoint.pt"]; rows=[]; targets=[]
@@ -295,7 +303,7 @@ if [[ "$WEIGHTED_DENSE" == 1 ]]; then
         --protocol weighted-endpoints-50 --alpha-schedule uniform
 fi
 if [[ "$MODE" == --check ]]; then
-    echo "CHECK PASSED: $ACTUAL_PAIRS pairs, checkpoint types, frozen code, three isolated forks and metric/export dependencies."
+    echo "CHECK PASSED: $ACTUAL_PAIRS pairs, checkpoint types, frozen code, three isolated forks and metric dependencies; EXPORT_GLB=$EXPORT_GLB."
     exit 0
 fi
 
@@ -340,18 +348,22 @@ while read -r cfg slat_cfg; do
             --local-cache-root /runtime-tmp/morphany3d --tfsa-spill-root /runtime-tmp/tfsa-spill
         run_sharded "${phase_prefix}interp3d_generation" "$INTERP_ENV" "$SNAPSHOT/Interp3D" python "$SCRIPT_IN" interp3d \
             --run-root "$base_in/shared" --steps "$STEPS" --slat-steps "$SLAT_STEPS"
-        run_sharded "${phase_prefix}shared_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
-            --run-root "$base_in/shared" --methods morphany3d interp3d --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
-        run_container "${phase_prefix}shared_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status \
-            --run-root "$base_in/shared" --methods morphany3d interp3d
+        if [[ "$EXPORT_GLB" == 1 ]]; then
+            run_sharded "${phase_prefix}shared_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
+                --run-root "$base_in/shared" --methods morphany3d interp3d --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
+            run_container "${phase_prefix}shared_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status \
+                --run-root "$base_in/shared" --methods morphany3d interp3d
+        fi
         for method in morphany3d interp3d; do
             evaluate_method "$base_in/shared" "$method" "$base_in/shared/metrics/$method" "${phase_prefix}${method}" "$metric_mode"
         done
         BASELINES_DONE=1
     fi
-    run_sharded "${PHASE_NAME}_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
-        --run-root "$CELL_IN" --methods morphflow --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
-    run_container "${PHASE_NAME}_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status --run-root "$CELL_IN"
+    if [[ "$EXPORT_GLB" == 1 ]]; then
+        run_sharded "${PHASE_NAME}_glbs" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" python "$SCRIPT_IN" texture \
+            --run-root "$CELL_IN" --methods morphflow --texture-size "$TEXTURE_SIZE" --simplify "$SIMPLIFY" --fill-holes "$FILL_HOLES"
+        run_container "${PHASE_NAME}_glb_audit" "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$SCRIPT_IN" texture-status --run-root "$CELL_IN"
+    fi
     evaluate_method "$CELL_IN" morphflow "$CELL_IN/metrics/morphflow" "${PHASE_NAME}_metrics" "$metric_mode"
     # Baseline timing files exist after their first generation phase.
     "$HOST_PYTHON" "$HELPER_HOST" cell --run-root "$RUN_ROOT" --evaluation "$evaluation" --cfg "$cfg" --slat-cfg "$slat_cfg" >/dev/null
@@ -396,7 +408,11 @@ if [[ "$WEIGHTED_DENSE" == 1 ]]; then
     echo "Dense evolution: $RUN_ROOT/weighted_50/weighted_endpoint_lpips/evolution.png"
 fi
 echo "DONE: $RUN_ROOT/cfg_grid_metrics.csv"
-echo "GLBs: $RUN_ROOT/cfg_ss_*/morphflow/pair_*/alpha_*/pred_final.glb"
-echo "Baselines: $RUN_ROOT/shared/{morphany3d,interp3d}/pair_*/alpha_*/pred_final.glb"
+if [[ "$EXPORT_GLB" == 1 ]]; then
+    echo "GLBs: $RUN_ROOT/cfg_ss_*/morphflow/pair_*/alpha_*/pred_final.glb"
+    echo "Baselines: $RUN_ROOT/shared/{morphany3d,interp3d}/pair_*/alpha_*/pred_final.glb"
+else
+    echo "GLB baking deferred for all models and protocols; mesh_raw.pt and Gaussian appearance retained in $RUN_ROOT."
+fi
 echo "Archive reports: $FINAL_ARCHIVE"
 echo "Weighted LPIPS comparison: $RUN_ROOT/weighted_endpoint_lpips/evolution.png"

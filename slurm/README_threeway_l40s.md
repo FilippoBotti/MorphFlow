@@ -6,6 +6,8 @@ precedente benchmark: account `g_vbd`, partizione/QoS `gpu_vbd`, nodo `wn49`,
 otto `gpu:l40s_vbd`, 64 CPU, 700 GiB RAM, massimo 10 giorni; modulo
 `singularity/3.8.7` e SIF `$HOME/containers/trellis-py240-cu118.sif`.
 Mail Slurm BEGIN, END e FAIL a `marco.barezzi@unipr.it`.
+Il default `EXPORT_GLB=0` conserva mesh e Gaussian nei raw e rimanda l'export GLB.
+Si applica a MorphFlow, MorphAny3D e Interp3D, in entrambi i protocolli.
 
 ## Preparazione e lancio sull'HPC Ateneo
 
@@ -49,6 +51,7 @@ export CHECKPOINT_PATH="$DEST/ss_best.pt"
 export SLAT_CHECKPOINT_PATH="$DEST/slat_best.pt"
 export RUN_NAME=v4_ss13_slat9_interp3d_weighted50
 export N=0 CFG_VALUES="2 3 5" SLAT_CFG_VALUES="1.5 2 2.5" WEIGHTED_DENSE=1
+export EXPORT_GLB=0
 # La preparazione e' necessaria solo se dipendenze/pesi non sono ancora presenti.
 bash slurm/prepare_threeway_interp3d_l40s.sh --prepare
 sbatch --export=ALL slurm/benchmark_threeway_interp3d_l40s.slurm
@@ -70,7 +73,8 @@ sbatch --export=ALL --time=04:00:00 slurm/benchmark_threeway_interp3d_l40s.slurm
 
 L'allocazione resta di otto GPU; con meno di otto coppie partono soltanto i worker
 necessari. `--check` verifica gli input e gli import CPU; il job verifica CUDA,
-fork corretto e contesto nvdiffrast prima della generazione. La verifica CUDA
+fork corretto e renderer prima della generazione. Con `EXPORT_GLB=1` verifica
+anche il contesto nvdiffrast per il baking. La verifica CUDA
 su L40S richiede l'esecuzione sull'Ateneo: non e' stata simulata come prova GPU.
 
 ## Ambienti e input
@@ -207,11 +211,12 @@ I report PNG/PDF mostrano tutti i 50 punti, distanze originali e contributi pesa
 weighted_50/cfg_grid_metrics.{csv,json}
 weighted_50/weighted_endpoint_lpips/evolution.{png,pdf}
 weighted_50/cfg_ss_.../weighted_endpoint_lpips/{curves.csv,pairs.csv,summary.csv,evolution.png,evolution.pdf}
-weighted_50/cfg_ss_.../morphflow/pair_.../alpha_.../pred_final.glb
-weighted_50/shared/{morphany3d,interp3d}/pair_.../alpha_.../pred_final.glb
+weighted_50/cfg_ss_.../morphflow/pair_.../alpha_.../mesh_raw.pt
+weighted_50/shared/{morphany3d,interp3d}/pair_.../alpha_.../mesh_raw.pt
 ```
 
-Vengono salvati tutti i 48 intermedi GLB per ogni coppia/modello/CFG. I baseline
+Vengono salvati i raw completi di tutti i 48 intermedi per ogni coppia/modello/CFG.
+Gli eventuali GLB sono controllati da `EXPORT_GLB`, anche per questa sequenza. I baseline
 sono generati e valutati una sola volta per protocollo; sorgenti e cache dei render
 di riferimento sono condivise anche fra i due protocolli. I riepiloghi densi
 vengono copiati nell'archivio sotto `weighted_50/`. Per eseguire soltanto il
@@ -219,8 +224,38 @@ protocollo precedente impostare `WEIGHTED_DENSE=0` e scegliere un nuovo RUN_NAME
 
 ## GLB, parallelismo e output
 
-I baseline vengono generati, esportati e valutati una sola volta per protocollo. Ogni CFG
-MorphFlow ha la propria generazione/GLB/metriche. Le fasi vengono ripartite per
+Con **`EXPORT_GLB=0` (default)** il job salta baking, export e audit GLB per tutti
+i modelli, inclusi gli endpoint. Restano i file `mesh_raw.pt` con geometria e
+Gaussian complete, i marker `mesh_raw.appearance.json`, i riferimenti
+`references_raw/`, i piani, i metadati, i checkpoint e il codice congelati.
+Questi raw consentono di esportare in seguito i GLB con il sottocomando `texture`,
+nel container con GPU e dipendenze di baking, senza nuova inferenza dei modelli.
+Le metriche leggono direttamente i raw Gaussian e non richiedono i GLB.
+CSV, PNG/PDF, render delle viste e feature FID vengono conservati come prima.
+
+Per la configurazione Ateneo corrente, su 50 coppie deterministiche e 15 CFG:
+
+```bash
+cd "$HOME/trellis-singularity/work/MorphFlow"
+# Dopo commit/push sul repository, aggiornare il checkout dell'Ateneo.
+git pull
+unset CONFIG_FILE RUN_ROOT FINAL_ARCHIVE
+export CHECKPOINT_PATH=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/checkpoints/ss_best_e17.pt
+export SLAT_CHECKPOINT_PATH=/hpc/archive/G_VBD/marco.barezzi/morph-benchmark/checkpoints/slat_best_e9.pt
+export RUN_NAME=v4_ss17_slat9_cfg15_n50_seed42_weighted50_raw
+export N=50 SEED=42
+export CFG_VALUES="1 2 3 5 7.5" SLAT_CFG_VALUES="1 1.5 2"
+export WEIGHTED_DENSE=1 EXPORT_GLB=0
+sbatch --export=ALL slurm/benchmark_threeway_interp3d_l40s.slurm
+```
+
+`EXPORT_GLB` e' registrato nel manifest immutabile: cambiare modalita' di export
+richiede un nuovo RUN_NAME. Il sottocomando `texture` puo' invece esportare i raw
+di una run esistente senza rilanciare il benchmark o cambiare quel manifest.
+Per abilitare il baking durante una nuova valutazione scegliere `EXPORT_GLB=1`.
+
+I baseline vengono generati e valutati una sola volta per protocollo. Ogni CFG
+MorphFlow ha la propria generazione e le proprie metriche. Le fasi vengono ripartite per
 `pair_id % worker_count`, con una GPU per processo; una barriera impedisce di
 sovrapporre fasi pesanti. Un errore termina i worker rimanenti e blocca le fasi
 successive. Ogni processo ha home e temporanei privati. TFSA usa RAM limitata
@@ -228,7 +263,7 @@ e overflow sul NVMe privato, selezionato esplicitamente con --tfsa-spill-root.
 Il default richiede 64 GiB di NVMe libero per worker piu' 20 GiB di margine;
 NODE_LOCAL_PARENT e NVME_MIN_GB sono configurabili.
 
-Gli export GLB sono obbligatori: mesh + aspetto Gaussian passano attraverso lo
+Con `EXPORT_GLB=1`, mesh + aspetto Gaussian passano attraverso lo
 stesso baking TRELLIS `to_glb(gaussian, mesh)`, texture 1024, simplify 0.95,
 fill_holes abilitato per default. Gli export sono atomici; file troncati o non
 validi vengono rigenerati. Un audit controlla ogni GLB intermedio e ogni endpoint
@@ -245,31 +280,37 @@ run_manifest.json                           # input, hash, formule e checkpoint 
 checkpoint_metadata.json                    # epoca/loss/tipo dei pesi scelti
 cfg_ss_2_slat_1.5/
   final_metrics.{csv,json}
-  texture_status.json                       # audit di tutti e tre i modelli
+  texture_status.json                       # solo con EXPORT_GLB=1
   morphflow/pair_.../
-    src1.glb
-    alpha_.../pred_final.glb                 # ogni intermedio, con texture
+    src1.glb                                # solo con EXPORT_GLB=1
+    alpha_.../pred_final.glb                 # solo con EXPORT_GLB=1
     alpha_.../mesh_raw.pt                    # geometria + aspetto autentico
-    src2.glb
-    sequence.json
+    alpha_.../mesh_raw.appearance.json       # marker necessario per validare il raw
+    src2.glb                                # solo con EXPORT_GLB=1
+    sequence.json                           # scritto dal baking
   metrics/morphflow/pair_.../images/...
   morphany3d -> ../shared/morphany3d
   interp3d -> ../shared/interp3d
 shared/
-  morphany3d/pair_.../alpha_.../pred_final.glb
-  interp3d/pair_.../alpha_.../pred_final.glb
-  references_textured/pair_.../{src1,src2}.glb
+  morphany3d/pair_.../alpha_.../mesh_raw.pt
+  interp3d/pair_.../alpha_.../mesh_raw.pt
+  references_raw/pair_.../{src1_raw,src2_raw}.pt
+  references_textured/pair_.../{src1,src2}.glb # solo con EXPORT_GLB=1
   metrics/{morphany3d,interp3d}/...
 logs/job_<jobid>_<timestamp>/<phase>_g<shard>.{out,err}
 progress.log
 ```
 
-Con 500 coppie e nove CFG vengono salvati **27.500 GLB intermedi** per il
+Con `EXPORT_GLB=1`, 500 coppie e nove CFG vengono salvati **27.500 GLB intermedi** per il
 protocollo Interp3D (`500*5*(9+2)`), piu' **264.000 GLB intermedi** per quello
 denso (`500*48*(9+2)`), oltre ai 1000 endpoint condivisi e ai relativi link.
 La parte densa richiede 9,6 volte le generazioni/baking degli intermedi del solo
 protocollo precedente. La ripresa conserva quanto completato anche in caso di
 raggiungimento del limite temporale del job.
+Con `EXPORT_GLB=0` non vengono creati GLB; restano gli stessi conteggi di raw e
+render intermedi. Per 50 coppie e 15 CFG sono 45.050 raw intermedi e circa
+2,88 milioni di PNG, oltre alle sorgenti condivise: il risparmio riguarda GLB
+e tempo di baking, senza eliminare gli altri output.
 RUN_ROOT conserva anche raw, PNG e feature: scegliere lo scratch con spazio
 adeguato per l'intero output, non una directory temporanea del container.
 Solo i riepiloghi compatti vengono copiati in

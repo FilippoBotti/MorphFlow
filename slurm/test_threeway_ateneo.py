@@ -105,6 +105,27 @@ class AteneoLayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Configuration changed"):
             self.prepare()
 
+    def test_glb_export_defaults_to_disabled_and_accepts_only_boolean_flags(self):
+        self.assertEqual(ateneo.requested_configuration(self.env)['EXPORT_GLB'], 0)
+        self.assertEqual(ateneo.requested_configuration(dict(self.env, EXPORT_GLB='1'))['EXPORT_GLB'], 1)
+        self.assertEqual(ateneo.requested_configuration(dict(self.env, EXPORT_GLB='0'))['EXPORT_GLB'], 0)
+        for value in ('2', '-1', 'true', ''):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'EXPORT_GLB'):
+                ateneo.requested_configuration(dict(self.env, EXPORT_GLB=value))
+
+    def test_glb_export_policy_is_frozen_on_resume(self):
+        self.prepare()
+        manifest = self.manifest()
+        self.assertEqual(manifest['configuration']['EXPORT_GLB'], 0)
+        self.assertEqual(manifest['asset_export'], {
+            'glb_enabled': False,
+            'raw_mesh_and_gaussian': True,
+            'glb_can_be_baked_later': True,
+        })
+        self.env['EXPORT_GLB'] = '1'
+        with self.assertRaisesRegex(ValueError, 'Configuration changed'):
+            self.prepare()
+
     def test_live_or_frozen_source_change_is_rejected(self):
         self.prepare()
         frozen = self.root / "source_snapshot/MorphFlow/models/model.py"

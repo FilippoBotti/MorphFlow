@@ -91,6 +91,14 @@ def complete_glbs(root, method, pair):
     return all((root / method / pair['pair_dir'] / ('alpha_' + str(i)) / 'pred_final.glb').is_file()
                for i in range(len(plan_for(root)['alphas'])))
 
+def complete_raws(root, method, pair):
+    paths = [root / method / pair['pair_dir'] / ('alpha_' + str(i)) / 'mesh_raw.pt'
+             for i in range(len(plan_for(root)['alphas']))]
+    paths.extend(root / 'references_raw' / pair['pair_dir'] / (source + '_raw.pt')
+                 for source in ('src1', 'src2'))
+    return all(path.is_file() and path.with_suffix('.appearance.json').is_file()
+               for path in paths)
+
 def dense_metrics():
     return dict((key, value) for key, value in METRICS.items() if key.startswith('weighted_endpoint_'))
 
@@ -185,6 +193,14 @@ elif command[2] in {'morphflow', 'morphany3d', 'interp3d'}:
         output = root / method / pair['pair_dir']
         output.mkdir(parents=True, exist_ok=True)
         (output / 'raw.done').write_text(str(len(plan['alphas']))+' appearance-aware intermediates')
+        paths = [output / ('alpha_' + str(i)) / 'mesh_raw.pt' for i in range(len(plan['alphas']))]
+        if method == 'morphflow':
+            paths.extend(root / 'references_raw' / pair['pair_dir'] / (source + '_raw.pt')
+                         for source in ('src1', 'src2'))
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'fake mesh and Gaussian payload')
+            write_json(path.with_suffix('.appearance.json'), dict(format_version=2, appearance='trellis_gaussian'))
     timing = root / 'timings' / (method + '_shard_' + option('--shard-index') + '.jsonl')
     timing.parent.mkdir(parents=True, exist_ok=True)
     timing.write_text('{}\n')
@@ -218,7 +234,10 @@ elif command[2] == 'shard':
     plan = plan_for(method_root.parent)
     assert (len(plan['alphas']) == 48) == dense
     pairs = selected(plan)
-    assert all(complete_glbs(method_root.parent, method_root.name, pair) for pair in pairs)
+    assert all(complete_raws(method_root.parent, method_root.name, pair) for pair in pairs)
+    manifest = json.loads((translate('/benchmark') / 'run_manifest.json').read_text())
+    if manifest['configuration']['EXPORT_GLB']:
+        assert all(complete_glbs(method_root.parent, method_root.name, pair) for pair in pairs)
     output = translate(option('--output-dir'))
     write_json(output / ('fake_shard_' + option('--shard-index') + '.json'), [pair['pair_id'] for pair in pairs])
 elif command[2] == 'merge':
@@ -298,6 +317,7 @@ class LauncherTests(unittest.TestCase):
             if key.startswith("BASH_FUNC_") or key in {"BASH_ENV", "ENV"}:
                 self.env.pop(key)
         self.env.pop("CONFIG_FILE", None)
+        self.env.pop("EXPORT_GLB", None)
         self.env.update({
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "HOST_PYTHON": sys.executable, "PROJECT_DIR": str(self.project),
@@ -378,6 +398,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result[0], 0, result[1] + "\n" + result[2])
 
     def test_full_test_eight_gpu_two_cfg_grid_preserves_protocol_and_all_glbs(self):
+        self.env['EXPORT_GLB'] = '1'
         self.assert_success(self.run_launcher())
         calls = self.calls()
         grouped = {}
@@ -436,6 +457,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('weighted_endpoint_lpips_mean', {row['metric'] for row in rows})
 
     def test_dense_weighted_fifty_frames_adds_separate_workload_without_repeating_baselines_per_cfg(self):
+        self.env['EXPORT_GLB'] = '1'
         self.env['WEIGHTED_DENSE'] = '1'
         self.assert_success(self.run_launcher(timeout=45))
         calls = self.calls()
@@ -516,6 +538,70 @@ class LauncherTests(unittest.TestCase):
             archived_cell = dense_archive/('cfg_ss_'+cfg+'_slat_1.5')
             self.assertTrue((archived_cell/'final_metrics.json').is_file())
             self.assertTrue((archived_cell/'weighted_endpoint_lpips/evolution.png').is_file())
+
+    def assert_raw_only_workloads(self, dense):
+        self.env['WEIGHTED_DENSE'] = str(int(dense))
+        # Leave EXPORT_GLB unset to exercise the production default.
+        self.assertNotIn('EXPORT_GLB', self.env)
+        self.assert_success(self.run_launcher(timeout=45))
+        calls = self.calls()
+        operations = [self.operation(row) for row in calls]
+        self.assertNotIn('texture', operations)
+        self.assertNotIn('texture-status', operations)
+        self.assertEqual(operations.count('morphflow'), 16 * (1 + int(dense)))
+        for method in ('morphany3d', 'interp3d'):
+            self.assertEqual(operations.count(method), 8 * (1 + int(dense)))
+        self.assertEqual(operations.count('shard'), 32 * (1 + int(dense)))
+        self.assertEqual(operations.count('merge'), 4 * (1 + int(dense)))
+        self.assertEqual(operations.count('aggregate'), 2 * (1 + int(dense)))
+        manifest = json.loads((self.run_root / 'run_manifest.json').read_text())
+        self.assertEqual(manifest['configuration']['EXPORT_GLB'], 0)
+        self.assertEqual(manifest['asset_export'], {
+            'glb_enabled': False,
+            'raw_mesh_and_gaussian': True,
+            'glb_can_be_baked_later': True,
+        })
+        self.assertEqual(list(self.run_root.rglob('*.glb')), [])
+        self.assertEqual(list(self.run_root.rglob('texture_status.json')), [])
+        archive = Path(self.env['FINAL_ARCHIVE'])
+        self.assertEqual(list(archive.rglob('*.glb')), [])
+        self.assertEqual(list(archive.rglob('texture_status.json')), [])
+        roots = [(self.run_root, archive, 5)]
+        if dense:
+            roots.append((self.run_root / 'weighted_50', archive / 'weighted_50', 48))
+        for root, saved, k in roots:
+            for cfg in ('2', '5'):
+                cell = root / ('cfg_ss_' + cfg + '_slat_1.5')
+                raw_paths = list((cell / 'morphflow').glob('pair_*/alpha_*/mesh_raw.pt'))
+                self.assertEqual(len(raw_paths), 10 * k)
+                self.assertTrue(all(p.with_suffix('.appearance.json').is_file() for p in raw_paths))
+                for method in ('morphany3d', 'interp3d'):
+                    self.assertTrue((cell / method).is_symlink())
+                    self.assertEqual((cell / method).resolve(), root / 'shared' / method)
+                    raw_paths = list((cell / method).glob('pair_*/alpha_*/mesh_raw.pt'))
+                    self.assertEqual(len(raw_paths), 10 * k)
+                    self.assertTrue(all(p.with_suffix('.appearance.json').is_file() for p in raw_paths))
+                self.assertTrue((saved / cell.name / 'final_metrics.json').is_file())
+            references = list((root / 'shared/references_raw').glob('pair_*/*_raw.pt'))
+            self.assertEqual(len(references), 20)
+            self.assertTrue(all(p.with_suffix('.appearance.json').is_file() for p in references))
+            grid = json.loads((root / 'cfg_grid_metrics.json').read_text())
+            self.assertEqual((grid['completed_configurations'], grid['expected_configurations']), (2, 2))
+            with (saved / 'cfg_grid_metrics.csv').open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertIn('weighted_endpoint_lpips_mean', {row['metric'] for row in rows})
+            if k == 5:
+                self.assertIn('fid_endpoint_manifold', {row['metric'] for row in rows})
+                self.assertIn('fid_endpoint_manifold_mean_per_state', {row['metric'] for row in rows})
+            else:
+                self.assertTrue(all(row['metric'].startswith('weighted_endpoint_') for row in rows))
+            self.assertTrue((saved / 'weighted_endpoint_lpips/evolution.pdf').is_file())
+
+    def test_default_raw_only_runs_standard_metrics_without_any_glb_export(self):
+        self.assert_raw_only_workloads(dense=False)
+
+    def test_default_raw_only_runs_both_protocols_with_shared_baselines_and_all_raws(self):
+        self.assert_raw_only_workloads(dense=True)
 
     def test_insufficient_cuda_allocation_fails_before_generation(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-test-0,GPU-test-1"
