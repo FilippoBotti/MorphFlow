@@ -385,3 +385,52 @@ Solo i riepiloghi compatti vengono copiati in
 Rilanciare con lo stesso RUN_NAME/configurazione riprende coppie, GLB e metriche
 completati. Un lock impedisce scritture concorrenti. Cambiare codice, metadati,
 CFG o parametri richiede un nuovo nome; gli output precedenti sono preservati.
+
+## Confronti PNG della vista 025
+
+Per confrontare una cella CFG usando i PNG gia' renderizzati, senza nuove
+generazioni o metriche, eseguire dal checkout MorphFlow sull'Ateneo:
+
+```bash
+RUN=/hpc/scratch/marco.barezzi/morph-benchmark/threeway-runs/NOME_RUN
+bash slurm/compare_threeway_pngs_l40s.sh "$RUN" 5 1.5
+
+# Solo due coppie, eventualmente mentre il benchmark sta ancora terminando:
+bash slurm/compare_threeway_pngs_l40s.sh "$RUN" 5 1.5 \
+  --pair 0 --pair 12 --skip-incomplete
+```
+
+Il wrapper usa soltanto CPU e il Python dell'env MorphAny3D esistente, montato
+in sola lettura nello stesso container; non installa pacchetti. Ogni coppia
+produce una tavola con tre righe (MorphFlow, MorphAny3D, Interp3D) e sette colonne:
+sorgente 1, cinque intermedi del protocollo Interp3D originale, sorgente 2.
+Usa sempre il file `025.png`, indicizzato da zero, con gli alpha reali del piano
+e ordine `alpha=1 -> alpha=0`. Il protocollo aggiuntivo `weighted_50` e' escluso.
+La vista 025 e' una camera Hammersley fissa; l'orientamento frontale dipende
+dall'oggetto. I PNG sorgente restano nella run scratch; l'archivio compatto non
+contiene i rendering.
+
+Output predefinito: `$RUN/comparisons/cfg_ss_5_slat_1.5/view_025/`.
+Per scegliere un'altra destinazione, anteporre `COMPARISON_OUT=/percorso/output`
+al comando. `--tile-size 256` controlla le dimensioni delle immagini nelle
+tavole; `--overwrite` permette di sostituire confronti gia' presenti.
+Senza `--pair` vengono elaborate tutte le coppie. Se mancano immagini il comando
+segnala il problema; `--skip-incomplete` permette di saltare le coppie incomplete.
+Un PNG di confronto gia' presente viene preservato e segnalato: aggiungere
+`--overwrite` per rigenerarlo esplicitamente, anche dopo aver cambiato le dimensioni.
+
+Per i benchmark gia' presenti su **CINECA Leonardo**, usare il lanciatore locale
+che richiama `envs/morphflow/bin/python` della workspace, senza container o GPU:
+
+```bash
+cd /leonardo_work/IscrC_MORPHFL/mbarezzi/src/MorphFlow
+RUN=/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/threeway_benchmark/threeway_v4_ss13_slat6_n30_beta5_cfg235_slat15225_20261017
+bash slurm/compare_threeway_pngs_leonardo.sh "$RUN" 5 1.5
+
+# Una sola coppia:
+bash slurm/compare_threeway_pngs_leonardo.sh "$RUN" 5 1.5 --pair 0 --overwrite
+```
+
+Le opzioni e la struttura di output sono le stesse del lanciatore Ateneo.
+`COMPARISON_PYTHON=/percorso/python` seleziona un altro Python gia' dotato di
+Pillow; `COMPARISON_OUT=/percorso/output` cambia la destinazione.

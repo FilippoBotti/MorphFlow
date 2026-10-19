@@ -57,6 +57,9 @@ def cfg_values(value):
 
 
 def requested_configuration(env):
+    backend = env.get("EXECUTION_BACKEND", "container")
+    if backend not in {"container", "native"}:
+        raise ValueError("EXECUTION_BACKEND must be container or native")
     for key, expected in PROTOCOL.items():
         if env.get(key, expected) != expected:
             raise ValueError("{}={} changes the paper protocol; expected {}".format(key, env[key], expected))
@@ -87,9 +90,17 @@ def requested_configuration(env):
         "EXPORT_GLB": int(env.get("EXPORT_GLB", "0")),
         "SOURCE_IMAGE_FILENAME": env.get("SOURCE_IMAGE_FILENAME", ""),
     })
-    for key in ("PROJECT_DIR", "DATA_ROOT_HOST", "SOURCE_IMAGES_ROOT_HOST", "CHECKPOINT_PATH",
-                "SLAT_CHECKPOINT_PATH", "ORIGINAL_ENV", "MORPHANY_ENV", "INTERP_ENV", "SIF",
-                "TRELLIS_REPO_HOST", "MORPHANY_REPO", "INTERP_REPO", "PROTOCOL_PYTHON"):
+    paths = ["PROJECT_DIR", "DATA_ROOT_HOST", "SOURCE_IMAGES_ROOT_HOST", "CHECKPOINT_PATH",
+             "SLAT_CHECKPOINT_PATH", "ORIGINAL_ENV", "MORPHANY_ENV", "INTERP_ENV",
+             "TRELLIS_REPO_HOST", "MORPHANY_REPO", "INTERP_REPO"]
+    if backend == "native":
+        configuration["EXECUTION_BACKEND"] = "native"
+        if env.get("DATASET_INPUT_ROOT"):
+            paths.append("DATASET_INPUT_ROOT")
+    else:
+        # Keep existing container manifests byte-for-byte compatible on resume.
+        paths.extend(("SIF", "PROTOCOL_PYTHON"))
+    for key in paths:
         configuration[key] = str(Path(env[key]).resolve())
     metadata = Path(env.get("METADATA", "metadata_test.json"))
     if not metadata.is_absolute():
@@ -169,7 +180,7 @@ def prepare(args):
     sources = {name: digest(path) for name, path in files.items()}
     inputs = {"metadata": digest(config["METADATA_HOST"])}
     splits = {name: Path(config["DATA_ROOT_HOST"]) / name
-              for name in ("split_assets.json", "splits.json")}
+              for name in ("split_assets.json", "splits.json", "dataset_provenance.json")}
     for name, split in splits.items():
         if split.is_file():
             inputs[name] = digest(split)

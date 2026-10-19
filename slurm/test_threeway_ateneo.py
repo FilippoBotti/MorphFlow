@@ -76,6 +76,32 @@ class AteneoLayoutTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ateneo.cfg_values(value)
 
+    def test_native_configuration_uses_same_grid_without_container_paths(self):
+        environment = dict(self.env, EXECUTION_BACKEND="native", DATASET_INPUT_ROOT=str(self.base / "original-images"))
+        del environment["SIF"]
+        del environment["PROTOCOL_PYTHON"]
+        configuration = ateneo.requested_configuration(environment)
+        self.assertEqual(configuration["EXECUTION_BACKEND"], "native")
+        self.assertEqual(configuration["DATASET_INPUT_ROOT"], str(self.base / "original-images"))
+        self.assertEqual(configuration["N"], 0)
+        self.assertEqual(configuration["FID_AGGREGATION"], "both")
+        self.assertNotIn("SIF", configuration)
+        self.assertNotIn("PROTOCOL_PYTHON", configuration)
+        # The default must preserve the existing container manifest shape.
+        self.assertNotIn("EXECUTION_BACKEND", ateneo.requested_configuration(self.env))
+
+    def test_native_dataset_provenance_is_frozen_and_checked_on_resume(self):
+        self.env["EXECUTION_BACKEND"] = "native"
+        del self.env["SIF"]
+        del self.env["PROTOCOL_PYTHON"]
+        provenance = self.data / "dataset_provenance.json"
+        provenance.write_text('{"endpoint_seed":42}\n')
+        self.prepare()
+        self.assertEqual((self.root / "input_snapshot/dataset_provenance.json").read_bytes(), provenance.read_bytes())
+        provenance.write_text('{"endpoint_seed":43}\n')
+        with self.assertRaisesRegex(ValueError, "Code or test metadata changed"):
+            self.prepare()
+
     def test_fixed_protocol_counts_cannot_silently_drift(self):
         for key, value in (("K", "7"), ("NUM_VIEWS", "32"), ("FID_NUM_VIEWS", "64"), ("FID_AGGREGATION", "concatenated")):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "paper protocol"):
