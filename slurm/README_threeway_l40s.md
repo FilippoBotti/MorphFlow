@@ -90,10 +90,39 @@ Gli ambienti esistenti sono montati in sola lettura, sempre come `/opt/trellis/e
 Ogni processo importa un solo fork TRELLIS dal proprio `/workspace/MethodRepo`.
 Toolchain CUDA 11.8/GCC11: `$BENCH_ROOT/morphany3d/toolchain/cuda118-gcc11`.
 Cache: `$BENCH_ROOT/shared-cache/{hf-home,torch-home,u2net}`. `pytorch-fid==0.3.0`
-viene preparato, se necessario, in un overlay Python distinto
-`$BENCH_ROOT/protocol-python`; gli env di training non vengono modificati.
+viene preparato, se necessario, in `$BENCH_ROOT/protocol-python`. Il renderer
+`diff_gaussian_rasterization` viene verificato e, se manca o e' incompatibile,
+compilato in un overlay separato sotto `protocol-python/gaussian`; gli env di
+training e baseline restano in sola lettura. La sorgente e' il fork mip-splatting
+usato da TRELLIS, commit `dda02ab5ecf45d6edb8c540d9bb65c7e451345a9` di
+`autonomousvision/mip-splatting`, sottodirectory `submodules/diff-gaussian-rasterization`.
+Il controllo richiede anche i campi `kernel_size` e `subpixel_offset`, specifici
+di questa variante. La normale estensione Graphdeco non e' un sostituto compatibile.
+
+La compilazione usa Torch dell'env MorphAny3D, CUDA 11.8/GCC11 e architettura
+L40S 8.9 esplicita, quindi puo' avvenire sul login senza GPU. Le sorgenti sono
+conservate sotto `$BENCH_ROOT/gaussian-build`; `GAUSSIAN_BUILD_JOBS=2` limita i
+processi di compilazione. L'overlay e' pubblicato solo dopo un import verificato
+e conserva metadati ABI per evitare il riuso con Torch/CUDA/Python incompatibili.
+Le wheel compilate su Leonardo con CUDA 12.1 non vengono riutilizzate su Ateneo.
+
 Il preparatore verifica anche gli hash dei pesi canonici Inception FID e VGG16.
 Il batch esegue nuovamente il controllo offline, senza installazioni/download.
+Nel controllo GPU viene renderizzata una Gaussian di prova prima di avviare i
+worker. Questo renderer serve alle metriche anche quando `EXPORT_GLB=0`.
+
+Se un job termina con `ModuleNotFoundError: diff_gaussian_rasterization`, dopo
+aver aggiornato **tutto** il checkout (incluso `slurm/prepare_gaussian_rasterizer.py`):
+
+```bash
+cd "$HOME/trellis-singularity/work/MorphFlow"
+bash slurm/prepare_threeway_interp3d_l40s.sh --prepare
+bash slurm/prepare_threeway_interp3d_l40s.sh --check
+```
+
+Il primo comando puo' impiegare diversi minuti per compilare. Poi usare un nuovo
+RUN_NAME per il benchmark: il codice della run fallita e' gia' stato congelato e
+la ripresa rileva correttamente il cambiamento dei sorgenti.
 
 Dataset predefinito: `/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4`;
 immagini: directory sorella `flux_outputs`. **N=0 significa tutte le coppie uniche

@@ -11,15 +11,18 @@ case "$MODE" in
 Usage: bash slurm/prepare_threeway_interp3d_l40s.sh [--prepare|--check]
 
 Run --prepare once on an Ateneo login node with internet access. It installs
-pytorch-fid 0.3.0 into a separate pure Python overlay only when needed, then
-caches and verifies the canonical FID Inception and VGG16 LPIPS backbone weights.
+pytorch-fid 0.3.0 and the TRELLIS mip-splatting Gaussian rasterizer in separate
+evaluation overlays only when needed, then caches and verifies canonical weights.
+The rasterizer is compiled for L40S with the existing CUDA 11.8/GCC11 toolchain;
+no GPU is required for compilation when the target CUDA architecture is explicit.
 The existing Conda environments are always mounted read-only.
 
 --check is offline: it verifies imports and full SHA256 hashes of cached weights.
 It does not download assets or install packages. No GPU is required.
 
 Optional variables: BENCH_ROOT, SIF, MORPHANY_ENV, SHARED_CACHE,
-PROTOCOL_PYTHON (default: $BENCH_ROOT/protocol-python).
+PROTOCOL_PYTHON (default: $BENCH_ROOT/protocol-python), TOOLCHAIN_ROOT_HOST,
+GAUSSIAN_CUDA_ARCH_LIST (default: 8.9), GAUSSIAN_BUILD_JOBS (default: 2).
 HELP
         exit 0 ;;
     *) echo "ERROR: expected --prepare, --check, or --help" >&2; exit 2 ;;
@@ -31,6 +34,10 @@ SIF="${SIF:-$HOME/containers/trellis-py240-cu118.sif}"
 MORPHANY_ENV="${MORPHANY_ENV:-$BENCH_ROOT/morphany3d/env}"
 SHARED_CACHE="${SHARED_CACHE:-$BENCH_ROOT/shared-cache}"
 PROTOCOL_PYTHON="${PROTOCOL_PYTHON:-$BENCH_ROOT/protocol-python}"
+TOOLCHAIN_ROOT_HOST="${TOOLCHAIN_ROOT_HOST:-$BENCH_ROOT/morphany3d/toolchain/cuda118-gcc11}"
+GAUSSIAN_CUDA_ARCH_LIST="${GAUSSIAN_CUDA_ARCH_LIST:-8.9}"
+GAUSSIAN_BUILD_JOBS="${GAUSSIAN_BUILD_JOBS:-2}"
+GAUSSIAN_PREPARER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/prepare_gaussian_rasterizer.py"
 
 [[ "$PROTOCOL_PYTHON" = /* && "$PROTOCOL_PYTHON" != / ]] || {
     echo "ERROR: PROTOCOL_PYTHON must be an absolute directory path other than /" >&2
@@ -38,6 +45,8 @@ PROTOCOL_PYTHON="${PROTOCOL_PYTHON:-$BENCH_ROOT/protocol-python}"
 }
 [[ -f "$SIF" ]] || { echo "ERROR: missing container: $SIF" >&2; exit 1; }
 [[ -d "$MORPHANY_ENV" ]] || { echo "ERROR: missing existing environment: $MORPHANY_ENV" >&2; exit 1; }
+[[ -d "$TOOLCHAIN_ROOT_HOST" ]] || { echo "ERROR: missing CUDA 11.8/GCC11 toolchain: $TOOLCHAIN_ROOT_HOST" >&2; exit 1; }
+[[ -f "$GAUSSIAN_PREPARER" ]] || { echo "ERROR: missing helper: $GAUSSIAN_PREPARER; update the complete MorphFlow checkout" >&2; exit 1; }
 if [[ "$MODE" == --check ]]; then
     for directory in "$PROTOCOL_PYTHON" "$SHARED_CACHE/torch-home"; do
         [[ -d "$directory" ]] || {
@@ -66,11 +75,13 @@ export SINGULARITYENV_PYTHONDONTWRITEBYTECODE=1
 
 singularity exec --cleanenv --containall --no-mount hostfs \
     --bind "$MORPHANY_ENV:/opt/trellis/env:ro" \
+    --bind "$TOOLCHAIN_ROOT_HOST:/opt/trellis/toolchain/cuda118-gcc11:ro" \
+    --bind "$GAUSSIAN_PREPARER:/prepare_gaussian_rasterizer.py:ro" \
     --bind "$OVERLAY_PARENT:/protocol-overlay-parent:rw" \
     --bind "$SHARED_CACHE/torch-home:/opt/trellis/torch-home:rw" \
     --bind "$RUNTIME_ROOT/home:/runtime-home:rw" \
     --bind "$RUNTIME_ROOT/tmp:/runtime-tmp:rw" \
-    "$SIF" bash -s -- "$MODE" "$OVERLAY_NAME" <<'IN_CONTAINER'
+    "$SIF" bash -s -- "$MODE" "$OVERLAY_NAME" "$GAUSSIAN_CUDA_ARCH_LIST" "$GAUSSIAN_BUILD_JOBS" <<'IN_CONTAINER'
 set -euo pipefail
 source /opt/conda/etc/profile.d/conda.sh
 conda activate /opt/trellis/env
@@ -84,6 +95,12 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export CUDA_HOME=/opt/trellis/toolchain/cuda118-gcc11
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export CC="$CUDA_HOME/bin/x86_64-conda-linux-gnu-gcc" CXX="$CUDA_HOME/bin/x86_64-conda-linux-gnu-g++"
+export CUDAHOSTCXX="$CXX" PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="$3" MAX_JOBS="$4"
 exec python - "$@" <<'PY'
 import hashlib
 import importlib
@@ -141,6 +158,15 @@ import torch
 import torchvision
 import lpips
 from pytorch_fid.inception import FID_WEIGHTS_URL
+
+# A CPU import of GaussianRenderer alone does not exercise this lazy native
+# dependency. Install/probe the exact mip-splatting API before allocating GPUs.
+subprocess.run([
+    sys.executable, '/prepare_gaussian_rasterizer.py',
+    '--prepare' if prepare else '--check',
+    '--overlay', str(overlay / 'gaussian'),
+    '--source-root', '/protocol-overlay-parent/gaussian-build',
+], check=True)
 
 if fid_version() != expected_version:
     raise SystemExit('Unexpected pytorch-fid version after preparation')

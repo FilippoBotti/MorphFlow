@@ -217,7 +217,7 @@ export CUDAHOSTCXX="$CXX" PATH="$CUDA_HOME/bin:$PATH" LD_LIBRARY_PATH="$CUDA_HOM
 export TORCH_EXTENSIONS_DIR=/opt/trellis/torch-home/extensions/nvdiffrast-035 MAX_JOBS=2
 export ATTN_BACKEND=xformers SPCONV_ALGO=native PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRELLIS_REPO=/workspace/MethodRepo PYTHONPATH=/workspace/MethodRepo:/workspace/MorphFlow:/opt/protocol-python
+export TRELLIS_REPO=/workspace/MethodRepo PYTHONPATH=/workspace/MethodRepo:/workspace/MorphFlow:/opt/protocol-python/gaussian:/opt/protocol-python
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 exec "$@"
 IN_CONTAINER
@@ -277,11 +277,11 @@ for spec in "main|$ORIGINAL_ENV|$SNAPSHOT/TRELLIS" "morphany3d|$MORPHANY_ENV|$SN
 done
 if [[ "$EXPORT_GLB" == 1 ]]; then
     run_container preflight_export "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" "$preflight_gpu" python -c \
-        'import sys; import lpips, pytorch_fid, scipy, xatlas, pyvista, pymeshfix, igraph, cv2, diff_gaussian_rasterization; from trellis.utils import postprocessing_utils; import nvdiffrast.torch as dr; dr.RasterizeCudaContext() if sys.argv[1]=="gpu" else None; print("Gaussian renderer, GLB baking and metric imports OK")' \
+        'import sys, runpy; import lpips, pytorch_fid, scipy, xatlas, pyvista, pymeshfix, igraph, cv2, diff_gaussian_rasterization; from trellis.utils import postprocessing_utils; import nvdiffrast.torch as dr; dr.RasterizeCudaContext() if sys.argv[1]=="gpu" else None; runpy.run_path("/workspace/MorphFlow/slurm/prepare_gaussian_rasterizer.py")["smoke_gpu"]() if sys.argv[1]=="gpu" else None; print("Gaussian renderer, GLB baking and metric imports OK")' \
         "$([[ "$MODE" == --run ]] && echo gpu || echo cpu)"
 else
     run_container preflight_metrics "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" "$preflight_gpu" python -c \
-        'import lpips, pytorch_fid, scipy, diff_gaussian_rasterization; from trellis.utils import render_utils; print("Gaussian renderer and metric imports OK; GLB baking deferred")' \
+        'import sys, runpy; import lpips, pytorch_fid, scipy, diff_gaussian_rasterization; from trellis.utils import render_utils; runpy.run_path("/workspace/MorphFlow/slurm/prepare_gaussian_rasterizer.py")["smoke_gpu"]() if sys.argv[1]=="gpu" else None; print("Gaussian renderer and metric imports OK; GLB baking deferred")' \
         "$([[ "$MODE" == --run ]] && echo gpu || echo cpu)"
 fi
 run_container fid_weights "$MORPHANY_ENV" "$SNAPSHOT/MorphAny3D" cpu python "$EVAL_IN" check-fid-weights

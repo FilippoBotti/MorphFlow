@@ -38,12 +38,15 @@ for position, value in enumerate(argv):
         binds[guest] = host
 bash = argv.index('bash')
 command = argv[argv.index('--', bash) + 1:]
-# Discard the actual container bootstrap, which belongs inside Singularity.
-sys.stdin.read()
+# The shell is not executed by the fake runtime, but its package search path
+# still has to expose the separately compiled Gaussian rasterizer overlay.
+bootstrap = sys.stdin.read()
+gaussian_overlay_enabled = '/opt/protocol-python/gaussian' in bootstrap
 
 def record(event, **extra):
     value = dict(event=event, command=command, bindings=binds,
-                 gpu=os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES'), pid=os.getpid())
+                 gpu=os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES'), pid=os.getpid(),
+                 gaussian_overlay_enabled=gaussian_overlay_enabled)
     value.update(extra)
     with open(os.environ['FAKE_CONTAINER_JOURNAL'], 'a') as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -117,8 +120,12 @@ METRICS = {
 if command[0] == '--check':
     # The separate protocol preparation helper is itself invoked by the launcher.
     assert '/protocol-overlay-parent' in binds and '/opt/trellis/env' in binds
+    assert '/prepare_gaussian_rasterizer.py' in binds
+    assert translate('/prepare_gaussian_rasterizer.py').is_file()
+    assert '/opt/trellis/toolchain/cuda118-gcc11' in binds
     print('Fake offline protocol preparation verified')
 elif command[:2] == ['python', '-c']:
+    assert gaussian_overlay_enabled
     if 'detect_flow_target' in command[2]:
         assert translate('/checkpoints/ss/checkpoint.pt').read_bytes().startswith(b'SS')
         assert translate('/checkpoints/slat/checkpoint.pt').read_bytes().startswith(b'SLat')
@@ -284,7 +291,8 @@ class LauncherTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.project = self.root / "project"
         (self.project / "slurm").mkdir(parents=True)
-        for filename in ("benchmark_threeway_interp3d_l40s.slurm", "threeway_ateneo.py", "prepare_threeway_interp3d_l40s.sh"):
+        for filename in ("benchmark_threeway_interp3d_l40s.slurm", "threeway_ateneo.py", "prepare_threeway_interp3d_l40s.sh",
+                         "prepare_gaussian_rasterizer.py"):
             shutil.copyfile(str(SLURM_DIR / filename), str(self.project / "slurm" / filename))
         (self.project / "benchmarks").mkdir()
         for filename in ("threeway_textured_benchmark.py", "eval_textured_benchmark.py", "weighted_endpoint_report.py"):
@@ -397,10 +405,28 @@ class LauncherTests(unittest.TestCase):
     def assert_success(self, result):
         self.assertEqual(result[0], 0, result[1] + "\n" + result[2])
 
+    def assert_gaussian_runtime_prepared(self, calls):
+        preparation = [row for row in calls if row['command'][0] == '--check']
+        self.assertEqual(len(preparation), 1)
+        binding = preparation[0]['bindings']['/prepare_gaussian_rasterizer.py']
+        self.assertEqual(Path(binding).read_bytes(),
+                         (self.project / 'slurm/prepare_gaussian_rasterizer.py').read_bytes())
+        workers = [row for row in calls if row not in preparation]
+        self.assertTrue(workers)
+        self.assertTrue(all(row['gaussian_overlay_enabled'] for row in workers))
+        rasterizer_checks = [row for row in workers
+                             if row['command'][:2] == ['python', '-c'] and
+                             'runpy.run_path' in row['command'][2] and
+                             'smoke_gpu' in row['command'][2]]
+        self.assertEqual(len(rasterizer_checks), 1)
+        self.assertEqual(rasterizer_checks[0]['command'][-1], 'gpu')
+        self.assertEqual(rasterizer_checks[0]['gpu'], 'GPU-test-0')
+
     def test_full_test_eight_gpu_two_cfg_grid_preserves_protocol_and_all_glbs(self):
         self.env['EXPORT_GLB'] = '1'
         self.assert_success(self.run_launcher())
         calls = self.calls()
+        self.assert_gaussian_runtime_prepared(calls)
         grouped = {}
         for call in calls:
             grouped.setdefault(self.operation(call), []).append(call)
@@ -461,6 +487,7 @@ class LauncherTests(unittest.TestCase):
         self.env['WEIGHTED_DENSE'] = '1'
         self.assert_success(self.run_launcher(timeout=45))
         calls = self.calls()
+        self.assert_gaussian_runtime_prepared(calls)
         grouped = {}
         for call in calls:
             grouped.setdefault(self.operation(call), []).append(call)
@@ -545,6 +572,7 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('EXPORT_GLB', self.env)
         self.assert_success(self.run_launcher(timeout=45))
         calls = self.calls()
+        self.assert_gaussian_runtime_prepared(calls)
         operations = [self.operation(row) for row in calls]
         self.assertNotIn('texture', operations)
         self.assertNotIn('texture-status', operations)
