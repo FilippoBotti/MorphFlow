@@ -3,6 +3,8 @@
 The host layout/snapshot/summarizer and launcher are real. Only GPU/container
 commands are replaced: their arguments and shard coverage are checked, and small
 artifacts stand in for expensive inference, GLB baking and image metrics.
+Set THREEWAY_TEST_BASH to a Bash 4.2/4.3 executable to exercise the old nounset
+semantics for empty arrays, as used by the Ateneo compute-node shell.
 """
 
 import csv
@@ -375,7 +377,8 @@ class LauncherTests(unittest.TestCase):
         path.chmod(0o755)
 
     def run_launcher(self, mode="--run", timeout=30):
-        command = ["bash", str(self.project / "slurm" / "benchmark_threeway_interp3d_l40s.slurm"), mode]
+        command = [os.environ.get("THREEWAY_TEST_BASH", "bash"),
+                   str(self.project / "slurm" / "benchmark_threeway_interp3d_l40s.slurm"), mode]
         started = time.monotonic()
         process = subprocess.Popen(command, cwd=str(self.project), env=self.env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -681,6 +684,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(len(preflights), 5)
         self.assertTrue(all(row["gpu"] == "" for row in preflights))
         self.assertFalse(any(self.operation(row) in {"morphflow", "morphany3d", "interp3d", "texture", "shard"} for row in calls))
+
+    def test_cpu_check_without_optional_split_files_preserves_isolated_environment_binds(self):
+        (self.dataset / "split_assets.json").unlink()
+        self.env["CUDA_VISIBLE_DEVICES"] = "NoDevFiles"
+        self.env.pop("SLURM_JOB_ID")
+        # Empty GPU allocation, split binds, per-model protocol binds and
+        # cleanup PID arrays must all be valid with set -u, including Bash 4.3.
+        result = self.run_launcher("--check")
+        self.assert_success(result)
+        self.assertIn("CHECK PASSED: 10 pairs", result[1])
+        calls = [row for row in self.calls() if "/workspace/MethodRepo" in row["bindings"]]
+        self.assertTrue(calls)
+        self.assertEqual({row["bindings"]["/opt/trellis/env"] for row in calls},
+                         {self.env[key] for key in ("ORIGINAL_ENV", "MORPHANY_ENV", "INTERP_ENV")})
+        for row in calls:
+            self.assertFalse(any(guest.endswith(("/split_assets.json", "/splits.json"))
+                                 for guest in row["bindings"]))
+            self.assertEqual("/opt/protocol-python" in row["bindings"],
+                             row["bindings"]["/opt/trellis/env"] == self.env["MORPHANY_ENV"])
+        self.assertFalse(list((self.run_root / "check-tmp").glob("threeway-*")))
 
     def test_failed_worker_stops_next_phases_and_terminates_siblings(self):
         self.env["FAKE_FAIL_GENERATION"] = "morphflow"

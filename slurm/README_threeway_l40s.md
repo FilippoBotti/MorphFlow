@@ -35,6 +35,13 @@ bash slurm/benchmark_threeway_interp3d_l40s.slurm --check
 sbatch --export=ALL slurm/benchmark_threeway_interp3d_l40s.slurm
 ```
 
+Il launcher gestisce anche gli array vuoti con `set -u` su Bash 4.2/4.3,
+usato su sistemi HPC meno recenti. Gli argomenti opzionali assenti vengono
+omessi senza creare argomenti vuoti; gli env dei tre modelli restano separati.
+Se una run termina con `protocol_binds[@]: unbound variable`, aggiornare il
+launcher e scegliere un nuovo `RUN_NAME`: la precedente ha gia' congelato
+i sorgenti. Non occorre ripetere `--prepare` per questo errore Bash.
+
 Per la coppia migliore disponibile al 19 ottobre 2026 (SS epoca 13, SLat epoca 9),
 eseguire **dal login Ateneo**; i file sorgente sono snapshot immutabili:
 

@@ -142,7 +142,9 @@ elif [[ "$MODE" == --run ]]; then
     (( ${#GPU_TOKENS[@]} == NGPUS )) || die "No explicit GPU mapping and nvidia-smi count differs from NGPUS."
 fi
 declare -A SEEN_GPU_TOKENS=()
-for gpu in "${GPU_TOKENS[@]}"; do
+# Bash 4.2/4.3 treats an empty array as unset under nounset. The + expansion
+# passes zero arguments when empty, preserving separate quoted values otherwise.
+for gpu in ${GPU_TOKENS[@]+"${GPU_TOKENS[@]}"}; do
     [[ -n "$gpu" && -z "${SEEN_GPU_TOKENS[$gpu]:-}" ]] || die "Empty or duplicate allocated GPU token."
     SEEN_GPU_TOKENS[$gpu]=1
 done
@@ -156,10 +158,8 @@ ACTIVE_PIDS=()
 cleanup() {
     local rc=$?
     trap - EXIT
-    if (( ${#ACTIVE_PIDS[@]} )); then
-        for child in "${ACTIVE_PIDS[@]}"; do kill "$child" 2>/dev/null || true; done
-        for child in "${ACTIVE_PIDS[@]}"; do wait "$child" 2>/dev/null || true; done
-    fi
+    for child in ${ACTIVE_PIDS[@]+"${ACTIVE_PIDS[@]}"}; do kill "$child" 2>/dev/null || true; done
+    for child in ${ACTIVE_PIDS[@]+"${ACTIVE_PIDS[@]}"}; do wait "$child" 2>/dev/null || true; done
     rm -rf -- "$NODE_TMP"
     exit "$rc"
 }
@@ -209,14 +209,14 @@ container_exec() {
         --bind "$repository:/workspace/MethodRepo:ro" \
         --bind "$DATA_PARENT:/inputs:ro" \
         --bind "$DATA_PARENT:$DATA_PARENT:ro" \
-        "${SPLIT_BINDS[@]}" \
+        ${SPLIT_BINDS[@]+"${SPLIT_BINDS[@]}"} \
         --bind "$RUN_ROOT:/benchmark:rw" \
         --bind "$RUN_ROOT/checkpoints/ss:/checkpoints/ss:ro" \
         --bind "$RUN_ROOT/checkpoints/slat:/checkpoints/slat:ro" \
         --bind "$SHARED_CACHE/hf-home:/opt/trellis/hf-home:rw" \
         --bind "$SHARED_CACHE/torch-home:/opt/trellis/torch-home:rw" \
         --bind "$SHARED_CACHE/u2net:/opt/trellis/u2net:rw" \
-        "${protocol_binds[@]}" \
+        ${protocol_binds[@]+"${protocol_binds[@]}"} \
         --bind "$phase_home:/runtime-home:rw" \
         --bind "$phase_tmp:/runtime-tmp:rw" \
         --pwd /workspace/MorphFlow "$SIF" bash -s -- "$@" <<'IN_CONTAINER'
