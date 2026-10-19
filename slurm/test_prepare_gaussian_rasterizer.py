@@ -23,6 +23,9 @@ class PreparationTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.overlay = self.root / "protocol-python/gaussian"
         self.source_root = self.root / "source"
+        self.package = self.root / "cached-package"
+        self.package.mkdir()
+        (self.package / "setup.py").write_text("# pinned fixture\n")
         self.runtime = dict(python=[3, 10], torch="2.4.0+cu118", cuda="11.8",
                             cxx11_abi=False, machine="x86_64", architectures="8.9")
         self.result = dict(runtime=self.runtime, module_file="/fake/module.py", extension_file="/fake/_C.so")
@@ -72,6 +75,11 @@ class PreparationTests(unittest.TestCase):
             self.assertIn("--no-build-isolation", arguments)
             self.assertEqual(kwargs["env"]["TORCH_CUDA_ARCH_LIST"], getattr(self, "expected_architectures", "8.9"))
             self.assertEqual(kwargs["env"]["MAX_JOBS"], getattr(self, "expected_jobs", "2"))
+            package = Path(arguments[-1])
+            self.assertNotEqual(package, self.package)
+            self.assertEqual((package / "setup.py").read_text(), "# pinned fixture\n")
+            for pattern in ("build", "dist", "*.egg-info", "__pycache__"):
+                self.assertEqual(list(package.rglob(pattern)), [])
             wheels = Path(arguments[arguments.index("--wheel-dir") + 1])
             (wheels / "diff_gaussian_rasterization-test.whl").write_bytes(b"test wheel")
         elif "install" in arguments:
@@ -90,7 +98,8 @@ class PreparationTests(unittest.TestCase):
         self.metadata(old_version)
         self.overlay.symlink_to(old_version.name, target_is_directory=True)
         self.source_root.mkdir()
-        with mock.patch.object(helper, "source_package", return_value=self.source_root), \
+        with mock.patch.object(helper, "source_package", return_value=self.package), \
+                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", side_effect=helper.PreparationError("undefined symbol: torch ABI")):
             with self.assertRaisesRegex(helper.PreparationError, "torch ABI"):
@@ -102,7 +111,12 @@ class PreparationTests(unittest.TestCase):
 
     def test_build_publishes_relative_symlink_and_pinned_metadata(self):
         self.source_root.mkdir()
-        with mock.patch.object(helper, "source_package", return_value=self.source_root), \
+        for name in ("build", "dist", "old.egg-info", "__pycache__"):
+            directory = self.package / name
+            directory.mkdir()
+            (directory / "stale.o").write_bytes(b"wrong old environment")
+        with mock.patch.object(helper, "source_package", return_value=self.package), \
+                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=self.result):
             helper.build_overlay(self.overlay, self.source_root)
@@ -113,13 +127,15 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(metadata["source_commit"], helper.SOURCE_COMMIT)
         self.assertEqual(metadata["source_url"], helper.SOURCE_URL)
         self.assertEqual(list(self.source_root.iterdir()), [])
+        self.assertTrue((self.package / "build/stale.o").is_file())
 
     def test_atomic_replacement_keeps_previous_version_available(self):
         old_version = self.overlay.parent / ".gaussian-old"
         self.metadata(old_version)
         self.overlay.symlink_to(old_version.name, target_is_directory=True)
         self.source_root.mkdir()
-        with mock.patch.object(helper, "source_package", return_value=self.source_root), \
+        with mock.patch.object(helper, "source_package", return_value=self.package), \
+                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=self.result):
             helper.build_overlay(self.overlay, self.source_root)
@@ -131,7 +147,8 @@ class PreparationTests(unittest.TestCase):
         self.expected_architectures, self.expected_jobs = "8.9+PTX", "3"
         overridden = dict(self.result, runtime=dict(self.runtime, architectures="8.9+PTX"))
         with mock.patch.dict(os.environ, {"TORCH_CUDA_ARCH_LIST": "8.9+PTX", "MAX_JOBS": "3"}), \
-                mock.patch.object(helper, "source_package", return_value=self.source_root), \
+                mock.patch.object(helper, "source_package", return_value=self.package), \
+                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=overridden):
             helper.build_overlay(self.overlay, self.source_root)
@@ -216,6 +233,190 @@ class PreparationTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"torch": torch, "diff_gaussian_rasterization": module}):
             with self.assertRaisesRegex(helper.PreparationError, "invalid image"):
                 helper.smoke_gpu()
+
+
+class ToolchainTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="gaussian_toolchain_test_")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.cuda = self.root / "cuda"
+        self.compiler = str(self.cuda / "bin/x86_64-conda-linux-gnu-g++")
+        self.nvcc = str(self.cuda / "bin/nvcc")
+        self.environment = dict(CUDA_HOME=str(self.cuda), CUDACXX=self.nvcc,
+                                CC=str(self.cuda / "bin/x86_64-conda-linux-gnu-gcc"),
+                                CXX=self.compiler, TORCH_CUDA_ARCH_LIST="8.9",
+                                CONDA_PREFIX="/model-specific/env", PATH="/model-specific/env/bin")
+        self.calls = []
+        self.header_failures = set()
+        self.cuda_failures = set()
+        self.available = {self.compiler, self.nvcc, "/usr/bin/g++"}
+
+    def fake_which(self, name, **kwargs):
+        return name if name in self.available else None
+
+    def fake_command(self, arguments, **kwargs):
+        self.calls.append((arguments, dict(kwargs.get("env", {}))))
+        compiler = arguments[0]
+        if "-dumpfullversion" in arguments:
+            return "11.4.0\n"
+        if "-dumpmachine" in arguments:
+            return "x86_64-conda-linux-gnu\n"
+        if "--version" in arguments:
+            return "g++ (fixture GCC) 11.4.0\n"
+        if "-E" in arguments:
+            self.assertIn("#include <cfloat>", kwargs["input"])
+            if compiler in self.header_failures and not kwargs["env"].get("CPLUS_INCLUDE_PATH"):
+                raise helper.PreparationError("fatal error: cfloat: No such file or directory")
+            return "preprocessed C++\n"
+        if compiler == self.nvcc:
+            selected = arguments[arguments.index("-ccbin") + 1]
+            self.assertNotIn("--allow-unsupported-compiler", arguments)
+            self.assertEqual(kwargs["env"]["CC"], selected)
+            self.assertEqual(kwargs["env"]["CXX"], selected)
+            self.assertEqual(kwargs["env"]["CUDAHOSTCXX"], selected)
+            self.assertIn("arch=compute_89,code=sm_89", arguments)
+            if selected in self.cuda_failures:
+                raise helper.PreparationError("nvcc rejected unsupported host compiler")
+            Path(arguments[arguments.index("-o") + 1]).write_bytes(b"real compile fixture object")
+            return ""
+        self.fail("Unexpected compiler command: " + repr(arguments))
+
+    def configure(self):
+        with mock.patch.object(helper.shutil, "which", side_effect=self.fake_which), \
+                mock.patch.object(helper, "run_command", side_effect=self.fake_command):
+            return helper.configure_build_toolchain(self.environment, self.root / "probe")
+
+    def test_existing_compiler_keeps_model_env_and_torch_uses_verified_gxx(self):
+        original = dict(self.environment)
+        configured = self.configure()
+        self.assertEqual(self.environment, original)
+        self.assertEqual(configured["CONDA_PREFIX"], "/model-specific/env")
+        self.assertEqual(configured["PATH"], original["PATH"])
+        self.assertEqual(configured["CC"], self.compiler)
+        self.assertNotIn("CPLUS_INCLUDE_PATH", configured)
+        self.assertEqual(sum(args[0] == self.nvcc for args, _ in self.calls), 1)
+
+    def test_missing_cfloat_recovers_only_matching_version_and_target_headers(self):
+        self.header_failures.add(self.compiler)
+        base = self.cuda / "x86_64-conda-linux-gnu/include/c++/11.4.0"
+        base.mkdir(parents=True)
+        (base / "cfloat").write_text("// standard C++ header")
+        (base / "x86_64-conda-linux-gnu").mkdir()
+        (base / "backward").mkdir()
+        configured = self.configure()
+        self.assertEqual(configured["CC"], self.compiler)
+        self.assertEqual(configured["CPLUS_INCLUDE_PATH"].split(os.pathsep),
+                         [str(base), str(base / "x86_64-conda-linux-gnu"), str(base / "backward")])
+        self.assertTrue(any(args[0] == self.nvcc for args, _ in self.calls))
+
+    def test_missing_headers_selects_system_compiler_only_after_real_nvcc_probe(self):
+        self.header_failures.add(self.compiler)
+        configured = self.configure()
+        self.assertEqual(configured["CC"], "/usr/bin/g++")
+        probes = [args for args, _ in self.calls if args[0] == self.nvcc]
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0][probes[0].index("-ccbin") + 1], "/usr/bin/g++")
+
+    def test_header_success_does_not_accept_nvcc_failure(self):
+        self.cuda_failures.add(self.compiler)
+        configured = self.configure()
+        self.assertEqual(configured["CC"], "/usr/bin/g++")
+        self.assertEqual(sum(args[0] == self.nvcc for args, _ in self.calls), 2)
+
+    def test_different_gcc_version_headers_are_not_used_and_all_fail_actionably(self):
+        self.header_failures.add(self.compiler)
+        self.cuda_failures.add("/usr/bin/g++")
+        wrong = self.cuda / "include/c++/10.3.0"
+        wrong.mkdir(parents=True)
+        (wrong / "cfloat").write_text("// incompatible GCC header")
+        with self.assertRaisesRegex(helper.PreparationError, "GCC/G\\+\\+ and matching libstdc\\+\\+ development headers"):
+            self.configure()
+        self.assertFalse(any(env.get("CPLUS_INCLUDE_PATH") for _, env in self.calls))
+
+    def test_no_nvcc_object_is_not_success(self):
+        real_fake = self.fake_command
+
+        def no_object(arguments, **kwargs):
+            result = real_fake(arguments, **kwargs)
+            if arguments[0] == self.nvcc:
+                Path(arguments[arguments.index("-o") + 1]).unlink()
+            return result
+
+        with mock.patch.object(helper.shutil, "which", side_effect=self.fake_which), \
+                mock.patch.object(helper, "run_command", side_effect=no_object):
+            with self.assertRaisesRegex(helper.PreparationError, "NVCC did not create"):
+                helper.configure_build_toolchain(self.environment, self.root / "probe")
+
+    def test_absent_container_gxx_and_missing_headers_prepare_private_compiler(self):
+        self.header_failures.add(self.compiler)
+        self.available.remove("/usr/bin/g++")
+        prefix = self.root / "private-gcc11"
+        private_compiler = str(prefix / "bin/x86_64-conda-linux-gnu-g++")
+        original = dict(self.environment)
+
+        def prepare(target, environment):
+            self.assertEqual(target, prefix)
+            self.assertEqual(environment, original)
+            self.available.add(private_compiler)
+            return private_compiler
+
+        with mock.patch.object(helper.shutil, "which", side_effect=self.fake_which), \
+                mock.patch.object(helper, "run_command", side_effect=self.fake_command), \
+                mock.patch.object(helper, "prepare_private_compiler", side_effect=prepare) as installer:
+            result = helper.configure_build_toolchain(self.environment, self.root / "probe", compiler_root=prefix)
+        installer.assert_called_once()
+        self.assertEqual(self.environment, original)
+        self.assertEqual(result["CONDA_PREFIX"], "/model-specific/env")
+        self.assertEqual(result["CC"], private_compiler)
+        self.assertTrue(result["PATH"].startswith(str(prefix / "bin") + os.pathsep))
+        self.assertNotIn("LD_LIBRARY_PATH", result)
+        self.assertTrue(any(args[0] == self.nvcc and args[args.index("-ccbin") + 1] == private_compiler
+                            for args, _ in self.calls))
+
+
+class PrivateCompilerTests(unittest.TestCase):
+    def test_conda_installs_only_into_dedicated_prefix_and_retains_model_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "build-tools/gcc11"
+            model = root / "model-env"
+            model.mkdir()
+            marker = model / "keep.txt"
+            marker.write_text("unchanged")
+            environment = {"CONDA_PREFIX": str(model), "CONDA_EXE": "/opt/conda/bin/conda", "PATH": str(model / "bin")}
+
+            def install(arguments, **kwargs):
+                self.assertEqual(arguments[:3], ["/opt/conda/bin/conda", "create", "--yes"])
+                self.assertEqual(arguments[arguments.index("--prefix") + 1], str(prefix))
+                self.assertIn("gxx_linux-64=11", arguments)
+                self.assertIn("sysroot_linux-64=2.17", arguments)
+                self.assertEqual(kwargs["env"]["CONDA_PREFIX"], str(model))
+                self.assertTrue(kwargs["env"]["CONDA_PKGS_DIRS"].startswith(str(root / "build-tools")))
+                (prefix / "bin").mkdir(parents=True)
+                (prefix / "bin/x86_64-conda-linux-gnu-g++").write_text("compiler")
+                return ""
+
+            with mock.patch.object(helper, "run_command", side_effect=install) as command:
+                result = helper.prepare_private_compiler(prefix, environment)
+                self.assertEqual(result, str(prefix / "bin/x86_64-conda-linux-gnu-g++"))
+                helper.prepare_private_compiler(prefix, environment)
+                self.assertEqual(command.call_count, 1)
+            self.assertEqual(marker.read_text(), "unchanged")
+            self.assertEqual(sorted(path.name for path in model.iterdir()), ["keep.txt"])
+            self.assertNotIn("CONDA_PKGS_DIRS", environment)
+
+    def test_incomplete_compiler_prefix_is_preserved_and_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "gcc11"
+            prefix.mkdir()
+            marker = prefix / "partial.txt"
+            marker.write_text("preserve")
+            with mock.patch.object(helper, "run_command") as command:
+                with self.assertRaisesRegex(helper.PreparationError, "Incomplete private compiler"):
+                    helper.prepare_private_compiler(prefix, {})
+                command.assert_not_called()
+            self.assertEqual(marker.read_text(), "preserve")
 
 
 if __name__ == "__main__":

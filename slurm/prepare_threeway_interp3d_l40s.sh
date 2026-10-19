@@ -13,8 +13,9 @@ Usage: bash slurm/prepare_threeway_interp3d_l40s.sh [--prepare|--check]
 Run --prepare once on an Ateneo login node with internet access. It installs
 pytorch-fid 0.3.0 and the TRELLIS mip-splatting Gaussian rasterizer in separate
 evaluation overlays only when needed, then caches and verifies canonical weights.
-The rasterizer is compiled for L40S with the existing CUDA 11.8/GCC11 toolchain;
-no GPU is required for compilation when the target CUDA architecture is explicit.
+The rasterizer is compiled for L40S using CUDA 11.8. If C++ headers/compilers
+are missing, a build-only GCC/G++ 11 prefix is created under gaussian-build/gcc11.
+No GPU is required for compilation when the target CUDA architecture is explicit.
 The existing Conda environments are always mounted read-only.
 
 --check is offline: it verifies imports and full SHA256 hashes of cached weights.
@@ -72,6 +73,9 @@ cleanup() { rm -rf -- "$RUNTIME_ROOT"; }
 trap cleanup EXIT
 mkdir -p "$RUNTIME_ROOT/home" "$RUNTIME_ROOT/tmp"
 export SINGULARITYENV_PYTHONDONTWRITEBYTECODE=1
+echo "Metric/runtime environment (MorphAny3D, read-only): $MORPHANY_ENV"
+echo "CUDA toolkit (read-only): $TOOLCHAIN_ROOT_HOST"
+echo "Evaluation overlays: $PROTOCOL_PYTHON"
 
 singularity exec --cleanenv --containall --no-mount hostfs \
     --bind "$MORPHANY_ENV:/opt/trellis/env:ro" \
@@ -158,6 +162,7 @@ import torch
 import torchvision
 import lpips
 from pytorch_fid.inception import FID_WEIGHTS_URL
+print(f'Preparing against Python={sys.executable}, Torch={torch.__version__}, CUDA={torch.version.cuda}; model environments remain separate', flush=True)
 
 # A CPU import of GaussianRenderer alone does not exercise this lazy native
 # dependency. Install/probe the exact mip-splatting API before allocating GPUs.

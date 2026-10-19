@@ -99,8 +99,17 @@ usato da TRELLIS, commit `dda02ab5ecf45d6edb8c540d9bb65c7e451345a9` di
 Il controllo richiede anche i campi `kernel_size` e `subpixel_offset`, specifici
 di questa variante. La normale estensione Graphdeco non e' un sostituto compatibile.
 
-La compilazione usa Torch dell'env MorphAny3D, CUDA 11.8/GCC11 e architettura
-L40S 8.9 esplicita, quindi puo' avvenire sul login senza GPU. Le sorgenti sono
+La compilazione usa Torch dell'env MorphAny3D, CUDA 11.8 e architettura
+L40S 8.9 esplicita, quindi puo' avvenire sul login senza GPU. Il compilatore
+viene prima verificato su header standard C++ e un piccolo sorgente CUDA.
+Se la toolchain non contiene gli header C++ (errore `cfloat`) e il container
+non dispone di un G++, il preparatore crea **solo per il build** il prefisso
+`$BENCH_ROOT/gaussian-build/gcc11`, con GCC/G++ 11 e sysroot 2.17 da conda-forge.
+Nessun compilatore o pacchetto viene installato negli env dei modelli; questi
+restano in sola lettura. Il Python che costruisce l'estensione resta quello
+dell'env MorphAny3D e il successivo import viene verificato nel runtime originale.
+Il prefisso del compilatore non viene attivato ne' montato nei job di inferenza.
+Le sorgenti sono
 conservate sotto `$BENCH_ROOT/gaussian-build`; `GAUSSIAN_BUILD_JOBS=2` limita i
 processi di compilazione. L'overlay e' pubblicato solo dopo un import verificato
 e conserva metadati ABI per evitare il riuso con Torch/CUDA/Python incompatibili.
@@ -110,6 +119,11 @@ Il preparatore verifica anche gli hash dei pesi canonici Inception FID e VGG16.
 Il batch esegue nuovamente il controllo offline, senza installazioni/download.
 Nel controllo GPU viene renderizzata una Gaussian di prova prima di avviare i
 worker. Questo renderer serve alle metriche anche quando `EXPORT_GLB=0`.
+L'overlay nativo e quello FID sono visibili esclusivamente nelle fasi eseguite
+con l'env MorphAny3D, che include il renderer comune delle metriche. Generazione
+MorphFlow e Interp3D usano soltanto i propri env e fork, senza questi overlay.
+Ogni build usa una copia pulita delle sorgenti, senza oggetti CUDA rimasti da
+tentativi precedenti.
 
 Se un job termina con `ModuleNotFoundError: diff_gaussian_rasterization`, dopo
 aver aggiornato **tutto** il checkout (incluso `slurm/prepare_gaussian_rasterizer.py`):
@@ -123,6 +137,10 @@ bash slurm/prepare_threeway_interp3d_l40s.sh --check
 Il primo comando puo' impiegare diversi minuti per compilare. Poi usare un nuovo
 RUN_NAME per il benchmark: il codice della run fallita e' gia' stato congelato e
 la ripresa rileva correttamente il cambiamento dei sorgenti.
+La stessa preparazione corregge la toolchain incompleta segnalata da
+`fatal error: cfloat: No such file or directory`: prima di lanciare `pip wheel`,
+deve comparire `CUDA compile probe passed`. Se il download/install del solo
+compilatore fallisce, nessuno degli env modello viene modificato.
 
 Dataset predefinito: `/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4`;
 immagini: directory sorella `flux_outputs`. **N=0 significa tutte le coppie uniche

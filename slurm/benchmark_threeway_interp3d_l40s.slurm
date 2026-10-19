@@ -103,6 +103,12 @@ for file in "$SIF" "$HELPER_HOST" "$CHECKPOINT_PATH" "$SLAT_CHECKPOINT_PATH"; do
     [[ -f "$file" ]] || die "Missing file: $file"
 done
 [[ -d "$PROTOCOL_PYTHON" ]] || die "Run first: bash $PROJECT_DIR/slurm/prepare_threeway_interp3d_l40s.sh --prepare"
+echo "Environment map (read-only):"
+echo "  MorphFlow generation: $ORIGINAL_ENV"
+echo "  MorphAny3D generation: $MORPHANY_ENV"
+echo "  Interp3D generation: $INTERP_ENV"
+echo "  Common rendering/metrics: $MORPHANY_ENV; evaluation overlay: $PROTOCOL_PYTHON"
+echo "  The evaluation overlay is excluded from MorphFlow and Interp3D environments."
 if ! env PROJECT_DIR="$PROJECT_DIR" SIF="$SIF" BENCH_ROOT="$BENCH_ROOT" \
     MORPHANY_ENV="$MORPHANY_ENV" MORPHANY_REPO="$MORPHANY_REPO" \
     TOOLCHAIN_ROOT_HOST="$TOOLCHAIN_ROOT_HOST" SHARED_CACHE="$SHARED_CACHE" \
@@ -178,6 +184,14 @@ container_exec() {
     local phase="$1" environment="$2" repository="$3" gpu="$4"
     shift 4
     local phase_home="$RUN_ROOT/runtime-home/$phase" phase_tmp="$NODE_TMP/$phase"
+    local protocol_binds=()
+    # This native extension is compiled against MorphAny3D's Torch/CUDA ABI.
+    # Other model environments must use only their own installed packages.
+    export SINGULARITYENV_MORPHFLOW_METRIC_OVERLAY=0
+    if [[ "$environment" == "$MORPHANY_ENV" ]]; then
+        protocol_binds=(--bind "$PROTOCOL_PYTHON:/opt/protocol-python:ro")
+        export SINGULARITYENV_MORPHFLOW_METRIC_OVERLAY=1
+    fi
     mkdir -p "$phase_home" "$phase_tmp"
     if [[ "$gpu" == cpu ]]; then
         export SINGULARITYENV_CUDA_VISIBLE_DEVICES=""
@@ -202,7 +216,7 @@ container_exec() {
         --bind "$SHARED_CACHE/hf-home:/opt/trellis/hf-home:rw" \
         --bind "$SHARED_CACHE/torch-home:/opt/trellis/torch-home:rw" \
         --bind "$SHARED_CACHE/u2net:/opt/trellis/u2net:rw" \
-        --bind "$PROTOCOL_PYTHON:/opt/protocol-python:ro" \
+        "${protocol_binds[@]}" \
         --bind "$phase_home:/runtime-home:rw" \
         --bind "$phase_tmp:/runtime-tmp:rw" \
         --pwd /workspace/MorphFlow "$SIF" bash -s -- "$@" <<'IN_CONTAINER'
@@ -217,7 +231,10 @@ export CUDAHOSTCXX="$CXX" PATH="$CUDA_HOME/bin:$PATH" LD_LIBRARY_PATH="$CUDA_HOM
 export TORCH_EXTENSIONS_DIR=/opt/trellis/torch-home/extensions/nvdiffrast-035 MAX_JOBS=2
 export ATTN_BACKEND=xformers SPCONV_ALGO=native PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRELLIS_REPO=/workspace/MethodRepo PYTHONPATH=/workspace/MethodRepo:/workspace/MorphFlow:/opt/protocol-python/gaussian:/opt/protocol-python
+export TRELLIS_REPO=/workspace/MethodRepo PYTHONPATH=/workspace/MethodRepo:/workspace/MorphFlow
+if [[ "${MORPHFLOW_METRIC_OVERLAY:-0}" == 1 ]]; then
+    export PYTHONPATH="$PYTHONPATH:/opt/protocol-python/gaussian:/opt/protocol-python"
+fi
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 exec "$@"
 IN_CONTAINER

@@ -32,21 +32,27 @@ import time
 
 argv = sys.argv[1:]
 binds = {}
+bind_modes = {}
 for position, value in enumerate(argv):
     if value == '--bind':
         host, guest, mode = argv[position + 1].rsplit(':', 2)
         binds[guest] = host
+        bind_modes[guest] = mode
 bash = argv.index('bash')
 command = argv[argv.index('--', bash) + 1:]
-# The shell is not executed by the fake runtime, but its package search path
-# still has to expose the separately compiled Gaussian rasterizer overlay.
+# The shell is not executed by the fake runtime. Evaluate the overlay role used
+# by its conditional package path, and record mounts to verify ABI isolation.
 bootstrap = sys.stdin.read()
-gaussian_overlay_enabled = '/opt/protocol-python/gaussian' in bootstrap
+metric_overlay = os.environ.get('SINGULARITYENV_MORPHFLOW_METRIC_OVERLAY', '0')
+gaussian_overlay_enabled = (metric_overlay == '1' and
+                            '/opt/protocol-python' in binds and
+                            '/opt/protocol-python/gaussian' in bootstrap)
 
 def record(event, **extra):
     value = dict(event=event, command=command, bindings=binds,
                  gpu=os.environ.get('SINGULARITYENV_CUDA_VISIBLE_DEVICES'), pid=os.getpid(),
-                 gaussian_overlay_enabled=gaussian_overlay_enabled)
+                 gaussian_overlay_enabled=gaussian_overlay_enabled,
+                 metric_overlay=metric_overlay, binding_modes=bind_modes)
     value.update(extra)
     with open(os.environ['FAKE_CONTAINER_JOURNAL'], 'a') as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -125,7 +131,8 @@ if command[0] == '--check':
     assert '/opt/trellis/toolchain/cuda118-gcc11' in binds
     print('Fake offline protocol preparation verified')
 elif command[:2] == ['python', '-c']:
-    assert gaussian_overlay_enabled
+    assert ('if [[ "${MORPHFLOW_METRIC_OVERLAY:-0}" == 1 ]]' in bootstrap and
+            'PYTHONPATH=/workspace/MethodRepo:/workspace/MorphFlow\n' in bootstrap)
     if 'detect_flow_target' in command[2]:
         assert translate('/checkpoints/ss/checkpoint.pt').read_bytes().startswith(b'SS')
         assert translate('/checkpoints/slat/checkpoint.pt').read_bytes().startswith(b'SLat')
@@ -413,7 +420,32 @@ class LauncherTests(unittest.TestCase):
                          (self.project / 'slurm/prepare_gaussian_rasterizer.py').read_bytes())
         workers = [row for row in calls if row not in preparation]
         self.assertTrue(workers)
-        self.assertTrue(all(row['gaussian_overlay_enabled'] for row in workers))
+        environments_seen = set()
+        for row in workers:
+            environment = row['bindings']['/opt/trellis/env']
+            environments_seen.add(environment)
+            self.assertEqual(row['binding_modes']['/opt/trellis/env'], 'ro')
+            self.assertEqual(row['binding_modes']['/workspace/MethodRepo'], 'ro')
+            enabled = environment == self.env['MORPHANY_ENV']
+            self.assertEqual(row['metric_overlay'], str(int(enabled)))
+            self.assertEqual(row['gaussian_overlay_enabled'], enabled)
+            self.assertEqual('/opt/protocol-python' in row['bindings'], enabled)
+            if enabled:
+                self.assertEqual(row['bindings']['/opt/protocol-python'], self.env['PROTOCOL_PYTHON'])
+                self.assertEqual(row['binding_modes']['/opt/protocol-python'], 'ro')
+            operation = self.operation(row)
+            if operation in ('morphflow', 'morphany3d', 'interp3d'):
+                expected_env, fork = {
+                    'morphflow': ('ORIGINAL_ENV', 'TRELLIS'),
+                    'morphany3d': ('MORPHANY_ENV', 'MorphAny3D'),
+                    'interp3d': ('INTERP_ENV', 'Interp3D'),
+                }[operation]
+                self.assertEqual(environment, self.env[expected_env])
+                self.assertEqual(Path(row['bindings']['/workspace/MethodRepo']).name, fork)
+            if operation in ('shard', 'merge', 'texture', 'texture-status', 'aggregate', 'check-fid-weights'):
+                self.assertTrue(enabled, operation)
+        self.assertEqual(environments_seen, {self.env[name] for name in
+                         ('ORIGINAL_ENV', 'MORPHANY_ENV', 'INTERP_ENV')})
         rasterizer_checks = [row for row in workers
                              if row['command'][:2] == ['python', '-c'] and
                              'runpy.run_path' in row['command'][2] and
