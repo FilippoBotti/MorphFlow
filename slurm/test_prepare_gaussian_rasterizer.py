@@ -99,7 +99,7 @@ class PreparationTests(unittest.TestCase):
         self.overlay.symlink_to(old_version.name, target_is_directory=True)
         self.source_root.mkdir()
         with mock.patch.object(helper, "source_package", return_value=self.package), \
-                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
+                mock.patch.object(helper, "configure_complete_toolchain", side_effect=lambda env, workspace, source_root: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", side_effect=helper.PreparationError("undefined symbol: torch ABI")):
             with self.assertRaisesRegex(helper.PreparationError, "torch ABI"):
@@ -116,7 +116,7 @@ class PreparationTests(unittest.TestCase):
             directory.mkdir()
             (directory / "stale.o").write_bytes(b"wrong old environment")
         with mock.patch.object(helper, "source_package", return_value=self.package), \
-                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
+                mock.patch.object(helper, "configure_complete_toolchain", side_effect=lambda env, workspace, source_root: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=self.result):
             helper.build_overlay(self.overlay, self.source_root)
@@ -135,7 +135,7 @@ class PreparationTests(unittest.TestCase):
         self.overlay.symlink_to(old_version.name, target_is_directory=True)
         self.source_root.mkdir()
         with mock.patch.object(helper, "source_package", return_value=self.package), \
-                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
+                mock.patch.object(helper, "configure_complete_toolchain", side_effect=lambda env, workspace, source_root: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=self.result):
             helper.build_overlay(self.overlay, self.source_root)
@@ -148,7 +148,7 @@ class PreparationTests(unittest.TestCase):
         overridden = dict(self.result, runtime=dict(self.runtime, architectures="8.9+PTX"))
         with mock.patch.dict(os.environ, {"TORCH_CUDA_ARCH_LIST": "8.9+PTX", "MAX_JOBS": "3"}), \
                 mock.patch.object(helper, "source_package", return_value=self.package), \
-                mock.patch.object(helper, "configure_build_toolchain", side_effect=lambda env, workspace, **kwargs: dict(env)), \
+                mock.patch.object(helper, "configure_complete_toolchain", side_effect=lambda env, workspace, source_root: dict(env)), \
                 mock.patch.object(helper, "run_command", side_effect=self.fake_build_command), \
                 mock.patch.object(helper, "probe", return_value=overridden):
             helper.build_overlay(self.overlay, self.source_root)
@@ -297,6 +297,22 @@ class ToolchainTests(unittest.TestCase):
         self.assertNotIn("CPLUS_INCLUDE_PATH", configured)
         self.assertEqual(sum(args[0] == self.nvcc for args, _ in self.calls), 1)
 
+    def test_cuda_probe_covers_rasterizer_headers_and_links_shared_cudart(self):
+        self.configure()
+        probes = [args for args, _ in self.calls if args[0] == self.nvcc]
+        self.assertEqual(len(probes), 1)
+        arguments = probes[0]
+        self.assertIn("--shared", arguments)
+        self.assertEqual(arguments[arguments.index("--cudart") + 1], "shared")
+        self.assertIn("-Xcompiler=-fPIC", arguments)
+        self.assertNotIn("-c", arguments)
+        source = next(Path(argument) for argument in arguments if argument.endswith(".cu")).read_text()
+        for header in ("cuda.h", "cuda_runtime.h", "cooperative_groups.h",
+                       "cooperative_groups/reduce.h", "cub/cub.cuh", "cub/device/device_radix_sort.cuh"):
+            self.assertIn("#include <{}>".format(header), source)
+        self.assertIn("cooperative_groups::reduce", source)
+        self.assertIn("cub::DeviceRadixSort::SortKeys", source)
+
     def test_missing_cfloat_recovers_only_matching_version_and_target_headers(self):
         self.header_failures.add(self.compiler)
         base = self.cuda / "x86_64-conda-linux-gnu/include/c++/11.4.0"
@@ -417,6 +433,147 @@ class PrivateCompilerTests(unittest.TestCase):
                     helper.prepare_private_compiler(prefix, {})
                 command.assert_not_called()
             self.assertEqual(marker.read_text(), "preserve")
+
+
+class PrivateCudaTests(unittest.TestCase):
+    REQUIRED_FILES = (
+        "bin/nvcc", "include/cuda.h", "include/cuda_runtime.h",
+        "include/cooperative_groups.h", "include/cooperative_groups/reduce.h",
+        "include/cub/cub.cuh", "include/cub/device/device_radix_sort.cuh",
+        "lib/libcudart.so",
+    )
+
+    def complete_sdk(self, prefix):
+        for name in self.REQUIRED_FILES:
+            target = prefix / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("CUDA 11.8 fixture")
+
+    def test_private_cuda_install_pins_complete_sdk_without_changing_model_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "gaussian-build/cuda118"
+            model = root / "model-env"
+            model.mkdir()
+            marker = model / "keep.txt"
+            marker.write_text("unchanged")
+            environment = dict(CONDA_PREFIX=str(model), CONDA_EXE="/opt/conda/bin/conda",
+                               PATH=str(model / "bin"), LD_LIBRARY_PATH="/model/runtime/lib")
+            original = dict(environment)
+
+            def install(arguments, **kwargs):
+                self.assertEqual(arguments[:3], ["/opt/conda/bin/conda", "create", "--yes"])
+                self.assertEqual(arguments[arguments.index("--prefix") + 1], str(prefix))
+                self.assertIn("--override-channels", arguments)
+                self.assertIn("--strict-channel-priority", arguments)
+                self.assertEqual(arguments[arguments.index("--channel") + 1], "nvidia/label/cuda-11.8.0")
+                for package in ("cuda-nvcc", "cuda-cudart", "cuda-cudart-dev", "cuda-cccl", "cuda-driver-dev"):
+                    self.assertIn(package + "=11.8.89", arguments)
+                self.assertEqual(kwargs["env"]["CONDA_PREFIX"], str(model))
+                self.assertEqual(kwargs["env"]["LD_LIBRARY_PATH"], original["LD_LIBRARY_PATH"])
+                self.assertTrue(Path(kwargs["env"]["CONDA_PKGS_DIRS"]).is_relative_to(prefix.parent))
+                self.complete_sdk(prefix)
+                return ""
+
+            with mock.patch.object(helper, "run_command", side_effect=install) as command:
+                self.assertEqual(helper.prepare_private_cuda(prefix, environment), prefix)
+                self.assertEqual(helper.prepare_private_cuda(prefix, environment), prefix)
+                command.assert_called_once()
+            self.assertEqual(environment, original)
+            self.assertEqual(marker.read_text(), "unchanged")
+            self.assertEqual(list(model.iterdir()), [marker])
+
+    def test_incomplete_private_cuda_prefix_is_preserved_and_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "cuda118"
+            (prefix / "bin").mkdir(parents=True)
+            nvcc = prefix / "bin/nvcc"
+            nvcc.write_text("preserve existing partial SDK")
+            with mock.patch.object(helper, "run_command") as command:
+                with self.assertRaisesRegex(helper.PreparationError, "Incomplete private CUDA"):
+                    helper.prepare_private_cuda(prefix, {})
+                command.assert_not_called()
+            self.assertEqual(nvcc.read_text(), "preserve existing partial SDK")
+
+    def test_installer_success_with_missing_cuda_header_is_not_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "cuda118"
+
+            def install(*args, **kwargs):
+                self.complete_sdk(prefix)
+                (prefix / "include/cooperative_groups.h").unlink()
+                return ""
+
+            with mock.patch.object(helper, "run_command", side_effect=install):
+                with self.assertRaisesRegex(helper.PreparationError, "cooperative_groups.h"):
+                    helper.prepare_private_cuda(prefix, {"CONDA_EXE": "/opt/conda/bin/conda"})
+            self.assertTrue((prefix / "bin/nvcc").is_file())
+
+
+class CompleteToolchainTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="complete_cuda_test_")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / "probe"
+        self.source_root = self.root / "gaussian-build"
+        self.environment = dict(
+            CUDA_HOME="/read-only/old-sdk", CUDA_PATH="/read-only/old-sdk",
+            CUDACXX="/read-only/old-sdk/bin/nvcc", CXX="/read-only/old-gcc/bin/g++",
+            CONDA_PREFIX="/model-specific/env", CONDA_EXE="/opt/conda/bin/conda",
+            PATH="/read-only/old-sdk/bin:/model-specific/env/bin",
+            LD_LIBRARY_PATH="/model-specific/env/lib:/read-only/old-sdk/lib64",
+        )
+
+    def test_complete_existing_toolchain_does_not_prepare_cuda(self):
+        original = dict(self.environment)
+        expected = dict(self.environment, CC="/verified/g++")
+        with mock.patch.object(helper, "configure_build_toolchain", return_value=expected) as configure, \
+                mock.patch.object(helper, "prepare_private_cuda") as prepare:
+            result = helper.configure_complete_toolchain(self.environment, self.workspace, self.source_root)
+        self.assertIs(result, expected)
+        configure.assert_called_once()
+        self.assertEqual(configure.call_args.kwargs["compiler_root"], self.source_root / "gcc11")
+        prepare.assert_not_called()
+        self.assertEqual(self.environment, original)
+
+    def test_missing_cooperative_groups_repairs_only_build_sdk_and_keeps_model_runtime(self):
+        original = dict(self.environment)
+        sdk = self.source_root / "cuda118"
+        calls = []
+
+        def configure(environment, workspace, compiler_root=None):
+            calls.append((dict(environment), Path(workspace), compiler_root))
+            self.assertEqual(compiler_root, self.source_root / "gcc11")
+            if len(calls) == 1:
+                raise helper.PreparationError("fatal error: cooperative_groups.h: No such file or directory")
+            self.assertEqual(environment["CUDA_HOME"], str(sdk))
+            self.assertEqual(environment["CUDA_PATH"], str(sdk))
+            self.assertEqual(environment["CUDACXX"], str(sdk / "bin/nvcc"))
+            self.assertTrue(environment["PATH"].startswith(str(sdk / "bin") + os.pathsep))
+            self.assertEqual(environment["CONDA_PREFIX"], original["CONDA_PREFIX"])
+            self.assertEqual(environment["LD_LIBRARY_PATH"], original["LD_LIBRARY_PATH"])
+            return dict(environment, CC="/verified/private-gcc11/bin/g++")
+
+        with mock.patch.object(helper, "configure_build_toolchain", side_effect=configure), \
+                mock.patch.object(helper, "prepare_private_cuda", return_value=sdk) as prepare:
+            result = helper.configure_complete_toolchain(self.environment, self.workspace, self.source_root)
+        prepare.assert_called_once_with(sdk, original)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], original)
+        self.assertEqual(result["CUDA_HOME"], str(sdk))
+        self.assertEqual(self.environment, original)
+
+    def test_failure_after_private_cuda_preserves_both_diagnostics(self):
+        original_error = "fatal error: cooperative_groups.h: No such file or directory"
+        private_error = "private CUDA probe: undefined reference to cudaGetDeviceCount"
+        with mock.patch.object(helper, "configure_build_toolchain", side_effect=[
+                helper.PreparationError(original_error), helper.PreparationError(private_error)]), \
+                mock.patch.object(helper, "prepare_private_cuda", return_value=self.source_root / "cuda118"):
+            with self.assertRaises(helper.PreparationError) as raised:
+                helper.configure_complete_toolchain(self.environment, self.workspace, self.source_root)
+        self.assertIn(original_error, str(raised.exception))
+        self.assertIn(private_error, str(raised.exception))
 
 
 if __name__ == "__main__":

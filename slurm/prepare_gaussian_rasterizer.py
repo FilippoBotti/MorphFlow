@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Prepare the TRELLIS mip Gaussian rasterizer without modifying Conda envs.
 
-The CUDA compiler and host compiler are supplied by the surrounding container
-helper. A GPU is not needed: TORCH_CUDA_ARCH_LIST explicitly selects L40S.
+The container supplies its existing toolchain first; incomplete development
+components are prepared in private build-only prefixes. A GPU is not needed:
+TORCH_CUDA_ARCH_LIST explicitly selects L40S.
 """
 
 import argparse
@@ -22,6 +23,14 @@ SOURCE_COMMIT = "dda02ab5ecf45d6edb8c540d9bb65c7e451345a9"
 PACKAGE_SUBDIRECTORY = "submodules/diff-gaussian-rasterization"
 METADATA_NAME = "gaussian-rasterizer-build.json"
 ARCHITECTURES = "8.9"
+CUDA_CHANNEL = "nvidia/label/cuda-11.8.0"
+CUDA_PACKAGES = tuple(name + "=11.8.89" for name in (
+    "cuda-nvcc", "cuda-cudart", "cuda-cudart-dev", "cuda-cccl", "cuda-driver-dev"))
+CUDA_REQUIRED_FILES = (
+    "bin/nvcc", "include/cuda.h", "include/cuda_runtime.h",
+    "include/cooperative_groups.h", "include/cooperative_groups/reduce.h",
+    "include/cub/cub.cuh", "include/cub/device/device_radix_sort.cuh", "lib/libcudart.so",
+)
 PROBE_PREFIX = "GAUSSIAN_PROBE_JSON="
 PROBE_CODE = r'''
 import importlib
@@ -131,6 +140,62 @@ def prepare_private_compiler(prefix, environment):
     return str(compiler)
 
 
+def prepare_private_cuda(prefix, environment):
+    """Prepare the CUDA 11.8 compiler, development headers and link libraries.
+
+    The runtime-only CUDA packages in an inference env are insufficient to
+    build the rasterizer. Keep the complete build SDK outside every model env.
+    Only the NVIDIA 11.8 release channel is used, including its matching CCCL.
+    """
+    prefix = Path(prefix)
+    missing = [name for name in CUDA_REQUIRED_FILES if not (prefix / name).is_file()]
+    if not missing:
+        return prefix
+    if prefix.exists() and any(prefix.iterdir()):
+        raise PreparationError("Incomplete private CUDA SDK {}; missing {}. "
+                               "Move this build-only prefix aside before preparing again".format(
+                                   prefix, ", ".join(missing)))
+    conda = environment.get("CONDA_EXE") or shutil.which("conda", path=environment.get("PATH"))
+    if not conda:
+        raise PreparationError("No complete CUDA development SDK and no Conda executable available to prepare one")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    cache = prefix.parent / ".cuda-conda-pkgs"
+    cache.mkdir(exist_ok=True)
+    installer_environment = dict(environment, CONDA_PKGS_DIRS=str(cache))
+    print("Preparing build-only CUDA 11.8 SDK with Cooperative Groups and CUB in {}; "
+          "model environments stay unchanged".format(prefix), flush=True)
+    run_command([conda, "create", "--yes", "--prefix", str(prefix),
+                 "--override-channels", "--channel", CUDA_CHANNEL, "--strict-channel-priority",
+                 *CUDA_PACKAGES], env=installer_environment)
+    missing = [name for name in CUDA_REQUIRED_FILES if not (prefix / name).is_file()]
+    if missing:
+        raise PreparationError("Conda provided an incomplete CUDA 11.8 SDK {}; missing {}".format(
+            prefix, ", ".join(missing)))
+    return prefix
+
+
+def configure_complete_toolchain(environment, workspace, source_root):
+    """Prefer the supplied toolchain, recovering incomplete SDKs privately."""
+    try:
+        return configure_build_toolchain(environment, workspace, compiler_root=source_root / "gcc11")
+    except PreparationError as original:
+        print("Supplied CUDA/C++ toolchain failed the rasterizer build probe; "
+              "checking a private CUDA 11.8 SDK", flush=True)
+        try:
+            cuda = prepare_private_cuda(source_root / "cuda118", environment)
+            private = dict(environment)
+            private.update(CUDA_HOME=str(cuda), CUDA_PATH=str(cuda), CUDACXX=str(cuda / "bin/nvcc"))
+            private["PATH"] = str(cuda / "bin") + os.pathsep + private.get("PATH", "")
+            # Retain the active model Python/Torch and its runtime libraries.
+            # In particular, never put build SDK/GCC libraries on the runtime
+            # LD_LIBRARY_PATH or activate either private Conda prefix.
+            return configure_build_toolchain(private, workspace / "private-cuda-probe",
+                                             compiler_root=source_root / "gcc11")
+        except (PreparationError, OSError, subprocess.TimeoutExpired) as fallback:
+            raise PreparationError("Private CUDA 11.8 SDK preparation/probe failed:\n{}\n"
+                                   "Original toolchain failure:\n{}".format(fallback, original)) from fallback
+
+
 def matching_cxx_headers(cuda_home, compiler, environment):
     """Recover only headers matching this compiler's version and target.
 
@@ -166,8 +231,8 @@ def matching_cxx_headers(cuda_home, compiler, environment):
 def configure_build_toolchain(environment, workspace, compiler_root=None):
     """Return a tested build environment; never alter the model environment.
 
-    Every candidate must compile both standard C++ headers and a real CUDA
-    translation unit. In particular, a system compiler is never accepted merely
+    Every candidate must compile standard C++ headers and compile/link the CUDA
+    SDK features used by the rasterizer. A compiler is never accepted merely
     because its executable exists. Neither probe requires a GPU.
     """
     environment = dict(environment)
@@ -195,8 +260,19 @@ def configure_build_toolchain(environment, workspace, compiler_root=None):
         raise PreparationError("TORCH_CUDA_ARCH_LIST must specify a numeric CUDA architecture, e.g. 8.9")
     architecture = match[1] + match[2]
     source = workspace / "gaussian-toolchain-probe.cu"
-    source.write_text("#include <cfloat>\n#include <vector>\n#include <cuda_runtime.h>\n"
-                      "__global__ void probe(float* x) { *x = FLT_EPSILON; }\n")
+    # Exercise the SDK used by forward/backward/rasterizer_impl, rather than
+    # accepting an nvcc + cuda_runtime-only installation. Also link cudart,
+    # matching the shared-library build performed by Torch's cpp_extension.
+    source.write_text("#include <cfloat>\n#include <vector>\n#include <cuda.h>\n"
+                      "#include <cuda_runtime.h>\n#include <device_launch_parameters.h>\n"
+                      "#include <cooperative_groups.h>\n#include <cooperative_groups/reduce.h>\n"
+                      "#include <cub/cub.cuh>\n#include <cub/device/device_radix_sort.cuh>\n"
+                      "__global__ void probe(float* x) {\n"
+                      "  auto tile = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());\n"
+                      "  float v = cooperative_groups::reduce(tile, FLT_EPSILON, cooperative_groups::plus<float>());\n"
+                      "  if (threadIdx.x == 0) *x = v;\n}\n"
+                      "cudaError_t probe_sort(void* storage, size_t& bytes, unsigned* in, unsigned* out) {\n"
+                      "  return cub::DeviceRadixSort::SortKeys(storage, bytes, in, out, 1);\n}\n")
     errors = []
     for index, compiler in enumerate(candidates):
         candidate = dict(environment)
@@ -217,23 +293,26 @@ def configure_build_toolchain(environment, workspace, compiler_root=None):
                 run_command([compiler, "-std=c++17", "-E", "-x", "c++", "-"],
                             input="#include <cfloat>\n#include <vector>\n",
                             env=candidate, timeout=30)
-            target = workspace / ("gaussian-toolchain-probe-{}.o".format(index))
+            target = workspace / ("gaussian-toolchain-probe-{}.so".format(index))
             target.unlink(missing_ok=True)
             run_command([nvcc, "-ccbin", compiler, "-std=c++17", "-gencode",
                          "arch=compute_{0},code=sm_{0}".format(architecture),
-                         "-c", str(source), "-o", str(target)], env=candidate, timeout=180)
+                         "--shared", "--cudart", "shared", "-Xcompiler=-fPIC",
+                         "-L" + str(cuda_home / "lib"), "-L" + str(cuda_home / "lib64"),
+                         str(source), "-o", str(target)], env=candidate, timeout=180)
             if not target.is_file():
-                raise PreparationError("NVCC did not create the CUDA probe object")
+                raise PreparationError("NVCC did not create the CUDA probe shared library")
             version = run_command([compiler, "--version"], env=candidate, timeout=30).splitlines()[0]
             print("Verified Gaussian build compiler: {} ({})".format(compiler, version), flush=True)
             if candidate.get("CPLUS_INCLUDE_PATH") != environment.get("CPLUS_INCLUDE_PATH"):
                 print("Recovered matching C++ headers: {}".format(candidate["CPLUS_INCLUDE_PATH"]), flush=True)
-            print("CUDA compile probe passed with {} (no GPU required)".format(nvcc), flush=True)
+            print("CUDA compile/link probe passed with {}: Cooperative Groups, CUB and cudart "
+                  "(no GPU required)".format(nvcc), flush=True)
             return candidate
         except (PreparationError, OSError, subprocess.TimeoutExpired) as error:
             diagnostic = "\n".join(str(error).splitlines()[-6:])
             errors.append("{}: {}".format(compiler, diagnostic))
-            print("Gaussian compiler candidate rejected: {}".format(errors[-1]), flush=True)
+            print("Gaussian toolchain candidate rejected: {}".format(errors[-1]), flush=True)
     if compiler_root is not None:
         compiler = prepare_private_compiler(compiler_root, environment)
         private = dict(environment)
@@ -336,7 +415,7 @@ def build_overlay(overlay, source_root):
         environment.setdefault("TORCH_CUDA_ARCH_LIST", ARCHITECTURES)
         environment.setdefault("MAX_JOBS", "2")
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment = configure_build_toolchain(environment, workspace, compiler_root=source_root / "gcc11")
+        environment = configure_complete_toolchain(environment, workspace, source_root)
         # Cached sources can contain objects from an interrupted or failed build
         # in another model environment. Compile a clean, private copy instead.
         package_copy = workspace / "package"

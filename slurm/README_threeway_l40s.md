@@ -101,7 +101,8 @@ di questa variante. La normale estensione Graphdeco non e' un sostituto compatib
 
 La compilazione usa Torch dell'env MorphAny3D, CUDA 11.8 e architettura
 L40S 8.9 esplicita, quindi puo' avvenire sul login senza GPU. Il compilatore
-viene prima verificato su header standard C++ e un piccolo sorgente CUDA.
+viene prima verificato su header standard C++ e un sorgente CUDA che usa
+Cooperative Groups (`reduce`), CUB (`DeviceRadixSort`) e il collegamento a cudart.
 Se la toolchain non contiene gli header C++ (errore `cfloat`) e il container
 non dispone di un G++, il preparatore crea **solo per il build** il prefisso
 `$BENCH_ROOT/gaussian-build/gcc11`, con GCC/G++ 11 e sysroot 2.17 da conda-forge.
@@ -109,6 +110,13 @@ Nessun compilatore o pacchetto viene installato negli env dei modelli; questi
 restano in sola lettura. Il Python che costruisce l'estensione resta quello
 dell'env MorphAny3D e il successivo import viene verificato nel runtime originale.
 Il prefisso del compilatore non viene attivato ne' montato nei job di inferenza.
+Se anche l'SDK CUDA e' incompleto (per esempio manca `cooperative_groups.h`),
+il preparatore crea `$BENCH_ROOT/gaussian-build/cuda118` con i componenti di
+sviluppo NVIDIA 11.8.89: `cuda-nvcc`, `cuda-cudart`, `cuda-cudart-dev`, `cuda-cccl`
+e `cuda-driver-dev`, dal canale ufficiale `nvidia/label/cuda-11.8.0`.
+Sono circa 56 MB di download, oltre allo spazio per pacchetti estratti e cache;
+non occorre scaricare l'intero toolkit. Il nuovo SDK viene usato soltanto dal
+build, senza attivarlo o cambiare le librerie runtime dei modelli.
 Le sorgenti sono
 conservate sotto `$BENCH_ROOT/gaussian-build`; `GAUSSIAN_BUILD_JOBS=2` limita i
 processi di compilazione. L'overlay e' pubblicato solo dopo un import verificato
@@ -137,10 +145,14 @@ bash slurm/prepare_threeway_interp3d_l40s.sh --check
 Il primo comando puo' impiegare diversi minuti per compilare. Poi usare un nuovo
 RUN_NAME per il benchmark: il codice della run fallita e' gia' stato congelato e
 la ripresa rileva correttamente il cambiamento dei sorgenti.
-La stessa preparazione corregge la toolchain incompleta segnalata da
-`fatal error: cfloat: No such file or directory`: prima di lanciare `pip wheel`,
-deve comparire `CUDA compile probe passed`. Se il download/install del solo
-compilatore fallisce, nessuno degli env modello viene modificato.
+La stessa preparazione corregge gli errori della toolchain incompleta
+`fatal error: cfloat: No such file or directory` e
+`fatal error: cooperative_groups.h: No such file or directory`.
+Prima di lanciare `pip wheel` deve comparire `CUDA compile/link probe passed`,
+con Cooperative Groups, CUB e cudart. Se il download/install dei componenti di
+build fallisce, nessuno degli env modello viene modificato. I prefissi privati
+gia' completi vengono riutilizzati; un prefisso privato parzialmente installato
+viene segnalato e conservato, senza cancellazioni automatiche.
 
 Dataset predefinito: `/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4`;
 immagini: directory sorella `flux_outputs`. **N=0 significa tutte le coppie uniche
