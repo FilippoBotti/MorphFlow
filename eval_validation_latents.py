@@ -148,8 +148,8 @@ def build_model(ckpt, model_type, flow_target):
         raise ValueError("Image-conditioned student checkpoints are no longer supported")
     if args.get("ss_flow_arch", "standard") != "standard":
         raise ValueError("Residual SS checkpoints are no longer supported")
-    if bool(int(args.get("separate_cond", 0))) and args.get("separate_cond_gate") != "token":
-        raise ValueError("This checkpoint does not use token gating; use its historical code revision")
+    if bool(int(args.get("separate_cond", 0))) and args.get("separate_cond_gate") not in ("token", "alpha"):
+        raise ValueError("This checkpoint uses an unsupported condition gate; use its historical code revision")
     cond_input_norm = args.get("cond_input_norm")
     normalize_cond_latents = bool(int(args.get("normalize_cond_latents", 0)))
     if cond_input_norm is not None:

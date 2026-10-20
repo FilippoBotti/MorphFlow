@@ -117,8 +117,8 @@ for path in filter(None, (primary, secondary)):
         raise SystemExit("Checkpoint con conditioning diretto DINO non più supportato.")
     if args.get("ss_flow_arch", "standard") != "standard":
         raise SystemExit("Checkpoint SS residuale non più supportato.")
-    if int(args.get("separate_cond", 0)) and args.get("separate_cond_gate") != "token":
-        raise SystemExit("Sono supportati solo checkpoint con gating token.")
+    if int(args.get("separate_cond", 0)) and args.get("separate_cond_gate") not in ("token", "alpha"):
+        raise SystemExit("Sono supportati checkpoint con gating token o alpha fisso.")
     del ckpt
 if secondary and targets != ["ss", "slat"]:
     raise SystemExit("La pipeline richiede CHECKPOINT_PATH=SS e SLAT_CHECKPOINT_PATH=SLat.")

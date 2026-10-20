@@ -100,7 +100,7 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         qkv_bias: bool = True,
         share_mod: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["token"] = "token",
+        separate_cond_gate: Literal["token", "alpha"] = "token",
 
     ):
         super().__init__()
@@ -108,8 +108,8 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         self.share_mod = share_mod
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
-        if separate_cond and separate_cond_gate != "token":
-            raise ValueError("Only separate_cond_gate=token is supported")
+        if separate_cond and separate_cond_gate not in ("token", "alpha"):
+            raise ValueError("separate_cond_gate must be token or alpha")
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         self.norm2 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.norm3 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -147,6 +147,7 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
             )
             self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
 
+        if self.separate_cond and self.separate_cond_gate == "token":
             gate_in_dim = 3 * channels + 1
             hidden_dim = max(256, channels // 2)
             self.alpha_gate = nn.Sequential(
@@ -201,9 +202,12 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         h2 = self.cross_attn2(h, context2)
 
         alpha_rows = self._sparse_alpha_rows(h1, alpha)
-        gate_input = torch.cat([h1.feats, h2.feats, h2.feats - h1.feats, alpha_rows], dim=-1)
-        gate_delta = self.alpha_gate(gate_input)
-        gate = self._endpoint_preserving_gate(alpha_rows, gate_delta)
+        if self.separate_cond_gate == "alpha":
+            gate = 1.0 - alpha_rows
+        else:
+            gate_input = torch.cat([h1.feats, h2.feats, h2.feats - h1.feats, alpha_rows], dim=-1)
+            gate_delta = self.alpha_gate(gate_input)
+            gate = self._endpoint_preserving_gate(alpha_rows, gate_delta)
         feats = (1.0 - gate) * h1.feats + gate * h2.feats
         return h1.replace(feats)
 

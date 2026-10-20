@@ -100,7 +100,7 @@ class SLatFlowModel(nn.Module):
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["token"] = "token",
+        separate_cond_gate: Literal["token", "alpha"] = "token",
     ):
         super().__init__()
         self.resolution = resolution

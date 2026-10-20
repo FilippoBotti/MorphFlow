@@ -87,8 +87,8 @@ def main():
             raise ValueError("Checkpoint con conditioning diretto DINO non piu' supportato.")
         if config.get("ss_flow_arch", "standard") != "standard":
             raise ValueError("Checkpoint SS residuale non piu' supportato.")
-        if int(config.get("separate_cond", 0)) and config.get("separate_cond_gate") != "token":
-            raise ValueError("Sono supportati solo checkpoint con gating token.")
+        if int(config.get("separate_cond", 0)) and config.get("separate_cond_gate") not in ("token", "alpha"):
+            raise ValueError("Sono supportati checkpoint con gating token o alpha fisso.")
         del ckpt
     if targets != ["ss", "slat"]:
         raise ValueError("La pipeline richiede CHECKPOINT_PATH=SS e SLAT_CHECKPOINT_PATH=SLat.")

@@ -93,15 +93,15 @@ class ModulatedTransformerCrossBlock(nn.Module):
         qkv_bias: bool = True,
         share_mod: bool = False,
         separate_cond: bool = False,
-        separate_cond_gate: Literal["token"] = "token",
+        separate_cond_gate: Literal["token", "alpha"] = "token",
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.share_mod = share_mod
         self.separate_cond = separate_cond
         self.separate_cond_gate = separate_cond_gate
-        if separate_cond and separate_cond_gate != "token":
-            raise ValueError("Only separate_cond_gate=token is supported")
+        if separate_cond and separate_cond_gate not in ("token", "alpha"):
+            raise ValueError("separate_cond_gate must be token or alpha")
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         self.norm2 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.norm3 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -139,6 +139,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
             # Separate LayerNorm for the second cross-attention branch.
             # It is initialized/copy-loaded from norm2 in train.py.
             self.norm4 = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
+        if self.separate_cond and self.separate_cond_gate == "token":
             # Preserve token-gate parameter names/shapes for existing checkpoints.
             gate_in_dim = 3 * channels + 1
             hidden_dim = max(256, channels // 2)
@@ -202,10 +203,14 @@ class ModulatedTransformerCrossBlock(nn.Module):
             B, N, C = h1.shape
             alpha_base = alpha.reshape(B, 1, 1).to(device=h1.device, dtype=h1.dtype)
 
-            alpha_token = alpha_base.expand(B, N, 1)
-            gate_input = torch.cat([h1, h2, h2 - h1, alpha_token], dim=-1)
-            gate_delta = self.alpha_gate(gate_input)
-            gate = self._endpoint_preserving_gate(alpha_token, gate_delta)
+            if self.separate_cond_gate == "alpha":
+                # Ablation: retain both attention branches, with no learned gate.
+                gate = 1.0 - alpha_base
+            else:
+                alpha_token = alpha_base.expand(B, N, 1)
+                gate_input = torch.cat([h1, h2, h2 - h1, alpha_token], dim=-1)
+                gate_delta = self.alpha_gate(gate_input)
+                gate = self._endpoint_preserving_gate(alpha_token, gate_delta)
 
             h = (1.0 - gate) * h1 + gate * h2
         else:

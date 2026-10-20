@@ -19,6 +19,7 @@ os.environ.setdefault("ATTN_BACKEND", "xformers")
 
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
+from accelerate.utils import set_seed
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
@@ -59,6 +60,7 @@ def build_parser():
 
     # Training
     parser.add_argument("--train_bs", type=int, default=1, help="Batch size per GPU/process")
+    parser.add_argument("--seed", type=int, default=None, help="Seed Python, NumPy, Torch and loader workers; omitted preserves historical behavior.")
     parser.add_argument("--val_bs", type=int, default=1)
     parser.add_argument("--train_epochs", type=int, default=100)
     parser.add_argument("--stop_after_epoch", type=int, default=None,
@@ -90,7 +92,8 @@ def build_parser():
     parser.add_argument("--slat_condition_source", choices=["slat"], default="slat")
     parser.add_argument("--ss_flow_arch", choices=["standard"], default="standard")
     parser.add_argument("--separate_cond", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--separate_cond_gate", choices=["token"], default="token")
+    parser.add_argument("--separate_cond_gate", choices=["token", "alpha"], default="token",
+                        help="token learns an endpoint-preserving gate; alpha retains both cross-attention branches with fixed alpha weighting and no gate parameters.")
     parser.add_argument("--cfg_drop_prob", type=float, default=0.0)
 
     # Optional future architecture args.
@@ -1058,6 +1061,8 @@ def save_checkpoint(
 
 
 def train(args):
+    if args.seed is not None:
+        set_seed(args.seed)
     validate_trellis_prior_args(args)
     validate_balance_args(args)
     args.resume_from = resolve_existing_path(args.resume_from)
@@ -1172,6 +1177,7 @@ def train(args):
         pin_memory=torch.cuda.is_available(),
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
+        generator=torch.Generator().manual_seed(args.seed) if args.seed is not None else None,
     )
 
     val_dataset = None
@@ -1199,6 +1205,7 @@ def train(args):
             pin_memory=torch.cuda.is_available(),
             num_workers=args.num_workers,
             persistent_workers=args.num_workers > 0,
+            generator=torch.Generator().manual_seed(args.seed + 1) if args.seed is not None else None,
         )
     elif val_metadata_path:
         accelerator.print(f"Validation metadata not found, skipping validation: {val_metadata_path}")
@@ -1543,6 +1550,8 @@ def train(args):
             "Residual endpoint loss is only applied to SS residual models."
         )
     accelerator.print(f"Source-swap training augmentation: {args.augment_source_swap == 1}")
+    accelerator.print(f"Training seed: {args.seed}")
+    accelerator.print(f"Global batch: {args.train_bs} x {accelerator.num_processes} GPUs = {args.train_bs * accelerator.num_processes}")
     accelerator.print(f"Dataset size: {len(dataset)}")
     if train_metadata_asset_count is not None and val_metadata_asset_count is not None:
         accelerator.print(f"Train metadata source assets: {train_metadata_asset_count}")
