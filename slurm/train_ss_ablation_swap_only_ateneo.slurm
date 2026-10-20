@@ -16,7 +16,8 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 # Override resources with sbatch --nodelist=... --gres=gpu:TYPE:COUNT ...
-# Batch = allocated GPUs * TRAIN_BS (default 1/GPU). 20 epochs; swap_only: 10 on doubled data.
+# Batch = allocated GPUs * TRAIN_BS (default 1/GPU). Target: 250000 optimizer updates.
+# At 2 GPUs x batch 1: 10 epochs, or 5 epochs for swap_only.
 set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-$HOME/trellis-singularity/work/MorphFlow}"
 exec bash "$PROJECT_DIR/slurm/train_ss_ablation_ateneo.sh" swap_only "$@"

@@ -63,6 +63,10 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=None, help="Seed Python, NumPy, Torch and loader workers; omitted preserves historical behavior.")
     parser.add_argument("--val_bs", type=int, default=1)
     parser.add_argument("--train_epochs", type=int, default=100)
+    parser.add_argument("--expected_train_samples", type=int, default=None,
+                        help="Optional exact dataset size, including source swap; fail if filtering changes the ablation budget.")
+    parser.add_argument("--expected_train_steps", type=int, default=None,
+                        help="Optional total optimizer updates across all epochs; verified after distributed loader preparation.")
     parser.add_argument("--stop_after_epoch", type=int, default=None,
                         help="Stop after this completed epoch, preserving the train_epochs LR schedule.")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -889,6 +893,22 @@ def resolve_warmup_steps(requested_warmup_steps: int, total_training_steps: int)
     return min(requested_warmup_steps, max(1, total_training_steps // 10))
 
 
+def validate_training_budget(args, num_samples, steps_per_epoch=None):
+    for field in ("expected_train_samples", "expected_train_steps"):
+        expected = getattr(args, field, None)
+        if expected is not None and expected < 1:
+            raise ValueError(f"--{field} must be positive")
+    expected_samples = getattr(args, "expected_train_samples", None)
+    if expected_samples is not None and num_samples != expected_samples:
+        raise ValueError(f"Ablation dataset changed: expected {expected_samples} samples, found {num_samples}.")
+    expected_steps = getattr(args, "expected_train_steps", None)
+    if expected_steps is not None and steps_per_epoch is not None:
+        actual_steps = args.train_epochs * steps_per_epoch
+        if actual_steps != expected_steps:
+            raise ValueError(f"Ablation step budget changed: expected {expected_steps}, found {actual_steps} "
+                             f"({args.train_epochs} epochs x {steps_per_epoch} distributed steps).")
+
+
 def remember_base_lrs(optimizer):
     for group in optimizer.param_groups:
         group.setdefault("base_lr", group["lr"])
@@ -1168,6 +1188,7 @@ def train(args):
         source_image_filename=args.source_image_filename,
         augment_source_swap=args.augment_source_swap == 1,
     )
+    validate_training_budget(args, len(dataset))
 
     loader = DataLoader(
         dataset,
@@ -1287,6 +1308,8 @@ def train(args):
         model, optimizer, loader, scheduler = accelerator.prepare(
             model, optimizer, loader, scheduler
         )
+
+    validate_training_budget(args, len(dataset), len(loader))
 
     # A separate immutable supervisor, never part of the student's DDP module,
     # optimizer or checkpoints. Load original weights even when resuming a student.

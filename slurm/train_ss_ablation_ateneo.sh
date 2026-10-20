@@ -10,11 +10,10 @@ MODE="${1:---run}"
 CONDITION_GATE=alpha
 SOURCE_SWAP=0
 PRIOR_WEIGHT=0.0
-TRAIN_EPOCHS=20
 case "$ABLATION" in
   baseline) ;;
   gate_only) CONDITION_GATE=token ;;
-  swap_only) SOURCE_SWAP=1; TRAIN_EPOCHS=10 ;;
+  swap_only) SOURCE_SWAP=1 ;;
   prior_only) PRIOR_WEIGHT=0.1 ;;
   *) die "Unknown SS ablation: $ABLATION" ;;
 esac
@@ -23,9 +22,12 @@ TRAIN_ALPHA_GATE=0
 TRAIN_BS="${TRAIN_BS:-1}"
 SEED="${SEED:-42}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
+# Original v4 SS: 20 epochs * 100000 samples / (8 GPUs * batch 1).
+TARGET_TRAIN_STEPS="${TARGET_TRAIN_STEPS:-250000}"
 [[ "$TRAIN_BS" =~ ^[1-9][0-9]*$ ]] || die "TRAIN_BS must be positive."
 [[ "$SEED" =~ ^[0-9]+$ ]] || die "SEED must be a nonnegative integer."
 [[ "$NUM_WORKERS" =~ ^[0-9]+$ ]] || die "NUM_WORKERS must be a nonnegative integer."
+[[ "$TARGET_TRAIN_STEPS" =~ ^[1-9][0-9]*$ ]] || die "TARGET_TRAIN_STEPS must be positive."
 if [[ "$MODE" == --dry-run ]]; then
   NGPUS="${NGPUS:-${SLURM_GPUS_ON_NODE:-2}}"
 else
@@ -41,10 +43,14 @@ fi
 [[ "$NGPUS" =~ ^[1-9][0-9]*$ ]] || die "Invalid allocated GPU count: $NGPUS"
 GLOBAL_BATCH=$((NGPUS * TRAIN_BS))
 TRAIN_SAMPLES=$((50000 * (1 + SOURCE_SWAP)))
-RUN_NAME="${RUN_NAME:-v4_ss_ablation_${ABLATION}_e${TRAIN_EPOCHS}_s${SEED}_g${NGPUS}_bs${TRAIN_BS}}"
+STEPS_PER_EPOCH=$(((TRAIN_SAMPLES + GLOBAL_BATCH - 1) / GLOBAL_BATCH))
+(( TARGET_TRAIN_STEPS % STEPS_PER_EPOCH == 0 )) || die "Cannot reach exactly $TARGET_TRAIN_STEPS updates with whole epochs: global batch=$GLOBAL_BATCH, steps/epoch=$STEPS_PER_EPOCH. Choose a compatible batch or TARGET_TRAIN_STEPS."
+TRAIN_EPOCHS=$((TARGET_TRAIN_STEPS / STEPS_PER_EPOCH))
+RUN_NAME="${RUN_NAME:-v4_ss_ablation_${ABLATION}_steps${TARGET_TRAIN_STEPS}_e${TRAIN_EPOCHS}_s${SEED}_g${NGPUS}_bs${TRAIN_BS}}"
 [[ "$RUN_NAME" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die "Invalid RUN_NAME."
 echo "ABLATION=$ABLATION NODE=${SLURM_JOB_NODELIST:-wn46} GPUS=$NGPUS TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$GLOBAL_BATCH"
 echo "EPOCHS=$TRAIN_EPOCHS ORIGINAL_TRAIN_SAMPLES=50000 TRAIN_SAMPLES=$TRAIN_SAMPLES SEED=$SEED GATE=$CONDITION_GATE SOURCE_SWAP=$SOURCE_SWAP PRIOR_WEIGHT=$PRIOR_WEIGHT"
+echo "STEPS_PER_EPOCH=$STEPS_PER_EPOCH TARGET_TRAIN_STEPS=$TARGET_TRAIN_STEPS"
 echo "RUN_NAME=$RUN_NAME"
 if [[ "$MODE" == --dry-run ]]; then exit 0; fi
 
@@ -133,7 +139,7 @@ if [[ -n "$RESUME_FROM" ]]; then
   [[ "$RESUME_FROM" == "$resolved_run/checkpoints/"* ]] || die "Resume only checkpoints belonging to this ablation; choose a fresh RUN_NAME to train from TRELLIS."
   RESUME_FROM_IN="$OUT_ROOT_IN/$RUN_NAME/${RESUME_FROM#"$resolved_run/"}"
 fi
-python3 - "$RUN_DIR_HOST/ablation_config.json" "$ABLATION" "$CONDITION_GATE" "$SOURCE_SWAP" "$PRIOR_WEIGHT" "$NGPUS" "$TRAIN_BS" "$SEED" "$DATA_ROOT_HOST" "$RESUME_FROM" "$TRAIN_EPOCHS" <<'PY_CONFIG'
+python3 - "$RUN_DIR_HOST/ablation_config.json" "$ABLATION" "$CONDITION_GATE" "$SOURCE_SWAP" "$PRIOR_WEIGHT" "$NGPUS" "$TRAIN_BS" "$SEED" "$DATA_ROOT_HOST" "$RESUME_FROM" "$TRAIN_EPOCHS" "$TARGET_TRAIN_STEPS" "$STEPS_PER_EPOCH" <<'PY_CONFIG'
 import json
 from pathlib import Path
 import sys
@@ -142,6 +148,7 @@ keys=('experiment','condition_gate','source_swap','prior_weight','num_gpus','bat
 configuration=dict(zip(keys,sys.argv[2:10]))
 configuration.update(epochs=int(sys.argv[11]),original_train_samples=50000,
                      train_samples=50000*(1+int(sys.argv[4])),
+                     target_train_steps=int(sys.argv[12]),steps_per_epoch=int(sys.argv[13]),
                      learning_rate=1e-4,warmup_steps=10000,global_batch=int(sys.argv[6])*int(sys.argv[7]))
 if path.exists():
     previous=json.loads(path.read_text())
@@ -181,6 +188,8 @@ export SINGULARITYENV_SOURCE_SWAP="$SOURCE_SWAP"
 export SINGULARITYENV_TRAIN_ALPHA_GATE="$TRAIN_ALPHA_GATE"
 export SINGULARITYENV_TRAIN_BS="$TRAIN_BS"
 export SINGULARITYENV_TRAIN_EPOCHS="$TRAIN_EPOCHS"
+export SINGULARITYENV_TRAIN_SAMPLES="$TRAIN_SAMPLES"
+export SINGULARITYENV_TARGET_TRAIN_STEPS="$TARGET_TRAIN_STEPS"
 export SINGULARITYENV_SEED="$SEED"
 export SINGULARITYENV_NGPUS="$NGPUS"
 export SINGULARITYENV_NUM_WORKERS="$NUM_WORKERS"
@@ -305,6 +314,8 @@ accelerate launch "${launch_args[@]}" \
   --seed "$SEED" \
   --val_bs 1 \
   --train_epochs "$TRAIN_EPOCHS" \
+  --expected_train_samples "$TRAIN_SAMPLES" \
+  --expected_train_steps "$TARGET_TRAIN_STEPS" \
   --lr 1e-4 \
   --cond_lr 1e-4 \
   --flow_lr 1e-4 \

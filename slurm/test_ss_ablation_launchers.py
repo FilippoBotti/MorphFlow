@@ -8,11 +8,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT/'slurm/train_ss_ablation_ateneo.sh'
-EXPERIMENTS = {'baseline':('alpha','0','0.0','0',20), 'gate_only':('token','0','0.0','1',20),
-               'swap_only':('alpha','1','0.0','0',10), 'prior_only':('alpha','0','0.1','0',20)}
+EXPERIMENTS = {'baseline':('alpha','0','0.0','0',10), 'gate_only':('token','0','0.0','1',10),
+               'swap_only':('alpha','1','0.0','0',5), 'prior_only':('alpha','0','0.1','0',10)}
 
 
 def train_parser():
@@ -45,7 +46,7 @@ class LauncherTests(unittest.TestCase):
             if key.startswith('BASH_FUNC_'):
                 self.env.pop(key)
         self.env.update(PROJECT_DIR=str(ROOT),TRAIN_BS='1',SEED='42',NGPUS='2')
-        for name in ('RUN_NAME','RESUME_FROM','AUTO_RESUME','BASH_ENV'):
+        for name in ('RUN_NAME','RESUME_FROM','AUTO_RESUME','BASH_ENV','TARGET_TRAIN_STEPS'):
             self.env.pop(name,None)
         self.root = root
 
@@ -61,6 +62,7 @@ class LauncherTests(unittest.TestCase):
             self.assertIn('EPOCHS='+str(epochs),result.stdout)
             self.assertIn('TRAIN_SAMPLES='+str(50000*(1+int(swap))),result.stdout)
             self.assertIn('GLOBAL_BATCH=2',result.stdout)
+            self.assertIn('TARGET_TRAIN_STEPS=250000',result.stdout)
             self.assertIn('GATE='+gate,result.stdout)
             self.assertIn('SOURCE_SWAP='+swap,result.stdout)
             self.assertIn('PRIOR_WEIGHT='+prior,result.stdout)
@@ -70,7 +72,41 @@ class LauncherTests(unittest.TestCase):
         self.env.update(NGPUS='8',TRAIN_BS='2')
         result = subprocess.run(['bash',str(COMMON),'baseline','--dry-run'],env=self.env,check=True,text=True,stdout=subprocess.PIPE)
         self.assertIn('GLOBAL_BATCH=16',result.stdout)
-        self.assertIn('EPOCHS=20',result.stdout)
+        self.assertIn('EPOCHS=80',result.stdout)
+        self.assertIn('STEPS_PER_EPOCH=3125',result.stdout)
+
+    def test_eight_gpu_reference_and_changed_batch_keep_250000_updates(self):
+        for gpus,per_gpu,baseline_epochs,swap_epochs in ((8,1,40,20),(2,2,20,10),(1,1,5,1)):
+            # A single-GPU swap run cannot end at 250k using complete epochs.
+            variants=(('baseline',baseline_epochs),) if gpus==1 else (('baseline',baseline_epochs),('swap_only',swap_epochs))
+            for variant,epochs in variants:
+                self.env.update(NGPUS=str(gpus),TRAIN_BS=str(per_gpu))
+                result=subprocess.run(['bash',str(COMMON),variant,'--dry-run'],env=self.env,check=True,text=True,stdout=subprocess.PIPE)
+                self.assertIn('EPOCHS='+str(epochs)+' ',result.stdout)
+                self.assertIn('TARGET_TRAIN_STEPS=250000',result.stdout)
+
+    def test_inexact_whole_epoch_budget_is_rejected_instead_of_rounded(self):
+        self.env.update(NGPUS='3',TRAIN_BS='1')
+        result=subprocess.run(['bash',str(COMMON),'baseline','--dry-run'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Cannot reach exactly 250000',result.stdout)
+
+    def test_actual_distributed_loader_and_dataset_must_match_step_budget(self):
+        path=ROOT/'train.py'
+        tree=ast.parse(path.read_text())
+        function=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='validate_training_budget')
+        namespace={}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),str(path),'exec'),namespace)
+        validate=namespace['validate_training_budget']
+        args=SimpleNamespace(train_epochs=10,expected_train_samples=50000,expected_train_steps=250000)
+        validate(args,50000,25000)
+        with self.assertRaisesRegex(ValueError,'dataset changed'):
+            validate(args,49999)
+        with self.assertRaisesRegex(ValueError,'step budget changed'):
+            validate(args,50000,12500)
+        args=SimpleNamespace(train_epochs=5,expected_train_samples=100000,expected_train_steps=250000)
+        validate(args,100000,50000)
+        validate(SimpleNamespace(train_epochs=20),100000,12500)
 
     def prepare_fake_runtime(self):
         root = self.root
@@ -125,7 +161,9 @@ subprocess.run(['bash','-c',prefix+segment],env=env,check=True)
             self.assertEqual(command[command.index('--num_processes')+1],'2')
             args = parser.parse_args(command[command.index('main.py')+1:])
             self.assertEqual(args.train_epochs,epochs)
-            self.assertEqual(args.train_epochs*50000*(1+args.augment_source_swap),1000000)
+            self.assertEqual(args.expected_train_samples,50000*(1+args.augment_source_swap))
+            self.assertEqual(args.expected_train_steps,250000)
+            self.assertEqual(args.train_epochs*args.expected_train_samples//2,250000)
             self.assertEqual(args.train_bs,1)
             self.assertEqual(args.flow_target,'ss')
             self.assertEqual(args.separate_cond,1)
@@ -144,7 +182,7 @@ subprocess.run(['bash','-c',prefix+segment],env=env,check=True)
         for name in ('gate_only','swap_only','prior_only'):
             differences = {key for key in baseline if baseline[key]!=parsed[name][key]}
             expected = {'run_name'} | {'gate_only':{'separate_cond_gate','train_flow_alpha_gate'},
-                                      'swap_only':{'augment_source_swap','train_epochs'},
+                                      'swap_only':{'augment_source_swap','train_epochs','expected_train_samples'},
                                       'prior_only':{'trellis_prior_weight'}}[name]
             self.assertEqual(differences,expected)
 
