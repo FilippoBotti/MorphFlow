@@ -36,6 +36,26 @@ OUT_ROOT_HOST="$ARCHIVE_HOST/morphflow_runs"
 OUT_ROOT_IN="/archive/morphflow_runs"
 
 RUN_NAME="${RUN_NAME:-v4_interp3d_slat_dual_tgate_p25g4}"
+CONDITION_GATE="${CONDITION_GATE:-token}"
+SOURCE_SWAP="${SOURCE_SWAP:-1}"
+TRAIN_BS="${TRAIN_BS:-1}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-20}"
+SEED="${SEED:-42}"
+EXPECTED_TRAIN_STEPS="${EXPECTED_TRAIN_STEPS:-0}"
+[[ "$CONDITION_GATE" == token || "$CONDITION_GATE" == alpha ]] || { echo 'Invalid CONDITION_GATE' >&2; exit 1; }
+[[ "$SOURCE_SWAP" == 0 || "$SOURCE_SWAP" == 1 ]] || { echo 'Invalid SOURCE_SWAP' >&2; exit 1; }
+for value in "$TRAIN_BS" "$TRAIN_EPOCHS"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo 'Batch and epochs must be positive integers' >&2; exit 1; }
+done
+[[ "$SEED" =~ ^[0-9]+$ && "$EXPECTED_TRAIN_STEPS" =~ ^[0-9]+$ ]] || { echo 'Invalid seed or expected step budget' >&2; exit 1; }
+TRAIN_ALPHA_GATE=0
+[[ "$CONDITION_GATE" != token ]] || TRAIN_ALPHA_GATE=1
+TRAIN_SAMPLES=$((50000 * (1 + SOURCE_SWAP)))
+if (( EXPECTED_TRAIN_STEPS > 0 )); then
+  (( TRAIN_EPOCHS * ((TRAIN_SAMPLES + 8 * TRAIN_BS - 1) / (8 * TRAIN_BS)) == EXPECTED_TRAIN_STEPS )) || {
+    echo 'Epochs/batch do not match EXPECTED_TRAIN_STEPS for eight GPUs' >&2; exit 1;
+  }
+fi
 # SS: LoRA cross-attn + semantic matching + hubness regularization.
 # Cycle OFF; usage weight=0.01 cap=4; flow alpha embedder frozen/off.
 SEMANTIC_CYCLE_LOSS_WEIGHT="0.0"
@@ -116,6 +136,11 @@ else
   RESUME_FROM="<none>"
 fi
 
+if [[ "$AUTO_RESUME" == 0 && "$RESUME_FROM" == '<none>' && -f "$RUN_DIR_HOST/checkpoints/morphflow_last.pt" ]]; then
+  echo 'Existing checkpoint: choose a fresh RUN_NAME or enable AUTO_RESUME' >&2
+  exit 1
+fi
+
 exec > >(tee -a "$LOG_DIR_HOST/train.log") 2>&1
 
 echo "RUN_NAME=$RUN_NAME"
@@ -123,6 +148,8 @@ echo "RUN_DIR_HOST=$RUN_DIR_HOST"
 echo "DATA_ROOT_HOST=$DATA_ROOT_HOST"
 echo "AUTO_RESUME=$AUTO_RESUME"
 echo "RESUME_FROM=$RESUME_FROM"
+echo "FLOW_TARGET=slat CONDITION_GATE=$CONDITION_GATE TRAIN_ALPHA_GATE=$TRAIN_ALPHA_GATE SOURCE_SWAP=$SOURCE_SWAP"
+echo "TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$((8 * TRAIN_BS)) TRAIN_EPOCHS=$TRAIN_EPOCHS TRAIN_SAMPLES=$TRAIN_SAMPLES EXPECTED_TRAIN_STEPS=$EXPECTED_TRAIN_STEPS SEED=$SEED"
 echo "SEMANTIC_CYCLE_LOSS_WEIGHT=$SEMANTIC_CYCLE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_LOSS_WEIGHT=$SEMANTIC_USAGE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_CAP=$SEMANTIC_USAGE_CAP"
@@ -138,6 +165,14 @@ export SINGULARITYENV_FLUX_ROOT_IN="$FLUX_ROOT_IN"
 export SINGULARITYENV_OUT_ROOT_IN="$OUT_ROOT_IN"
 export SINGULARITYENV_RUN_NAME="$RUN_NAME"
 export SINGULARITYENV_RESUME_ARG="$RESUME_ARG"
+export SINGULARITYENV_CONDITION_GATE="$CONDITION_GATE"
+export SINGULARITYENV_TRAIN_ALPHA_GATE="$TRAIN_ALPHA_GATE"
+export SINGULARITYENV_SOURCE_SWAP="$SOURCE_SWAP"
+export SINGULARITYENV_TRAIN_BS="$TRAIN_BS"
+export SINGULARITYENV_TRAIN_EPOCHS="$TRAIN_EPOCHS"
+export SINGULARITYENV_TRAIN_SAMPLES="$TRAIN_SAMPLES"
+export SINGULARITYENV_EXPECTED_TRAIN_STEPS="$EXPECTED_TRAIN_STEPS"
+export SINGULARITYENV_SEED="$SEED"
 export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_WEIGHT="$SEMANTIC_CYCLE_LOSS_WEIGHT"
 export SINGULARITYENV_SEMANTIC_CYCLE_LOSS_PROB="$SEMANTIC_CYCLE_LOSS_PROB"
 export SINGULARITYENV_SEMANTIC_USAGE_LOSS_WEIGHT="$SEMANTIC_USAGE_LOSS_WEIGHT"
@@ -157,7 +192,9 @@ export SINGULARITYENV_TRELLIS_PRIOR_RMS_GUARD_LOW_RATIO="$TRELLIS_PRIOR_RMS_GUAR
 export SINGULARITYENV_TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO="$TRELLIS_PRIOR_RMS_GUARD_HIGH_RATIO"
 export SINGULARITYENV_HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 
-test -s "$BENCH_TORCH_HOME/hub/facebookresearch_dinov2_main/hubconf.py" || { echo "ERROR: DINOv2 cache incomplete" >&2; exit 1; }
+if [[ "$TRELLIS_PRIOR_WEIGHT" != 0 && "$TRELLIS_PRIOR_WEIGHT" != 0.0 ]]; then
+  test -s "$BENCH_TORCH_HOME/hub/facebookresearch_dinov2_main/hubconf.py" || { echo "ERROR: DINOv2 cache incomplete" >&2; exit 1; }
+fi
 singularity exec --cleanenv --nv \
   --bind "$TRELLIS_BASE:/opt/trellis" \
   --bind "$BENCH_HF_HOME:/opt/trellis/hf-home:rw" \
@@ -212,6 +249,11 @@ if weight > 0:
         print(f"TRELLIS prior cache: {path}")
 PY
 
+if python - "$TRELLIS_PRIOR_WEIGHT" <<'PY_PRIOR_ENABLED'
+import sys
+sys.exit(0 if float(sys.argv[1]) > 0 else 1)
+PY_PRIOR_ENABLED
+then
 python - <<'PY_V4_PRIOR'
 import torch
 from huggingface_hub import hf_hub_download
@@ -228,6 +270,12 @@ encoder = torch.hub.load('facebookresearch/dinov2:main',
 del encoder
 print('Prior DINOv2 warmed up once; starting 8 training GPUs.', flush=True)
 PY_V4_PRIOR
+fi
+
+budget_args=()
+if (( EXPECTED_TRAIN_STEPS > 0 )); then
+  budget_args=(--expected_train_steps "$EXPECTED_TRAIN_STEPS")
+fi
 
 accelerate launch \
   --multi-gpu \
@@ -241,9 +289,11 @@ accelerate launch \
   --val_metadata metadata_val.json \
   --out_dir "$OUT_ROOT_IN" \
   --run_name "$RUN_NAME" \
-  --train_bs 1 \
+  --train_bs "$TRAIN_BS" \
+  --seed "$SEED" \
   --val_bs 1 \
-  --train_epochs 20 \
+  --train_epochs "$TRAIN_EPOCHS" \
+  --expected_train_samples "$TRAIN_SAMPLES" \
   --lr 5e-5 \
   --cond_lr 5e-5 \
   --flow_lr 5e-5 \
@@ -315,21 +365,22 @@ accelerate launch \
   --semantic_usage_cap "$SEMANTIC_USAGE_CAP" \
   --semantic_match_log_stats 0 \
   --separate_cond 1 \
-  --separate_cond_gate token \
+  --separate_cond_gate "$CONDITION_GATE" \
   --t_schedule logit_normal \
   --t_logit_mean 1.0 \
   --t_logit_std 1.0 \
   --trainable_scope full \
   --freeze_modules none \
   --use_lora 1 \
-  --train_flow_alpha_gate 1 \
+  --train_flow_alpha_gate "$TRAIN_ALPHA_GATE" \
   --train_flow_alpha_embedder 0 \
   --use_ema 0 \
   --mixed_precision bf16 \
   --allow_tf32 1 \
   --use_checkpoint 0 \
-  --augment_source_swap 1 \
+  --augment_source_swap "$SOURCE_SWAP" \
   --checkpoint_every 2 \
+  ${budget_args[@]+"${budget_args[@]}"} \
   $RESUME_ARG
 
 echo "RUN_DIR=$OUT_ROOT_IN/$RUN_NAME"
