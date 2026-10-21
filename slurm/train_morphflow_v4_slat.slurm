@@ -42,6 +42,14 @@ TRAIN_BS="${TRAIN_BS:-1}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-20}"
 SEED="${SEED:-42}"
 EXPECTED_TRAIN_STEPS="${EXPECTED_TRAIN_STEPS:-0}"
+NGPUS="${NGPUS:-${SLURM_GPUS_ON_NODE:-8}}"
+[[ "$NGPUS" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid GPU count' >&2; exit 1; }
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+  [[ "${SLURM_JOB_NUM_NODES:-1}" == 1 ]] || { echo 'Use one node' >&2; exit 1; }
+  [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "$CUDA_VISIBLE_DEVICES" != NoDevFiles ]] || { echo 'No allocated CUDA devices' >&2; exit 1; }
+  IFS=',' read -r -a allocated_gpus <<< "$CUDA_VISIBLE_DEVICES"
+  [[ "${#allocated_gpus[@]}" == "$NGPUS" ]] || { echo 'GPU count differs from CUDA_VISIBLE_DEVICES' >&2; exit 1; }
+fi
 [[ "$CONDITION_GATE" == token || "$CONDITION_GATE" == alpha ]] || { echo 'Invalid CONDITION_GATE' >&2; exit 1; }
 [[ "$SOURCE_SWAP" == 0 || "$SOURCE_SWAP" == 1 ]] || { echo 'Invalid SOURCE_SWAP' >&2; exit 1; }
 for value in "$TRAIN_BS" "$TRAIN_EPOCHS"; do
@@ -52,8 +60,8 @@ TRAIN_ALPHA_GATE=0
 [[ "$CONDITION_GATE" != token ]] || TRAIN_ALPHA_GATE=1
 TRAIN_SAMPLES=$((50000 * (1 + SOURCE_SWAP)))
 if (( EXPECTED_TRAIN_STEPS > 0 )); then
-  (( TRAIN_EPOCHS * ((TRAIN_SAMPLES + 8 * TRAIN_BS - 1) / (8 * TRAIN_BS)) == EXPECTED_TRAIN_STEPS )) || {
-    echo 'Epochs/batch do not match EXPECTED_TRAIN_STEPS for eight GPUs' >&2; exit 1;
+  (( TRAIN_EPOCHS * ((TRAIN_SAMPLES + NGPUS * TRAIN_BS - 1) / (NGPUS * TRAIN_BS)) == EXPECTED_TRAIN_STEPS )) || {
+    echo 'Epochs/batch do not match EXPECTED_TRAIN_STEPS for the requested GPUs' >&2; exit 1;
   }
 fi
 # SS: LoRA cross-attn + semantic matching + hubness regularization.
@@ -149,7 +157,7 @@ echo "DATA_ROOT_HOST=$DATA_ROOT_HOST"
 echo "AUTO_RESUME=$AUTO_RESUME"
 echo "RESUME_FROM=$RESUME_FROM"
 echo "FLOW_TARGET=slat CONDITION_GATE=$CONDITION_GATE TRAIN_ALPHA_GATE=$TRAIN_ALPHA_GATE SOURCE_SWAP=$SOURCE_SWAP"
-echo "TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$((8 * TRAIN_BS)) TRAIN_EPOCHS=$TRAIN_EPOCHS TRAIN_SAMPLES=$TRAIN_SAMPLES EXPECTED_TRAIN_STEPS=$EXPECTED_TRAIN_STEPS SEED=$SEED"
+echo "GPUS=$NGPUS TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$((NGPUS * TRAIN_BS)) TRAIN_EPOCHS=$TRAIN_EPOCHS TRAIN_SAMPLES=$TRAIN_SAMPLES EXPECTED_TRAIN_STEPS=$EXPECTED_TRAIN_STEPS SEED=$SEED"
 echo "SEMANTIC_CYCLE_LOSS_WEIGHT=$SEMANTIC_CYCLE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_LOSS_WEIGHT=$SEMANTIC_USAGE_LOSS_WEIGHT"
 echo "SEMANTIC_USAGE_CAP=$SEMANTIC_USAGE_CAP"
@@ -165,6 +173,8 @@ export SINGULARITYENV_FLUX_ROOT_IN="$FLUX_ROOT_IN"
 export SINGULARITYENV_OUT_ROOT_IN="$OUT_ROOT_IN"
 export SINGULARITYENV_RUN_NAME="$RUN_NAME"
 export SINGULARITYENV_RESUME_ARG="$RESUME_ARG"
+export SINGULARITYENV_NGPUS="$NGPUS"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then export SINGULARITYENV_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"; fi
 export SINGULARITYENV_CONDITION_GATE="$CONDITION_GATE"
 export SINGULARITYENV_TRAIN_ALPHA_GATE="$TRAIN_ALPHA_GATE"
 export SINGULARITYENV_SOURCE_SWAP="$SOURCE_SWAP"
@@ -225,7 +235,11 @@ mkdir -p "$TMPDIR" "$OUT_ROOT_IN/$RUN_NAME"
 cd "$PROJECT_DIR"
 
 python --version
-python -c 'import torch; print("torch=", torch.__version__, "cuda=", torch.version.cuda, "avail=", torch.cuda.is_available(), "bf16=", torch.cuda.is_bf16_supported())'
+python - "$NGPUS" <<'PY_GPU'
+import sys, torch
+assert torch.cuda.device_count() == int(sys.argv[1]), (torch.cuda.device_count(), sys.argv[1])
+print("torch=", torch.__version__, "cuda=", torch.version.cuda, "GPUs=", torch.cuda.device_count(), "bf16=", torch.cuda.is_bf16_supported())
+PY_GPU
 nvidia-smi -L || true
 
 # Warm/check the shared cache once before launching the eight GPU processes.
@@ -268,7 +282,8 @@ print('TORCH_HOME:', torch.hub.get_dir(), flush=True)
 encoder = torch.hub.load('facebookresearch/dinov2:main',
                          'dinov2_vitl14_reg', pretrained=True, trust_repo=True)
 del encoder
-print('Prior DINOv2 warmed up once; starting 8 training GPUs.', flush=True)
+import os
+print('Prior DINOv2 warmed up once; starting %s training GPUs.' % os.environ['NGPUS'], flush=True)
 PY_V4_PRIOR
 fi
 
@@ -277,12 +292,9 @@ if (( EXPECTED_TRAIN_STEPS > 0 )); then
   budget_args=(--expected_train_steps "$EXPECTED_TRAIN_STEPS")
 fi
 
-accelerate launch \
-  --multi-gpu \
-  --num_processes 8 \
-  --num_machines 1 \
-  --mixed_precision bf16 \
-  --dynamo_backend no \
+launch_args=(--num_processes "$NGPUS" --num_machines 1 --mixed_precision bf16 --dynamo_backend no)
+if (( NGPUS > 1 )); then launch_args+=(--multi-gpu); fi
+accelerate launch "${launch_args[@]}" \
   main.py \
   --root_dir "$DATA_ROOT_IN" \
   --metadata metadata_train.json \

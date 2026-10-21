@@ -22,7 +22,8 @@ class SlatAblationTests(unittest.TestCase):
             capture.write_text('import json,sys\nprint("CAPTURE="+json.dumps(sys.argv[1:]))\n')
             env = os.environ.copy()
             for key in ('CONDITION_GATE','SOURCE_SWAP','TRAIN_BS','TRAIN_EPOCHS',
-                        'EXPECTED_TRAIN_STEPS','TRELLIS_PRIOR_WEIGHT','SEED','RUN_NAME'):
+                        'EXPECTED_TRAIN_STEPS','TRELLIS_PRIOR_WEIGHT','SEED','RUN_NAME',
+                        'NGPUS','SLURM_GPUS_ON_NODE','SLURM_JOB_ID','SLURM_JOB_NUM_NODES','CUDA_VISIBLE_DEVICES'):
                 env.pop(key,None)
             env.update(overrides)
             prefix = ('set -euo pipefail\n'
@@ -66,6 +67,27 @@ class SlatAblationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIsNone(args)
         self.assertIn('Epochs/batch do not match',result.stderr)
+
+    def test_gate_only_two_gpus_batch_two_keeps_update_budget(self):
+        result,args=self.command(dict(CONDITION_GATE='token',SOURCE_SWAP='0',
+                                      TRELLIS_PRIOR_WEIGHT='0.0',TRAIN_BS='2',NGPUS='2',
+                                      SLURM_JOB_ID='123',SLURM_GPUS_ON_NODE='2',
+                                      CUDA_VISIBLE_DEVICES='0,1',TRAIN_EPOCHS='20',
+                                      EXPECTED_TRAIN_STEPS='250000'),prior_guard=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag,value in [('--num_processes','2'),('--train_bs','2'),('--train_epochs','20'),
+                           ('--separate_cond_gate','token'),('--train_flow_alpha_gate','1'),
+                           ('--augment_source_swap','0'),('--trellis_prior_weight','0.0'),
+                           ('--expected_train_samples','50000'),('--expected_train_steps','250000')]:
+            self.assertEqual(args[args.index(flag)+1],value)
+        self.assertIn('--multi-gpu',args)
+
+    def test_allocation_mismatch_rejected_before_training(self):
+        result,args=self.command(dict(NGPUS='8',SLURM_JOB_ID='123',
+                                      SLURM_GPUS_ON_NODE='2',CUDA_VISIBLE_DEVICES='0,1'))
+        self.assertNotEqual(result.returncode,0)
+        self.assertIsNone(args)
+        self.assertIn('GPU count differs',result.stderr)
 
 
 if __name__=='__main__':unittest.main()
