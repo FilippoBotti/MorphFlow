@@ -138,6 +138,14 @@ def decode_with_mesh_fallback(original, mesh_decoder, sparse_tensor_cls, feats, 
 
 
 def worker_main():
+    retention_path = os.environ.get("MORPHFLOW_DENSE_RETENTION_SCRIPT")
+    if retention_path and len(sys.argv) > 1 and sys.argv[1] in ("morphflow", "morphany3d", "interp3d") and "--run-root" in sys.argv:
+        root = Path(sys.argv[sys.argv.index("--run-root") + 1])
+        retention = runpy.run_path(retention_path)
+        if retention["retired"](root, sys.argv[1]):
+            retention["release"](root, sys.argv[1])
+            print("RESUME: dense raw assets already retired after verified merged metrics", flush=True)
+            return
     script = os.environ.get("MORPHFLOW_MESH_REPAIR_SCRIPT", SCRIPT)
     sys.path.insert(0, str(Path(script).parent))
     sys.argv[0] = script

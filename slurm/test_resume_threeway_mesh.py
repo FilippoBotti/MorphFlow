@@ -5,6 +5,7 @@ import enum
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -122,6 +123,17 @@ class MeshFallbackTests(unittest.TestCase):
         loader = patch.object(repair, "load_channel_blocker", return_value=block, create=True)
         self.load_channel_blocker = loader.start()
         self.addCleanup(loader.stop)
+
+    def test_retired_dense_generation_returns_before_loading_models(self):
+        retired = Mock(return_value=True)
+        release = Mock()
+        with patch.dict(os.environ, {'MORPHFLOW_DENSE_RETENTION_SCRIPT':'/repair/retention.py'}), \
+                patch.object(sys, 'argv', ['worker.py','morphflow','--run-root','/run/weighted_50/cell']), \
+                patch.object(repair.runpy, 'run_path', return_value={'retired':retired,'release':release}) as run:
+            repair.worker_main()
+        run.assert_called_once_with('/repair/retention.py')
+        retired.assert_called_once_with(Path('/run/weighted_50/cell'),'morphflow')
+        release.assert_called_once_with(Path('/run/weighted_50/cell'),'morphflow')
 
     def decoder(self, layers):
         return types.SimpleNamespace(modules=lambda: iter(layers))
