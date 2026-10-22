@@ -67,6 +67,8 @@ def build_parser():
                         help="Optional exact dataset size, including source swap; fail if filtering changes the ablation budget.")
     parser.add_argument("--expected_train_steps", type=int, default=None,
                         help="Optional total optimizer updates across all epochs; verified after distributed loader preparation.")
+    parser.add_argument("--max_train_steps", type=int, default=None,
+                        help="Exact optimizer-step limit; finish validation/checkpointing after a partial final epoch.")
     parser.add_argument("--stop_after_epoch", type=int, default=None,
                         help="Stop after this completed epoch, preserving the train_epochs LR schedule.")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -894,7 +896,7 @@ def resolve_warmup_steps(requested_warmup_steps: int, total_training_steps: int)
 
 
 def validate_training_budget(args, num_samples, steps_per_epoch=None):
-    for field in ("expected_train_samples", "expected_train_steps"):
+    for field in ("expected_train_samples", "expected_train_steps", "max_train_steps"):
         expected = getattr(args, field, None)
         if expected is not None and expected < 1:
             raise ValueError(f"--{field} must be positive")
@@ -902,8 +904,11 @@ def validate_training_budget(args, num_samples, steps_per_epoch=None):
     if expected_samples is not None and num_samples != expected_samples:
         raise ValueError(f"Ablation dataset changed: expected {expected_samples} samples, found {num_samples}.")
     expected_steps = getattr(args, "expected_train_steps", None)
+    limit = getattr(args, "max_train_steps", None)
+    if limit is not None and steps_per_epoch is not None and args.train_epochs * steps_per_epoch < limit:
+        raise ValueError("--max_train_steps exceeds the available distributed epoch budget")
     if expected_steps is not None and steps_per_epoch is not None:
-        actual_steps = args.train_epochs * steps_per_epoch
+        actual_steps = limit if limit is not None else args.train_epochs * steps_per_epoch
         if actual_steps != expected_steps:
             raise ValueError(f"Ablation step budget changed: expected {expected_steps}, found {actual_steps} "
                              f"({args.train_epochs} epochs x {steps_per_epoch} distributed steps).")
@@ -1283,6 +1288,10 @@ def train(args):
     )
 
     total_training_steps = args.train_epochs * len(loader)
+    if args.max_train_steps is not None:
+        # Accelerate's default (unsplit batches) scheduler advances once per
+        # process on every optimizer update. Preserve that existing convention.
+        total_training_steps = args.max_train_steps * accelerator.num_processes
     warmup_steps = resolve_warmup_steps(args.warmup_steps, total_training_steps)
     scheduler = build_lr_scheduler(
         optimizer=optimizer,
@@ -1613,6 +1622,8 @@ def train(args):
         )
 
     for epoch in range(start_epoch, end_epoch + 1):
+        if args.max_train_steps is not None and global_step >= args.max_train_steps:
+            break
         running_loss = 0.0
 
         progress_bar = tqdm(
@@ -1813,7 +1824,12 @@ def train(args):
                 )
                 accelerator.wait_for_everyone()
 
-        epoch_avg = running_loss / max(1, len(loader))
+            if args.max_train_steps is not None and global_step >= args.max_train_steps:
+                accelerator.print(f"Reached optimizer-step limit {global_step}; validating and saving checkpoint.")
+                progress_bar.close()
+                break
+
+        epoch_avg = running_loss / max(1, batch_idx)
         accelerator.print(f"Epoch {epoch} completed. avg_loss={epoch_avg:.6f}")
 
         val_avg = None

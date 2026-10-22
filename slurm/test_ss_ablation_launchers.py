@@ -85,11 +85,13 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn('EPOCHS='+str(epochs)+' ',result.stdout)
                 self.assertIn('TARGET_TRAIN_STEPS=250000',result.stdout)
 
-    def test_inexact_whole_epoch_budget_is_rejected_instead_of_rounded(self):
+    def test_inexact_whole_epoch_budget_stops_at_exact_step_instead_of_rounding(self):
         self.env.update(NGPUS='3',TRAIN_BS='1')
-        result=subprocess.run(['bash',str(COMMON),'baseline','--dry-run'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-        self.assertNotEqual(result.returncode,0)
-        self.assertIn('Cannot reach exactly 250000',result.stdout)
+        for variant,epochs in [('baseline',15),('gate_only',15),('prior_only',15),('swap_only',8)]:
+            result=subprocess.run(['bash',str(COMMON),variant,'--dry-run'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            self.assertEqual(result.returncode,0,result.stdout)
+            self.assertIn('EPOCHS='+str(epochs)+' ',result.stdout)
+            self.assertIn('MAX_TRAIN_STEPS=250000',result.stdout)
 
     def test_actual_distributed_loader_and_dataset_must_match_step_budget(self):
         path=ROOT/'train.py'
@@ -107,6 +109,12 @@ class LauncherTests(unittest.TestCase):
         args=SimpleNamespace(train_epochs=5,expected_train_samples=100000,expected_train_steps=250000)
         validate(args,100000,50000)
         validate(SimpleNamespace(train_epochs=20),100000,12500)
+        validate(SimpleNamespace(train_epochs=15,expected_train_samples=50000,
+                                 expected_train_steps=250000,max_train_steps=250000),50000,16667)
+        validate(SimpleNamespace(train_epochs=8,expected_train_samples=100000,
+                                 expected_train_steps=250000,max_train_steps=250000),100000,33334)
+        with self.assertRaisesRegex(ValueError,'exceeds'):
+            validate(SimpleNamespace(train_epochs=14,max_train_steps=250000),50000,16667)
 
     def prepare_fake_runtime(self):
         root = self.root
@@ -200,6 +208,19 @@ subprocess.run(['bash','-c',prefix+segment],env=env,check=True)
         failed=self.run_fake('baseline',check=False)
         self.assertNotEqual(failed.returncode,0)
         self.assertIn('Configuration changed',failed.stdout)
+
+    def test_actual_three_gpu_commands_use_partial_epoch_stop(self):
+        self.prepare_fake_runtime()
+        self.env.update(SLURM_GPUS_ON_NODE='3',CUDA_VISIBLE_DEVICES='0,1,2',NGPUS='3')
+        parser=train_parser()
+        for variant,epochs in [('gate_only',15),('swap_only',8),('prior_only',15)]:
+            self.run_fake(variant)
+            command=json.loads((self.root/'captured.json').read_text())
+            args=parser.parse_args(command[command.index('main.py')+1:])
+            self.assertEqual(command[command.index('--num_processes')+1],'3')
+            self.assertEqual(args.train_epochs,epochs)
+            self.assertEqual(args.max_train_steps,250000)
+            self.assertEqual(args.expected_train_steps,250000)
 
 
 if __name__=='__main__':

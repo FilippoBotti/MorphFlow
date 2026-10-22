@@ -26,7 +26,11 @@ per epoca (50000 originali + 50000 invertiti).
 Con i default di 2 GPU e batch 1 per GPU, baseline, gate_only e prior_only usano
 **10 epoche sui 50000 esempi originali**; swap_only usa **5 epoche sui 100000 esempi**.
 Il numero di epoche si calcola automaticamente dal batch globale per raggiungere
-esattamente `TARGET_TRAIN_STEPS` (default 250000).
+esattamente `TARGET_TRAIN_STEPS` (default 250000). Quando non corrisponde a
+epoche intere, il launcher imposta `--max_train_steps` e interrompe l'ultima
+epoca al budget esatto, eseguendo poi validazione e salvataggio dei checkpoint.
+Con **3 GPU x batch 1**, sono al massimo 15 epoche senza swap oppure 8 con swap;
+l'ultima e' parziale. Il totale resta 250000, non viene arrotondato.
 Tutti usano seed 42, learning rate 1e-4, warmup 10000,
 cosine, BF16, LoRA rank 32/alpha 64/dropout 0.1 su `to_q,to_kv`, matching semantico,
 endpoint loss e symmetry loss disabilitati. Il prior mantiene rollout 25,

@@ -15,6 +15,7 @@ Options passed to benchmarks/compare_threeway_pngs.py:
   --output-dir DIRECTORY    Choose another output directory.
   --overwrite              Regenerate existing comparison PNGs.
   --skip-incomplete        Skip pairs with missing renders.
+  --protocol weighted50   Use 50 states (48 uniform intermediates + sources).
 
 Default output: RUN_ROOT/comparisons/CFG_CELL/view_025/
 Default Python: WORKSPACE/envs/morphflow/bin/python.

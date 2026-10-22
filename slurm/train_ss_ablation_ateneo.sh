@@ -44,13 +44,15 @@ fi
 GLOBAL_BATCH=$((NGPUS * TRAIN_BS))
 TRAIN_SAMPLES=$((50000 * (1 + SOURCE_SWAP)))
 STEPS_PER_EPOCH=$(((TRAIN_SAMPLES + GLOBAL_BATCH - 1) / GLOBAL_BATCH))
-(( TARGET_TRAIN_STEPS % STEPS_PER_EPOCH == 0 )) || die "Cannot reach exactly $TARGET_TRAIN_STEPS updates with whole epochs: global batch=$GLOBAL_BATCH, steps/epoch=$STEPS_PER_EPOCH. Choose a compatible batch or TARGET_TRAIN_STEPS."
-TRAIN_EPOCHS=$((TARGET_TRAIN_STEPS / STEPS_PER_EPOCH))
+TRAIN_EPOCHS=$(((TARGET_TRAIN_STEPS + STEPS_PER_EPOCH - 1) / STEPS_PER_EPOCH))
+MAX_TRAIN_STEPS=0
+if (( TARGET_TRAIN_STEPS % STEPS_PER_EPOCH != 0 )); then MAX_TRAIN_STEPS="$TARGET_TRAIN_STEPS"; fi
 RUN_NAME="${RUN_NAME:-v4_ss_ablation_${ABLATION}_steps${TARGET_TRAIN_STEPS}_e${TRAIN_EPOCHS}_s${SEED}_g${NGPUS}_bs${TRAIN_BS}}"
 [[ "$RUN_NAME" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die "Invalid RUN_NAME."
 echo "ABLATION=$ABLATION NODE=${SLURM_JOB_NODELIST:-wn46} GPUS=$NGPUS TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$GLOBAL_BATCH"
 echo "EPOCHS=$TRAIN_EPOCHS ORIGINAL_TRAIN_SAMPLES=50000 TRAIN_SAMPLES=$TRAIN_SAMPLES SEED=$SEED GATE=$CONDITION_GATE SOURCE_SWAP=$SOURCE_SWAP PRIOR_WEIGHT=$PRIOR_WEIGHT"
 echo "STEPS_PER_EPOCH=$STEPS_PER_EPOCH TARGET_TRAIN_STEPS=$TARGET_TRAIN_STEPS"
+echo "MAX_TRAIN_STEPS=$MAX_TRAIN_STEPS (0: whole epochs; positive: partial final epoch)"
 echo "RUN_NAME=$RUN_NAME"
 if [[ "$MODE" == --dry-run ]]; then exit 0; fi
 
@@ -139,7 +141,7 @@ if [[ -n "$RESUME_FROM" ]]; then
   [[ "$RESUME_FROM" == "$resolved_run/checkpoints/"* ]] || die "Resume only checkpoints belonging to this ablation; choose a fresh RUN_NAME to train from TRELLIS."
   RESUME_FROM_IN="$OUT_ROOT_IN/$RUN_NAME/${RESUME_FROM#"$resolved_run/"}"
 fi
-python3 - "$RUN_DIR_HOST/ablation_config.json" "$ABLATION" "$CONDITION_GATE" "$SOURCE_SWAP" "$PRIOR_WEIGHT" "$NGPUS" "$TRAIN_BS" "$SEED" "$DATA_ROOT_HOST" "$RESUME_FROM" "$TRAIN_EPOCHS" "$TARGET_TRAIN_STEPS" "$STEPS_PER_EPOCH" <<'PY_CONFIG'
+python3 - "$RUN_DIR_HOST/ablation_config.json" "$ABLATION" "$CONDITION_GATE" "$SOURCE_SWAP" "$PRIOR_WEIGHT" "$NGPUS" "$TRAIN_BS" "$SEED" "$DATA_ROOT_HOST" "$RESUME_FROM" "$TRAIN_EPOCHS" "$TARGET_TRAIN_STEPS" "$STEPS_PER_EPOCH" "$MAX_TRAIN_STEPS" <<'PY_CONFIG'
 import json
 from pathlib import Path
 import sys
@@ -150,6 +152,8 @@ configuration.update(epochs=int(sys.argv[11]),original_train_samples=50000,
                      train_samples=50000*(1+int(sys.argv[4])),
                      target_train_steps=int(sys.argv[12]),steps_per_epoch=int(sys.argv[13]),
                      learning_rate=1e-4,warmup_steps=10000,global_batch=int(sys.argv[6])*int(sys.argv[7]))
+if int(sys.argv[14]):
+    configuration['max_train_steps']=int(sys.argv[14])
 if path.exists():
     previous=json.loads(path.read_text())
     if previous != configuration:
@@ -190,6 +194,7 @@ export SINGULARITYENV_TRAIN_BS="$TRAIN_BS"
 export SINGULARITYENV_TRAIN_EPOCHS="$TRAIN_EPOCHS"
 export SINGULARITYENV_TRAIN_SAMPLES="$TRAIN_SAMPLES"
 export SINGULARITYENV_TARGET_TRAIN_STEPS="$TARGET_TRAIN_STEPS"
+export SINGULARITYENV_MAX_TRAIN_STEPS="$MAX_TRAIN_STEPS"
 export SINGULARITYENV_SEED="$SEED"
 export SINGULARITYENV_NGPUS="$NGPUS"
 export SINGULARITYENV_NUM_WORKERS="$NUM_WORKERS"
@@ -302,6 +307,8 @@ if [[ -n "$RESUME_FROM_IN" ]]; then
 fi
 launch_args=(--num_processes "$NGPUS" --num_machines 1 --mixed_precision bf16 --dynamo_backend no --main_process_port "$MAIN_PROCESS_PORT")
 if (( NGPUS > 1 )); then launch_args+=(--multi_gpu); fi
+budget_args=()
+if (( MAX_TRAIN_STEPS > 0 )); then budget_args=(--max_train_steps "$MAX_TRAIN_STEPS"); fi
 
 accelerate launch "${launch_args[@]}" \
   main.py \
@@ -402,6 +409,7 @@ accelerate launch "${launch_args[@]}" \
   --use_checkpoint 0 \
   --augment_source_swap "$SOURCE_SWAP" \
   --checkpoint_every 2 \
+  ${budget_args[@]+"${budget_args[@]}"} \
   ${resume_args[@]+"${resume_args[@]}"}
 
 echo "RUN_DIR=$OUT_ROOT_IN/$RUN_NAME"

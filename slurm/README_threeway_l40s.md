@@ -434,3 +434,20 @@ bash slurm/compare_threeway_pngs_leonardo.sh "$RUN" 5 1.5 --pair 0 --overwrite
 Le opzioni e la struttura di output sono le stesse del lanciatore Ateneo.
 `COMPARISON_PYTHON=/percorso/python` seleziona un altro Python gia' dotato di
 Pillow; `COMPARISON_OUT=/percorso/output` cambia la destinazione.
+
+Per il protocollo denso, il confronto contiene tre righe e **50 colonne in
+un'unica striscia**: sorgente 1, 48 intermedi uniformi, sorgente 2. Il wrapper
+dedicato accetta la radice principale o direttamente la directory `weighted_50`:
+
+```bash
+bash slurm/compare_threeway_dense_pngs_leonardo.sh "$RUN" 5 2 --tile-size 256
+# Singola coppia, oppure versione piu' compatta:
+bash slurm/compare_threeway_dense_pngs_leonardo.sh "$RUN" 5 2 --pair 0 --tile-size 128
+```
+
+Output: `$RUN/weighted_50/comparisons/cfg_ss_5_slat_2/view_025/`. Con tile 256,
+ogni tavola misura 13382 x 932 pixel. I PNG conservano ordine degli alpha,
+metodi e percorsi sorgente nei metadati. Il programma richiede tutti i 50 stati
+per ciascun metodo; non ricostruisce immagini mancanti. Per usarlo direttamente
+con un Python dotato di Pillow: `python benchmarks/compare_threeway_pngs.py
+--run-root "$RUN" --cfg-ss 5 --cfg-slat 2 --protocol weighted50`.

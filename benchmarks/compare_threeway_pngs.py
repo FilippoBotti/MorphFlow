@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare cached view 025 across three methods and seven Interp3D states.
+"""Compare cached view 025 across three methods and seven or fifty states.
 
 Uses only Pillow and the standard library. No models, metrics, GLBs or CUDA are
 loaded. Inputs are the full benchmark results on scratch, including the shared
@@ -59,10 +59,12 @@ def find_cell(run_root, cfg_ss, cfg_slat):
     return cells[0], ss, slat
 
 
-def load_plan(run_root, cell):
+def load_plan(run_root, cell, protocol="interp3d"):
     path = cell / "plan.json"
     if not path.is_file():
         path = run_root / "shared/plan.json"
+    if not path.is_file():
+        path = run_root / "plan.json"
     if not path.is_file():
         raise ComparisonError("Missing plan.json in {} or {}/shared".format(cell, run_root))
     try:
@@ -71,11 +73,17 @@ def load_plan(run_root, cell):
         pairs = plan["pairs"]
     except (ValueError, TypeError, KeyError) as error:
         raise ComparisonError("Invalid benchmark plan {}: {}".format(path, error))
-    if (len(alphas) != 5 or not all(math.isfinite(a) and 0 < a < 1 for a in alphas)
+    expected = 48 if protocol == "weighted50" else 5
+    if (len(alphas) != expected or not all(math.isfinite(a) and 0 < a < 1 for a in alphas)
             or not all(a > b for a, b in zip(alphas, alphas[1:]))
-            or len(set(alpha_key(a) for a in alphas)) != 5):
-        raise ComparisonError("Expected five distinct intermediate alphas in descending order "
-                              "for the 7-state Interp3D protocol; check {} (not weighted_50)".format(path))
+            or len(set(alpha_key(a) for a in alphas)) != expected):
+        raise ComparisonError("Expected {} distinct intermediate alphas in descending order "
+                              "for the {}-state protocol; check {} and --protocol".format(expected, expected+2, path))
+    if protocol == "weighted50" and any(not math.isclose(a, i/49, rel_tol=0, abs_tol=1e-8)
+                                        for a, i in zip(alphas, range(48, 0, -1))):
+        raise ComparisonError("The 50-state protocol requires 48 uniform alphas i/49")
+    if int(plan.get("k_intermediate", expected)) != expected:
+        raise ComparisonError("Plan intermediate count differs from alpha schedule")
     if not isinstance(pairs, list) or not pairs:
         raise ComparisonError("No pairs in {}".format(path))
     ids, directories = set(), set()
@@ -153,19 +161,20 @@ def fit_text(draw, text, font, width):
     return text + "..."
 
 
-def compose(pair, paths, alphas, cfg_ss, cfg_slat, tile_size, destination):
+def compose(pair, paths, alphas, cfg_ss, cfg_slat, tile_size, destination, protocol="interp3d"):
     Image, ImageDraw, ImageFont, PngImagePlugin = pillow_modules()
     margin, label_width, gap, row_gap = 20, 150, 8, 14
     left, top = margin + label_width, 116
-    width = left + 7 * tile_size + 6 * gap + margin
+    columns = len(alphas) + 2
+    width = left + columns * tile_size + (columns-1) * gap + margin
     height = top + 3 * tile_size + 2 * row_gap + margin
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
     title_font = font_at(ImageFont, 20)
     label_font = font_at(ImageFont, 16)
     small_font = font_at(ImageFont, 13)
-    draw.text((margin, 14), fit_text(draw, "Three-way morph comparison | CFG SS={} | CFG SLat={} | view 025".format(
-        format(cfg_ss, ".12g"), format(cfg_slat, ".12g")), title_font, width - 2 * margin),
+    draw.text((margin, 14), fit_text(draw, "Three-way morph comparison | {} states | CFG SS={} | CFG SLat={} | view 025".format(
+        columns, format(cfg_ss, ".12g"), format(cfg_slat, ".12g")), title_font, width - 2 * margin),
         font=title_font, fill="#17263c")
     pair_text = "Pair {} | {} -> {}".format(pair["pair_id"], pair.get("src1", "src1"), pair.get("src2", "src2"))
     # Use ASCII labels so old Pillow's fallback bitmap font works in containers.
@@ -177,7 +186,7 @@ def compose(pair, paths, alphas, cfg_ss, cfg_slat, tile_size, destination):
         x = left + column * (tile_size + gap)
         label = "alpha={}".format(format(alpha, ".6f").rstrip("0").rstrip("."))
         draw.text((x + 4, 88), label, font=small_font, fill="#17263c")
-        if column in (0, 6):
+        if column in (0, columns-1):
             draw.text((x + 4, 70), "Source 1" if column == 0 else "Source 2", font=small_font, fill="#4d5b70")
     resampling = getattr(Image, "Resampling", Image).LANCZOS
     for row, method in enumerate(METHODS):
@@ -199,6 +208,7 @@ def compose(pair, paths, alphas, cfg_ss, cfg_slat, tile_size, destination):
     metadata = PngImagePlugin.PngInfo()
     metadata.add_text("comparison", json.dumps({
         "methods": list(METHODS), "alphas": full_alphas, "view": VIEW,
+        "protocol": protocol, "num_states": columns,
         "pair_id": pair["pair_id"], "pair_dir": pair["pair_dir"],
         "cfg_ss": cfg_ss, "cfg_slat": cfg_slat, "tile_size": tile_size,
         "layout": {"left": left, "top": top, "gap": gap, "row_gap": row_gap},
@@ -216,10 +226,14 @@ def compose(pair, paths, alphas, cfg_ss, cfg_slat, tile_size, destination):
 
 
 def create_comparisons(run_root, cfg_ss, cfg_slat, output_dir=None, pair_selectors=None,
-                       tile_size=256, overwrite=False, skip_incomplete=False):
+                       tile_size=256, overwrite=False, skip_incomplete=False, protocol="interp3d"):
     run_root = Path(run_root).expanduser().resolve()
+    if protocol not in ("interp3d", "weighted50"):
+        raise ComparisonError("Unknown comparison protocol: {}".format(protocol))
+    if protocol == "weighted50" and (run_root / "weighted_50").is_dir():
+        run_root = run_root / "weighted_50"
     cell, ss, slat = find_cell(run_root, cfg_ss, cfg_slat)
-    plan, alphas = load_plan(run_root, cell)
+    plan, alphas = load_plan(run_root, cell, protocol)
     pairs = select_pairs(plan["pairs"], pair_selectors)
     if not isinstance(tile_size, int) or tile_size < 32:
         raise ComparisonError("--tile-size must be an integer >= 32")
@@ -238,7 +252,7 @@ def create_comparisons(run_root, cfg_ss, cfg_slat, output_dir=None, pair_selecto
                 raise
             print("SKIP {}".format(error), file=sys.stderr, flush=True)
             continue
-        compose(pair, paths, alphas, ss, slat, tile_size, destination)
+        compose(pair, paths, alphas, ss, slat, tile_size, destination, protocol)
         results.append(destination)
         print("SAVED {}".format(destination), flush=True)
     if not results:
@@ -251,6 +265,8 @@ def main(argv=None):
     parser.add_argument("--run-root", required=True, help="Full scratch benchmark run, containing the CFG cells and shared caches")
     parser.add_argument("--cfg-ss", required=True, help="MorphFlow sparse-structure CFG")
     parser.add_argument("--cfg-slat", required=True, help="MorphFlow SLat CFG")
+    parser.add_argument("--protocol", choices=("interp3d", "weighted50"), default="interp3d",
+                        help="Seven states (default) or 50 states; weighted50 accepts the main run root or weighted_50 itself")
     parser.add_argument("--pair", action="append", dest="pair_selectors", help="Pair ID or full pair directory name; repeat to select several (default: all)")
     parser.add_argument("--output-dir", help="Default: RUN_ROOT/comparisons/CFG_CELL/view_025")
     parser.add_argument("--tile-size", type=int, default=256, help="Square tile size, without cropping; default: 256")
@@ -261,7 +277,8 @@ def main(argv=None):
         results = create_comparisons(**vars(args))
     except (ComparisonError, OSError) as error:
         parser.exit(1, "ERROR: {}\n".format(error))
-    print("DONE: {} comparisons, view 025, 3 methods x 7 states".format(len(results)), flush=True)
+    print("DONE: {} comparisons, view 025, 3 methods x {} states".format(
+        len(results), 50 if args.protocol == "weighted50" else 7), flush=True)
     return 0
 
 

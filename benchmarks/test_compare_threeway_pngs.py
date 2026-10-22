@@ -75,7 +75,73 @@ def png_metadata(path):
         return json.loads(image.info["comparison"])
 
 
+def dense_fixture(root):
+    cell = fixture(root, pairs=PAIRS[:1])
+    plan_path = root / 'shared/plan.json'
+    plan = json.loads(plan_path.read_text())
+    plan.update(alphas=[round(i/49, 10) for i in range(48, 0, -1)],
+                k_intermediate=48, num_sequence_frames=50,
+                protocol='weighted-endpoints-50', metric_mode='weighted-endpoints-only')
+    write_json(plan_path, plan)
+    for row, method in enumerate(METHODS):
+        for column, alpha in enumerate(plan['alphas'], 1):
+            color = (10+row*60, 10+column*4, 40+row*10)
+            write_png(cell/'metrics'/method/PAIRS[0]/'images'/compare.alpha_key(alpha)/'025.png', color)
+    return cell, plan['alphas']
+
+
 class CompareThreewayPngTests(unittest.TestCase):
+    def test_dense_grid_all_150_tiles_and_main_root_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cell, alphas = dense_fixture(root/'weighted_50')
+            outputs = compare.create_comparisons(root, 5, 1.5, protocol='weighted50', tile_size=64)
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(outputs[0].parent, root/'weighted_50/comparisons/cfg_ss_5_slat_1.5/view_025')
+            meta = png_metadata(outputs[0])
+            self.assertEqual(meta['num_states'], 50)
+            self.assertEqual(meta['protocol'], 'weighted50')
+            self.assertEqual(meta['alphas'], [1.0, *alphas, 0.0])
+            layout=meta['layout']
+            with Image.open(outputs[0]) as image:
+                self.assertEqual(image.width, layout['left']+50*64+49*layout['gap']+20)
+                for row in range(3):
+                    for column in range(50):
+                        expected = (frame_color(row, 0 if column==0 else 6)
+                                    if column in (0,49) else (10+row*60,10+column*4,40+row*10))
+                        center=(layout['left']+column*(64+layout['gap'])+32,
+                                layout['top']+row*(64+layout['row_gap'])+32)
+                        self.assertEqual(image.convert('RGB').getpixel(center), expected, (row,column))
+
+    def test_dense_requires_all_intermediates_and_uniform_schedule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            cell, alphas=dense_fixture(root)
+            missing=cell/'metrics/interp3d'/PAIRS[0]/'images'/compare.alpha_key(alphas[30])/'025.png'
+            missing.unlink()
+            with self.assertRaisesRegex(compare.MissingRenders, '025.png'):
+                compare.create_comparisons(root,5,1.5,protocol='weighted50',tile_size=64)
+            plan_path=root/'shared/plan.json'
+            plan=json.loads(plan_path.read_text())
+            plan['alphas'][10]-=.001
+            write_json(plan_path,plan)
+            with self.assertRaisesRegex(compare.ComparisonError,'uniform'):
+                compare.create_comparisons(root,5,1.5,protocol='weighted50',tile_size=64)
+
+    def test_dense_shell_wrapper_uses_existing_python_without_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            dense_fixture(root/'weighted_50')
+            wrapper=Path(compare.__file__).resolve().parents[1]/'slurm/compare_threeway_dense_pngs_leonardo.sh'
+            env=dict(os.environ,COMPARISON_PYTHON=sys.executable)
+            env.pop('COMPARISON_OUT',None)
+            env.pop('PROJECT_DIR',None)
+            result=subprocess.run(['bash',str(wrapper),str(root),'5','1.5','--pair','0','--tile-size','64'],
+                                  env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                  universal_newlines=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertIn('3 methods x 50 states',result.stdout)
+
     def test_grid_uses_shared_sources_relative_baselines_and_descending_alphas(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
