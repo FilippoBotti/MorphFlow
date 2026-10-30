@@ -252,7 +252,7 @@ def command_plan(args):
 
 class Reporter(object):
     """Atomic, low-IO worker heartbeat and progress, resilient to job restarts."""
-    def __init__(self, out, phase, shard, total, targets_per_pair=1):
+    def __init__(self, out, phase, shard, total, targets_per_pair=1, target_total=None):
         self.out = Path(out)
         self.path = self.out/'.progress'/('%s_gpu_%d.json' % (phase, shard))
         self.lock = threading.Lock()
@@ -263,7 +263,8 @@ class Reporter(object):
                       'job_id': os.environ.get('SLURM_JOB_ID', 'manual'),
                       'phase': phase, 'gpu_shard': shard, 'total': total,
                       'completed': 0, 'generated': 0, 'reused': 0,
-                      'target_total': total*targets_per_pair,
+                      'target_total': (total*targets_per_pair if target_total is None
+                                       else target_total),
                       'target_completed': 0, 'target_generated': 0,
                       'target_reused': 0,
                       'interior': 0, 'endpoint': 0,
@@ -296,14 +297,16 @@ class Reporter(object):
         with self.lock:
             self.state['current_item'] = str(name)
 
-    def complete(self, split, result, kind, duration=0.0, targets_generated=0):
+    def complete(self, split, result, kind, duration=0.0, targets_generated=0,
+                 target_count=None):
+        count_targets = self.targets_per_pair if target_count is None else target_count
         with self.lock:
             self.state['completed'] += 1
             self.state['per_split'][split] += 1
-            self.state['target_completed'] += self.targets_per_pair
-            self.state['per_split_targets'][split] += self.targets_per_pair
+            self.state['target_completed'] += count_targets
+            self.state['per_split_targets'][split] += count_targets
             self.state['target_generated'] += targets_generated
-            self.state['target_reused'] += self.targets_per_pair - targets_generated
+            self.state['target_reused'] += count_targets - targets_generated
             self.state['compute_seconds'] += float(duration)
             self.state['generated' if result == 'generated' else 'reused'] += 1
             if kind in ('endpoint', 'interior'):
@@ -475,9 +478,11 @@ def command_pairs(args):
     pairs = [p for p in plan['pairs']
              if p['pair_id'] % args.num_shards == args.shard_index]
     global ACTIVE_REPORTER
-    ACTIVE_REPORTER = Reporter(out, 'pairs', args.shard_index, len(pairs), plan['k'])
-    print('PAIR SHARD %d/%d: %d pairs, %d alphas each' %
-          (args.shard_index, args.num_shards, len(pairs), plan['k']), flush=True)
+    target_total = sum(len(pair['alphas']) for pair in pairs)
+    ACTIVE_REPORTER = Reporter(out, 'pairs', args.shard_index, len(pairs),
+                               target_total=target_total)
+    print('PAIR SHARD %d/%d: %d pairs, %d planned targets' %
+          (args.shard_index, args.num_shards, len(pairs), target_total), flush=True)
     if not pairs:
         ACTIVE_REPORTER.finish()
         return
@@ -558,7 +563,7 @@ def command_pairs(args):
                         for alpha in alphas}
         if all(ready_before.values()):
             ACTIVE_REPORTER.complete(pair['split'], 'reused', 'interior',
-                                     targets_generated=0)
+                                     targets_generated=0, target_count=len(alphas))
             continue
         current_schedule['alphas'] = interiors
         current_schedule['called'] = False
@@ -598,7 +603,8 @@ def command_pairs(args):
                 generated_targets += 1
         ACTIVE_REPORTER.complete(pair['split'], 'generated', 'interior',
                                  time.time()-item_start,
-                                 targets_generated=generated_targets)
+                                 targets_generated=generated_targets,
+                                 target_count=len(alphas))
         del outputs, coords, image1, image2
         capture['ss'], capture['slat'] = [], []
         if idx % 20 == 0:
@@ -637,19 +643,25 @@ def make_metadata(pair, alpha, k):
     a, b = pair['src_1'], pair['src_2']
     target_rel = 'targets/%s+%s/alpha_%s' % (a, b, alpha_slug(alpha))
     kind = 'endpoint' if alpha in (0.0, 1.0) else 'intermediate'
-    position = (pair['alphas'].index(alpha) if 0.0 < alpha < 1.0 else -1)
+    # A nested dataset can select two targets from an eight-alpha teacher
+    # trajectory. Keep the actual generation sequence as target provenance.
+    teacher_alphas = pair.get('teacher_alphas', pair['alphas'])
+    position = (teacher_alphas.index(alpha) if 0.0 < alpha < 1.0 else -1)
     ans = {'split': pair['split'], 'src_1': a, 'src_2': b,
            'target': '%s+%s/alpha_%s' % (a, b, alpha_slug(alpha)),
            'alpha': alpha, 'alpha_requested': alpha,
            'alpha_definition': 'alpha is fraction of src_1; alpha*src_1+(1-alpha)*src_2',
            'alpha_sequence_index': position,
-           'sequence_intermediates': len([a for a in pair['alphas'] if 0 < a < 1]),
-           'sequence_alphas': list(pair['alphas']),
+           'sequence_intermediates': len([a for a in teacher_alphas if 0 < a < 1]),
+           'sequence_alphas': list(teacher_alphas),
            'src1_dir': 'assets/'+a, 'src2_dir': 'assets/'+b,
            'target_dir': target_rel,
            'teacher_model': 'Interp3D', 'interp3d_t': float(1-alpha),
            'target_kind': kind,
            'symmetry_policy': 'reuse_same_target_after_source_swap'}
+    if 'teacher_alphas' in pair:
+        ans['dataset_sequence_alphas'] = list(pair['alphas'])
+        ans['dataset_samples_per_pair'] = k
     for key, name in (('src1', a), ('src2', b), ('target', None)):
         prefix = ('assets/' + name) if name else target_rel
         ans[key+'_slat_feats'] = prefix+'/slat_feats.pt'

@@ -16,8 +16,7 @@ import sys
 import time
 import zipfile
 
-EXPECTED = {'train': 50000, 'val': 2000, 'test': 2000}
-PAIRS = {'train': 12500, 'val': 500, 'test': 500}
+SPLITS = ('train', 'val', 'test')
 CORE = ('ss_latent.pt', 'slat_feats.pt', 'slat_coords.pt', 'structured_latent.pt', 'occupancy.pt')
 SRC_FILE_KEYS = ('src1_ss_latent', 'src1_slat_feats', 'src1_slat_coords', 'src1_occupancy',
                  'src2_ss_latent', 'src2_slat_feats', 'src2_slat_coords', 'src2_occupancy',
@@ -79,7 +78,7 @@ def main():
         split_assets = load(root / 'split_assets.json')
         splits = load(root / 'splits.json')
         missing = load(root / 'missing_targets.json')
-        grouped = {s: load(root / ('metadata_' + s + '.json')) for s in EXPECTED}
+        grouped = {s: load(root / ('metadata_' + s + '.json')) for s in SPLITS}
         combined = load(root / 'metadata.json')
     except (OSError, ValueError, TypeError) as exc:
         raise SystemExit('FAIL reading JSON: {}'.format(exc))
@@ -90,34 +89,42 @@ def main():
         error('Generation not complete (state/phase).')
     if missing:
         error('missing_targets.json has {} entries'.format(len(missing)))
-    if plan.get('k') != 4 or plan.get('num_pairs') != 13500 or plan.get('num_targets') != 54000:
+    k = plan.get('k')
+    quotas = plan.get('pair_quotas', {})
+    if k not in (2, 4, 8) or any(not isinstance(quotas.get(s), int) or quotas[s] < 0
+                                for s in SPLITS):
+        print('FAIL: audit a dataset with k=2, 4 or 8 and valid pair_quotas; '
+              'for a joint generation root, audit each dataset subdirectory.')
+        return 1
+    expected = {s: quotas[s] * k for s in SPLITS}
+    num_pairs = sum(quotas[s] for s in SPLITS)
+    num_targets = sum(expected.values())
+    if plan.get('num_pairs') != num_pairs or plan.get('num_targets') != num_targets:
         error('Unexpected plan size: k={} pairs={} targets={}'.format(
             plan.get('k'), plan.get('num_pairs'), plan.get('num_targets')))
-    if plan.get('train_virtual_after_swap') != 100000:
-        error('Expected 100000 virtual training samples')
-    if plan.get('pair_quotas') != PAIRS:
-        error('Wrong pair quotas: {}'.format(plan.get('pair_quotas')))
-    if not isinstance(plan.get('pairs'), list) or len(plan['pairs']) != 13500:
+    if plan.get('train_virtual_after_swap') != 2 * expected['train']:
+        error('Expected {} virtual training samples'.format(2 * expected['train']))
+    if not isinstance(plan.get('pairs'), list) or len(plan['pairs']) != num_pairs:
         error('Incorrect plan.pairs length')
     if not isinstance(plan.get('assets'), list):
         error('Missing plan.assets list')
-    for split, n in EXPECTED.items():
+    for split, n in expected.items():
         if len(grouped[split]) != n:
             error('metadata_{} length={} expected {}'.format(split, len(grouped[split]), n))
-    if len(combined) != 54000:
-        error('metadata.json length={} expected 54000'.format(len(combined)))
+    if len(combined) != num_targets:
+        error('metadata.json length={} expected {}'.format(len(combined), num_targets))
     if isinstance(splits, dict) and splits.get('missing_planned_targets', 0) != 0:
         error('splits.json reports incomplete targets')
 
     # Distinct asset split membership; assert metadata sources respect it.
     asset_membership = {}
-    for split in EXPECTED:
+    for split in SPLITS:
         for asset in split_assets.get(split, []):
             if asset in asset_membership:
                 error('Asset leakage {}: {} and {}'.format(asset, asset_membership[asset], split))
             asset_membership[asset] = split
     print('Assets in split assignments:',
-          {s: len(split_assets.get(s, [])) for s in EXPECTED}, flush=True)
+          {s: len(split_assets.get(s, [])) for s in SPLITS}, flush=True)
 
     image_root = Path(plan.get('images_root', '/hpc/scratch/marco.barezzi/3d_dataset/flux_outputs'))
     source_misses = []
@@ -218,20 +225,21 @@ def main():
                 if not pathvalue or not str(pathvalue).endswith('.pt'):
                     error('Bad metadata path {} for {}'.format(keyname, key))
                 # All target / asset files already verified above.
-    if len(by_pair) != 13500:
-        error('Distinct pairs={} expected 13500'.format(len(by_pair)))
+    if len(by_pair) != num_pairs:
+        error('Distinct pairs={} expected {}'.format(len(by_pair), num_pairs))
     for pair, vals in by_pair.items():
         expected_alphas = expected_per_pair.get(pair)
         if expected_alphas is None or tuple(sorted(vals)) != tuple(sorted(expected_alphas)):
             error('Metadata vs plan alpha mismatch for {}'.format(pair))
-        if len(vals) != 4 or len(set(vals)) != 4:
+        if len(vals) != k or len(set(vals)) != k:
             error('Pair {} has invalid alpha set: {}'.format(pair, vals))
-    for split in EXPECTED:
-        if sum(1 for p in by_pair if p[0] == split) != PAIRS[split]:
+    for split in SPLITS:
+        if sum(1 for p in by_pair if p[0] == split) != quotas[split]:
             error('Wrong number of distinct {} pairs'.format(split))
-        if endpoints[(split, 0)] != (500 if split == 'train' else 20):
+        endpoint_half = int(round(expected[split] * plan['endpoint_fraction'] / 2.0))
+        if endpoints[(split, 0)] != endpoint_half:
             error('Incorrect alpha=0 count for {}: {}'.format(split, endpoints[(split, 0)]))
-        if endpoints[(split, 1)] != (500 if split == 'train' else 20):
+        if endpoints[(split, 1)] != endpoint_half:
             error('Incorrect alpha=1 count for {}: {}'.format(split, endpoints[(split, 1)]))
     print('Metadata target counts:', dict(counts), flush=True)
     print('Endpoint counts:', dict(endpoints), flush=True)

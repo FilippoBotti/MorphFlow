@@ -1,5 +1,8 @@
 # Dataset v4 Interp3D: 12,500 unique train pairs x 4 alpha
 
+For the joint 8-step and 2-step datasets with the same 50,000-sample training
+budget, see [README_interp3d_v4_multistep.md](README_interp3d_v4_multistep.md).
+
 Ready-to-submit HPC package. Based on the existing MorphFlow 8xL40S Singularity layout.
 
 ## Budget

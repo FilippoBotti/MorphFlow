@@ -84,6 +84,9 @@ def status_data(out):
     return {'state': state, 'plan': {'num_pairs': plan.get('num_pairs'),
                                    'num_targets': plan.get('num_targets'),
                                    'k': plan.get('k'),
+                                   'variable_alphas_per_pair': plan.get('variable_alphas_per_pair', False),
+                                   'alphas_per_pair': sorted({len(p['alphas']) for p in plan.get('pairs', [])}),
+                                   'views': plan.get('views', {}),
                                    'pair_quotas': plan.get('pair_quotas'),
                                    'target_counts': plan.get('target_counts'),
                                    'num_assets': len(plan.get('assets', [])),
@@ -105,9 +108,18 @@ def show(data):
     if s.get('message'):
         print('Message:', s['message'])
     if p.get('num_pairs') is not None:
-        print('PLAN: %d pairs x %s alphas = %s physical targets | assets=%d | virtual train=%s' %
-              (p['num_pairs'], p.get('k'), p.get('num_targets'), p['num_assets'],
-               p.get('train_virtual_after_swap')))
+        if p.get('variable_alphas_per_pair'):
+            print('PLAN: %d pairs | %s alphas per pair | %s physical targets | assets=%d' %
+                  (p['num_pairs'], '/'.join(map(str, p['alphas_per_pair'])),
+                   p.get('num_targets'), p['num_assets']))
+            for name, view in sorted(p.get('views', {}).items()):
+                print('DATASET %s: %s alphas per pair | %s targets | virtual train=%s' %
+                      (view.get('name', name), view.get('k'), view.get('num_targets'),
+                       view.get('train_virtual_after_swap')))
+        else:
+            print('PLAN: %d pairs x %s alphas = %s physical targets | assets=%d | virtual train=%s' %
+                  (p['num_pairs'], p.get('k'), p.get('num_targets'), p['num_assets'],
+                   p.get('train_virtual_after_swap')))
         print('Splits:', p['pair_quotas'], '| alpha types:', p['target_counts'])
     done, total = data['completed'], data['total']
     pct = 100.0 * done / total if total else 0.0
