@@ -37,7 +37,7 @@ def _set_module(root, name, module):
 def _matches_attention_scope(name, attention_scope):
     parts = name.split(".")
     if attention_scope == "all":
-        return "_attn." in name
+        return "_attn." in name or "cross_attn2" in parts
     if attention_scope == "cross":
         return any(part in ("cross_attn", "cross_attn2") for part in parts)
     raise ValueError(f"Unknown LoRA attention scope: {attention_scope}")
@@ -50,19 +50,25 @@ def add_lora_to_attention(
     dropout=0.0,
     target_modules=("to_q", "to_kv"),
     attention_scope="all",
+    module_names=None,
 ):
     replaced = []
+    selected = None if module_names is None else set(module_names)
 
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
 
-        if not _matches_attention_scope(name, attention_scope):
-            continue
-
-        short_name = name.split(".")[-1]
-        if short_name not in target_modules:
-            continue
+        if selected is not None:
+            # Checkpoints record the exact projections that had adapters.
+            # This also supports legacy "all" checkpoints without cross_attn2.
+            if name not in selected:
+                continue
+        else:
+            if not _matches_attention_scope(name, attention_scope):
+                continue
+            if name.split(".")[-1] not in target_modules:
+                continue
 
         _set_module(
             model,

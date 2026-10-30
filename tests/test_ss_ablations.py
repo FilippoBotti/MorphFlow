@@ -90,7 +90,7 @@ class FixedAlphaAttentionTests(unittest.TestCase):
         function = next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='build_model')
         namespace = dict(inspect=inspect,torch=torch,MorphFlow=SmallStudent,MorphSLatFlow=SmallStudent,
                          checkpoint_args=lambda ckpt:ckpt['args'],unwrap_state_dict=lambda ckpt:ckpt['model'],
-                         maybe_insert_lora=lambda model,args:None)
+                         maybe_insert_lora=lambda model,args,state_dict=None:None)
         exec(compile(ast.Module(body=[function],type_ignores=[]),str(path),'exec'),namespace)
         for mode in ('alpha','token'):
             original = SmallStudent(separate_cond_gate=mode)

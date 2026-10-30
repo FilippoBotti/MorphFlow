@@ -99,6 +99,53 @@ smoke test con il padre montato.
 La precedente versione a 4 step conserva il proprio launcher e la propria
 directory. Il nuovo job usa un nome di output distinto.
 
+## Training a 8 stadi con LoRA su tutte le attention
+
+I launcher dedicati montano automaticamente la directory padre e usano
+esclusivamente `morphing_dataset_v4_steps8`:
+
+| Training | Nodo | GPU | Batch per GPU | Batch globale | LR | Epoche |
+|---|---|---|---:|---:|---:|---:|
+| SS | `wn49` | 8 `l40s_vbd` | 1 | 8 | `1e-4` | 40 |
+| SLat | `wn51` | 2 `h100_vbd` | 1 | 2 | `5e-5` | 20 |
+
+Dal login dell'Ateneo, dopo aver aggiornato la repo:
+
+```bash
+cd "$HOME/trellis-singularity/work/MorphFlow"
+git pull --ff-only
+bash slurm/queue_train_v4_steps8.sh
+```
+
+Il comando verifica con `sinfo` i nodi e i tipi di GPU prima di inviare i due
+job. Se la generazione è ancora attiva, legge il suo job ID dal `run_state.json`
+della directory padre e assegna **a entrambi** la dipendenza `afterok` da quel
+job. Se il dataset è già completo, li invia senza dipendenze. SS e SLat possono
+allenarsi in parallelo: SLat usa i latenti teacher e non aspetta il training SS.
+Una generazione fallita o non più in coda deve essere ripresa prima del training.
+
+Per controllare il piano senza inviare job:
+
+```bash
+bash slurm/queue_train_v4_steps8.sh --check
+```
+
+LoRA usa `attention_scope=all`, rank 32, alpha 64 e dropout 0,1. I target
+`to_qkv,to_q,to_kv` includono la self-attention e le due cross-attention di ogni
+blocco. I pesi base rimangono congelati; vengono allenati gli adapter LoRA, il
+conditioning e il token gate. Restano attivi source swap e prior con peso 0,1,
+rollout 25 e 4 passi con gradiente ogni 4 batch, come nella configurazione v4.
+
+Con 100.000 campioni train dopo lo swap, SS esegue 500.000 aggiornamenti e SLat
+1.000.000. Questi launcher completano le epoche richieste e non applicano il
+budget di 250.000 aggiornamenti usato dalle ablation.
+
+I nomi predefiniti delle run distinguono dataset e configurazione:
+`v4_steps8_ss_lora_all_bs1_lr1e4_e40` e
+`v4_steps8_slat_lora_all_bs1_lr5e5_e20`. Per nuove run si possono impostare
+`SS_RUN_NAME` e `SLAT_RUN_NAME`; rilanciando gli stessi nomi si riprendono i
+checkpoint compatibili già presenti.
+
 ## Monitoraggio e ripresa
 
 ```bash

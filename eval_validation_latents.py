@@ -212,7 +212,7 @@ def build_model(ckpt, model_type, flow_target):
             model.cond_proj_layer_norm = torch.nn.LayerNorm(model.model_channels)
             print("Added cond_proj_layer_norm for checkpoint compatibility.")
 
-    maybe_insert_lora(model, args)
+    maybe_insert_lora(model, args, state_dict)
     model.load_state_dict(state_dict, strict=True)
     return model
 
@@ -221,7 +221,7 @@ def get_flow_module(model):
     return getattr(model, "sparse_structure_flow", None) or getattr(model, "slat_flow", None)
 
 
-def maybe_insert_lora(model, args):
+def maybe_insert_lora(model, args, state_dict=None):
     if int(args.get("use_lora", 0)) != 1:
         return
 
@@ -230,6 +230,13 @@ def maybe_insert_lora(model, args):
         raise RuntimeError("Checkpoint uses LoRA, but no TRELLIS flow module was found.")
 
     targets = tuple(x.strip() for x in args.get("lora_target_modules", "to_q,to_kv").split(",") if x.strip())
+    module_names = None
+    if state_dict is not None:
+        flow_name = next(name for name, module in model.named_modules() if module is flow)
+        prefix = flow_name + "." if flow_name else ""
+        suffix = ".lora_A.weight"
+        module_names = {name[len(prefix):-len(suffix)] for name in state_dict
+                        if name.startswith(prefix) and name.endswith(suffix)}
     modules = add_lora_to_attention(
         flow,
         rank=int(args.get("lora_rank", 8)),
@@ -237,6 +244,7 @@ def maybe_insert_lora(model, args):
         dropout=float(args.get("lora_dropout", 0.0)),
         target_modules=targets,
         attention_scope=args.get("lora_attention_scope", "all"),
+        module_names=module_names,
     )
     print(f"Inserted LoRA modules: {len(modules)}")
 

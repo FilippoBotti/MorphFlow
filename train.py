@@ -179,7 +179,7 @@ def build_parser():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str, default="to_q,to_kv")
-    parser.add_argument("--lora_attention_scope", type=str, choices=["all", "cross"], default="all", help="all preserves the legacy *_attn selection; cross only targets cross_attn/cross_attn2.")
+    parser.add_argument("--lora_attention_scope", type=str, choices=["all", "cross"], default="all", help="all targets self-attention and both cross-attention branches; cross only targets cross_attn/cross_attn2.")
     parser.add_argument("--trainable_scope", type=str, choices=["full", "cond_cross_attn"], default="full", help="full trains the whole model. cond_cross_attn trains conditioning modules plus TRELLIS cross-attention parameters.")
     parser.add_argument("--freeze_modules", type=str, default="", help="Comma-separated modules/patterns to freeze after trainability setup. Aliases: condition, flow, flow_cross_attn, flow_self_attn, flow_mlp, flow_norm, alpha, alpha_embedder, alpha_gate, lora, null_cond.")
     parser.add_argument("--train_flow_alpha_embedder", type=int, choices=[0, 1], default=0, help="Train the TRELLIS flow alpha timestep embedder in LoRA or cond_cross_attn modes.")
