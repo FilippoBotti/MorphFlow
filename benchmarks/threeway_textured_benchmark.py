@@ -1839,7 +1839,7 @@ def numeric_stats(values: Sequence[float]) -> Dict[str, Any]:
     }
 
 
-def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
+def aggregate_generation_timings(run_root: Path, methods: Sequence[str] = METHODS) -> Dict[str, Any]:
     timing_root = run_root / "timings"
     result: Dict[str, Any] = {
         "definition": (
@@ -1859,7 +1859,7 @@ def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
         "process_peak_rss_gib",
         "node_min_mem_available_gib",
     )
-    for method in METHODS:
+    for method in methods:
         rows: List[Dict[str, Any]] = []
         for path in sorted(timing_root.glob(f"{method}_shard_*.jsonl")):
             rows.extend(read_jsonl_rows(path))
@@ -1910,7 +1910,7 @@ def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
     with (run_root / "generation_timings.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=csv_fields, extrasaction="ignore")
         writer.writeheader()
-        for method in METHODS:
+        for method in methods:
             for row in result["methods"][method]["pairs"]:
                 writer.writerow(row)
     return result
@@ -1918,6 +1918,7 @@ def aggregate_generation_timings(run_root: Path) -> Dict[str, Any]:
 
 def command_aggregate(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root).resolve()
+    methods = selected_methods(args)
     plan = load_plan(run_root)
     weighted_only = plan.get("metric_mode") == "weighted-endpoints-only"
     metrics_root = run_root / "metrics"
@@ -1951,7 +1952,7 @@ def command_aggregate(args: argparse.Namespace) -> None:
             "full_mean": "weighted_endpoint_lpips_full_mean averages all 50 states, including zero distance at canonical endpoints",
             "full_auc": "weighted_endpoint_lpips_full_auc integrates the complete curve on [0,1] including canonical endpoints",
         })
-    generation_timings = aggregate_generation_timings(run_root)
+    generation_timings = aggregate_generation_timings(run_root, methods)
     combined["generation_timings"] = generation_timings
     rows: List[Dict[str, Any]] = []
     headline = (
@@ -1979,7 +1980,7 @@ def command_aggregate(args: argparse.Namespace) -> None:
         headline = ("weighted_endpoint_lpips_mean", "weighted_endpoint_lpips_auc",
                     "weighted_endpoint_lpips_full_mean", "weighted_endpoint_lpips_full_auc")
 
-    for method in METHODS:
+    for method in methods:
         path = metrics_root / method / "metrics_batch.json"
         if not path.is_file():
             raise FileNotFoundError(f"Missing batch metrics for {method}: {path}")
@@ -2117,6 +2118,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ag = sub.add_parser("aggregate")
     common_run(ag)
+    ag.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     return p
 
 

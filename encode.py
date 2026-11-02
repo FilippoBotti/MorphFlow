@@ -3,6 +3,8 @@ import os
 import json
 import subprocess
 import tempfile
+import shutil
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -65,16 +67,37 @@ class TrellisSLatEncoderDebug:
         ])
 
     def _ensure_blender(self) -> str:
-        if self._blender_bin is not None:
-            return self._blender_bin
-
-        blender_dir = os.path.join(_PROJECT_ROOT, "workspace_encoding", "blender")
-        self._blender_bin = os.path.join(
-            blender_dir,
-            "blender-3.0.1-linux-x64",
-            "blender",
+        candidates = [
+            ("blender_bin", self._blender_bin),
+            ("BLENDER_BIN", os.environ.get("BLENDER_BIN")),
+            ("PATH", shutil.which("blender")),
+            ("workspace tools", Path(_PROJECT_ROOT).parents[1]
+             / "tools" / "blender-3.0.1-linux-x64" / "blender"),
+            ("legacy installation", Path(_PROJECT_ROOT) / "workspace_encoding"
+             / "blender" / "blender-3.0.1-linux-x64" / "blender"),
+        ]
+        checked = []
+        for source, candidate in candidates:
+            if not candidate:
+                checked.append(f"{source}: not configured or not found")
+                continue
+            candidate = os.path.expanduser(os.fspath(candidate))
+            executable = shutil.which(candidate)
+            if executable is not None:
+                self._blender_bin = os.path.abspath(executable)
+                return self._blender_bin
+            reason = "not executable" if os.path.isfile(candidate) else "not found"
+            checked.append(f"{source}: {candidate} ({reason})")
+            # An explicit caller override must never select a different Blender.
+            if source == "blender_bin":
+                raise FileNotFoundError(
+                    "Invalid blender_bin override. Supply an existing executable "
+                    "Blender 3.x path. Checked: " + "; ".join(checked)
+                )
+        raise FileNotFoundError(
+            "Blender 3.x executable not found. Pass blender_bin='/path/to/blender' "
+            "or set BLENDER_BIN. Checked: " + "; ".join(checked)
         )
-        return self._blender_bin
 
     def _render_views(self, mesh_path: str, output_dir: str, num_views: int = 50):
         blender_bin = self._ensure_blender()
