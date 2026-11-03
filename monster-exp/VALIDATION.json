@@ -1,0 +1,90 @@
+{
+  "status": "passed",
+  "cpu_contract_tests": 6,
+  "gpu_jobs": [
+    63381874,
+    63381875,
+    63382784
+  ],
+  "glb_test": {
+    "alphas": [
+      0.5
+    ],
+    "encoding_views": 8,
+    "default_encoding_views": 150
+  },
+  "slat_test": {
+    "alphas": [
+      0.5,
+      0,
+      1
+    ]
+  },
+  "resume": {
+    "status": "passed",
+    "old_outputs_untouched": true,
+    "slat_alphas": [
+      0.5,
+      0,
+      1
+    ],
+    "glb_alphas": [
+      0.5
+    ]
+  },
+  "textures": [
+    {
+      "mode": "slat",
+      "alpha": "alpha_0",
+      "uv": true,
+      "embedded_texture": [
+        2048,
+        2048
+      ]
+    },
+    {
+      "mode": "slat",
+      "alpha": "alpha_0p5",
+      "uv": true,
+      "embedded_texture": [
+        2048,
+        2048
+      ]
+    },
+    {
+      "mode": "slat",
+      "alpha": "alpha_1",
+      "uv": true,
+      "embedded_texture": [
+        2048,
+        2048
+      ]
+    },
+    {
+      "mode": "glb",
+      "alpha": "alpha_0p5",
+      "uv": true,
+      "embedded_texture": [
+        2048,
+        2048
+      ]
+    }
+  ],
+  "peak_gpu_reserved_gib": {
+    "glb": 9.3046875,
+    "slat": 11.216796875
+  },
+  "local_environment": {
+    "python": "3.10.20",
+    "torch": "2.4.0+cu121",
+    "gpu": "RTX 4090 24 GiB",
+    "blender": "3.0.1",
+    "cuda_home": "/usr/local/cuda-12.4",
+    "user_verified": [
+      "CUDA rasterizer context",
+      "texture exporter import",
+      "Blender Cycles GPU render"
+    ]
+  },
+  "example_outputs": "/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/monster_exp_smoke_20261103"
+}

@@ -106,6 +106,8 @@ def prepare(args):
                      'seed_policy': 'SS=42+100000*pair_id; SLat=SS+10000; reset at every alpha and in both branches',
                      'slat_noise_caveat': 'Same seed; when predicted coordinate sets differ, row-wise random noise is assigned to different spatial positions.'},
         'encoding': {'num_views': 150, 'render_resolution': 512, 'dino_resolution': 518,
+                     'lighting': 'uniform_texture',
+                     'lighting_description': 'Base-color texture emission=1; no extra lights or shading; Standard sRGB, exposure=0, gamma=1. Dataset v4 is generated from FLUX images, not a fixed Blender light rig.',
                      'voxel_resolution': 64, 'feature_model': 'dinov2_vitl14_reg',
                      'sample_posterior': False, 'latent_scale': 'raw_decoder',
                      'input_glb': 'full historical FP32 source mesh with official Gaussian-baked texture',
@@ -215,7 +217,8 @@ def worker(args):
             return
         started = time.perf_counter()
         codec = OfficialAssetCodec(trellis_root=manifest['encoder_trellis'], blender_bin=args.blender,
-                                    texture_size=2048, dino_batch_size=4, seed=42)
+                                    texture_size=2048, dino_batch_size=4, seed=42,
+                                    lighting=manifest['encoding'].get('lighting', 'official'))
         try:
             for label in ('src1', 'src2'):
                 name = pair[label]
@@ -232,6 +235,8 @@ def worker(args):
                     original = {'feats': torch.load(Path(asset['data_dir']) / 'slat_feats.pt', map_location='cpu', weights_only=True).float(),
                                 'coords': torch.load(Path(asset['data_dir']) / 'slat_coords.pt', map_location='cpu', weights_only=True).int()}
                     write_json(directory / 'encoding_diagnostics.json', latent_comparison(original, encoded))
+                    from morph_glb_conditioning_report import report
+                    report(args.run_root)
             codec.release()
             write_json(output / 'status.json', {'stage': 'full_model_morphing'})
             backend(args)
@@ -251,6 +256,8 @@ def worker(args):
             write_json(output / 'status.json', {'stage': 'complete', 'seconds': result['seconds_total']})
             (output / 'error.json').unlink(missing_ok=True)
             print('PAIR_COMPLETE ' + pair['pair_dir'], flush=True)
+            from morph_glb_conditioning_report import report
+            report(args.run_root)
         except Exception as exc:
             write_json(output / 'error.json', {'type': type(exc).__name__, 'message': str(exc), 'traceback': traceback.format_exc()})
             raise

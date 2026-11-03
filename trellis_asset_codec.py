@@ -56,8 +56,8 @@ def _guard_manifest(path, identity):
     return data
 
 
-# Execute the upstream renderer unchanged except for missing vertex-color
-# materials on material-free GLBs. This wrapper lives in each encoding output.
+# Keep upstream cameras/normalization; optionally render existing appearance
+# without adding a second lighting pass to textures baked from Gaussians.
 _BLENDER_WRAPPER = r'''
 import json
 import os
@@ -67,6 +67,7 @@ import bpy
 
 config = json.load(open(sys.argv[sys.argv.index('--') + 1]))
 official = config.pop('official_script')
+lighting = config.pop('lighting', 'official')
 namespace = {'__name__': 'trellis_official_renderer', '__file__': official}
 with open(official) as stream:
     source = stream.read()
@@ -98,6 +99,55 @@ def load_object(path):
                 if mesh.materials[index] is None:
                     mesh.materials[index] = material
         print('[codec] Enabled missing vertex-color material:', obj.name)
+    if lighting == 'uniform_texture':
+        for material in bpy.data.materials:
+            if not material.use_nodes:
+                material.use_nodes = True
+            nodes, links = material.node_tree.nodes, material.node_tree.links
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+            if bsdf is None or output is None:
+                raise RuntimeError('Uniform texture rendering requires a Principled material: ' + material.name)
+            emission = nodes.new('ShaderNodeEmission')
+            base = bsdf.inputs['Base Color']
+            if base.is_linked:
+                links.new(base.links[0].from_socket, emission.inputs['Color'])
+            else:
+                emission.inputs['Color'].default_value = base.default_value
+            emission.inputs['Strength'].default_value = 1.0
+            transparent = nodes.new('ShaderNodeBsdfTransparent')
+            mix = nodes.new('ShaderNodeMixShader')
+            alpha = bsdf.inputs['Alpha']
+            if alpha.is_linked:
+                links.new(alpha.links[0].from_socket, mix.inputs[0])
+            else:
+                mix.inputs[0].default_value = alpha.default_value
+            links.new(transparent.outputs[0], mix.inputs[1])
+            links.new(emission.outputs[0], mix.inputs[2])
+            for link in list(output.inputs['Surface'].links):
+                links.remove(link)
+            links.new(mix.outputs[0], output.inputs['Surface'])
+
+if lighting == 'uniform_texture':
+    def init_lighting():
+        for obj in list(bpy.data.objects):
+            if obj.type == 'LIGHT':
+                bpy.data.objects.remove(obj, do_unlink=True)
+        scene = bpy.context.scene
+        if scene.world:
+            scene.world.use_nodes = True
+            for node in scene.world.node_tree.nodes:
+                if node.type == 'BACKGROUND':
+                    node.inputs['Strength'].default_value = 0.0
+        scene.display_settings.display_device = 'sRGB'
+        scene.view_settings.view_transform = 'Standard'
+        scene.view_settings.look = 'None'
+        scene.view_settings.exposure = 0.0
+        scene.view_settings.gamma = 1.0
+        scene.view_settings.use_curve_mapping = False
+        print('[codec] Uniform texture appearance: emission=1, no additional lights, Standard sRGB')
+        return {}
+    namespace['init_lighting'] = init_lighting
 
 namespace['load_object'] = load_object
 namespace['main'](SimpleNamespace(**config))
@@ -114,7 +164,7 @@ class OfficialAssetCodec:
     """
 
     def __init__(self, trellis_root=None, blender_bin=None, device="cuda",
-                 dino_batch_size=4, texture_size=2048, seed=42):
+                 dino_batch_size=4, texture_size=2048, seed=42, lighting="official"):
         default_root = Path(__file__).resolve().parent.parent / "TRELLIS"
         self.trellis_root = Path(trellis_root or os.environ.get("TRELLIS_REPO", default_root)).resolve()
         default_blender = Path(__file__).resolve().parents[2] / "tools/blender-3.0.1-linux-x64/blender"
@@ -123,6 +173,9 @@ class OfficialAssetCodec:
         self.dino_batch_size = int(dino_batch_size)
         self.texture_size = int(texture_size)
         self.seed = int(seed)
+        if lighting not in ("official", "uniform_texture"):
+            raise ValueError("lighting must be official or uniform_texture")
+        self.lighting = lighting
         if self.dino_batch_size < 1 or self.texture_size < 1:
             raise ValueError("dino_batch_size and texture_size must be positive")
         self._torch = None
@@ -211,13 +264,14 @@ class OfficialAssetCodec:
                   "views": json.dumps(views), "object": str(glb), "resolution": 512,
                   "output_folder": str(outdir), "engine": "CYCLES", "geo_mode": False,
                   "save_depth": False, "save_normal": False, "save_albedo": False,
-                  "save_mist": False, "split_normal": False, "save_mesh": True}
+                  "save_mist": False, "split_normal": False, "save_mesh": True,
+                  "lighting": self.lighting}
         config_path, wrapper = outdir / "render_config.json", outdir / "official_render_wrapper.py"
         write_json(config_path, config)
         wrapper.write_text(_BLENDER_WRAPPER)
         command = [self.blender_bin, "-b", "--threads", os.environ.get("OMP_NUM_THREADS", "4"),
                    "--python-exit-code", "1", "-P", str(wrapper), "--", str(config_path)]
-        print(f"[codec] Rendering {num_views} official Cycles views: {glb}", flush=True)
+        print(f"[codec] Rendering {num_views} Cycles views ({self.lighting}): {glb}", flush=True)
         with (outdir / "blender.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
         if result.returncode or not transforms.is_file() or not (outdir / "mesh.ply").is_file():
@@ -313,6 +367,10 @@ class OfficialAssetCodec:
                     "feature_kind": "x_prenorm", "pooling": "mean_all_views",
                     "sample_posterior": False, "voxel_resolution": 64,
                     "vertex_color_material_fallback": True}
+        if self.lighting != "official":
+            identity.update(lighting=self.lighting, emission_strength=1.0,
+                            color_transform="Standard sRGB, exposure=0, gamma=1",
+                            wrapper_sha256=hashlib.sha256(_BLENDER_WRAPPER.encode()).hexdigest())
         manifest = outdir / "encode.json"
         old = _guard_manifest(manifest, identity)
         latent_path = outdir / "latent.pt"
@@ -446,6 +504,8 @@ def main(argv=None):
     parser.add_argument("--trellis-root", type=Path)
     parser.add_argument("--blender", type=Path)
     parser.add_argument("--views", type=int, default=150)
+    parser.add_argument("--lighting", choices=("official", "uniform_texture"), default="official",
+                        help="uniform_texture preserves baked RGB without additional shading")
     parser.add_argument("--dino-batch-size", type=int, default=4)
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
@@ -457,7 +517,7 @@ def main(argv=None):
         parser.error("--preserve-input-texture requires roundtrip with textured export")
     codec = OfficialAssetCodec(trellis_root=args.trellis_root, blender_bin=args.blender,
                                dino_batch_size=args.dino_batch_size,
-                               texture_size=args.texture_size, seed=args.seed)
+                               texture_size=args.texture_size, seed=args.seed, lighting=args.lighting)
     if args.operation in ("encode", "roundtrip"):
         pack = codec.encode(args.input, args.output_dir, args.views)
         if args.operation == "roundtrip":

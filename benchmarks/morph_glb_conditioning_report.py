@@ -232,7 +232,7 @@ def _report(root):
             for row in _rows(result):
                 values = {"pair_id": item["pair_id"], "pair_dir": item["pair_dir"],
                           "src1": item["src1"], "src2": item["src2"], "alpha": row["alpha"]}
-                for group in ("geometry", "appearance", "structure", "slat"):
+                for group in ("geometry", "appearance", "structure", "slat", "historical_vs_glb_encoded", "historical_reproducibility"):
                     values.update(_flatten(row.get(group, {}), group))
                 csv_rows.append(values)
         else:
@@ -279,7 +279,7 @@ def _report(root):
                       ("IoU silhouette ↑", "appearance.silhouette_iou", 4),
                       ("PSNR oggetto ↑", "appearance.psnr_foreground_union", 2),
                       ("IoU voxel SS ↑", "structure.occupancy_iou", 4),
-                      ("RMSE SS ↓", "structure.ss_rmse", 5)]
+                      ("RMSE SS ↓", "structure.latent_rmse", 5)]
     aggregate_table = '<table><tr><th>Confronti</th>' + ''.join('<th>%s</th>' % escape(label) for label, _, _ in metric_columns) + '</tr>'
     aggregate_table += '<tr><td>%d</td>' % len(csv_rows) + ''.join('<td>%s</td>' % _number(means.get(key), digits)
         for _, key, digits in metric_columns) + '</tr></table>'
@@ -295,6 +295,14 @@ def _report(root):
                 links.append('<a href="%s">%s</a>' % (escape(relative, quote=True), label))
         title = '<h2>Coppia %02d: %s → %s</h2>' % (item["pair_id"], escape(item["src1"]), escape(item["src2"]))
         content = title + '<p>' + ' | '.join(links) + '</p>'
+        for label in ('src1', 'src2'):
+            render_dir = root / 'assets' / item[label] / 'encoding' / 'renders'
+            transforms = _read(render_dir / 'transforms.json', {})
+            frames = transforms.get('frames', [])
+            if frames:
+                image = _artifact(root, render_dir, render_dir / frames[0]['file_path'])
+                if image:
+                    content += '<p>Vista effettiva usata per encoding %s:</p><a href="%s"><img style="width:200px;background:#ddd" src="%s" alt="Render uniforme encoder"></a>' % (label, escape(image, quote=True), escape(image, quote=True))
         if result:
             result_path = "pairs/%s/result.json" % name
             content += '<p><a href="%s">Metriche complete della coppia</a></p>' % escape(result_path, quote=True)
@@ -305,7 +313,10 @@ def _report(root):
             content += ''.join('<th>%s</th>' % escape(label) for label, _, _ in metric_columns) + '</tr>'
             for row in _rows(result):
                 directory = row.get("alpha_dir", _alpha_dir(row["alpha"]))
-                cells = ['<td>%.6f</td>' % row["alpha"]]
+                old_comparison = _artifact(root, folder, row.get('paths', {}).get('historical_comparison_png'))
+                alpha_label = ('<a href="%s">%.6f (anche storico)</a>' % (escape(old_comparison, quote=True), row['alpha'])
+                               if old_comparison else '%.6f' % row['alpha'])
+                cells = ['<td>%s</td>' % alpha_label]
                 for branch in ("dataset_control", "glb_encoded"):
                     options = []
                     for filename, label in (("prediction.glb", "Colori ai vertici"),
@@ -319,6 +330,18 @@ def _report(root):
             content += '</table>'
         else:
             content += '<p class="muted">Confronto in corso: le metriche appariranno dopo il completamento dei cinque alpha.</p>'
+            ready = []
+            for alpha in expected:
+                directory = _alpha_dir(alpha)
+                options = []
+                for branch, label in (('dataset_control', 'SLat dataset'), ('glb_encoded', 'SLat da GLB')):
+                    relative = 'pairs/%s/%s/%s/prediction.glb' % (name, branch, directory)
+                    if (root / relative).is_file():
+                        options.append('<a href="%s">%s</a>' % (escape(relative, quote=True), label))
+                if options:
+                    ready.append('<li>alpha %.6f: %s</li>' % (float(alpha), ' | '.join(options)))
+            if ready:
+                content += '<p>Primi GLB gia disponibili, con colori ai vertici:</p><ul>' + ''.join(ready) + '</ul>'
         cards.append('<article>' + content + '</article>')
     sampling = manifest.get("sampling", {})
     ss_meta, slat_meta = manifest.get("checkpoints", {}).get("ss", {}), manifest.get("checkpoints", {}).get("slat", {})
@@ -332,6 +355,7 @@ def _report(root):
         ss_epoch, slat_epoch, sampling.get("cfg_ss", 5), sampling.get("cfg_slat", 1.5),
         sampling.get("ss_steps", 25), sampling.get("slat_steps", 25), sampling.get("mixed_precision", "bf16")))))
     page += '<p>La prima riga di ogni confronto mostra gli output dagli SLat dataset; la seconda usa gli SLat ottenuti dai GLB. Gli estremi sono i due oggetti sorgente; le cinque colonne interne sono i morph agli alpha salvati.</p>'
+    page += '<p>Encoding con aspetto uniforme: texture RGB autoilluminata a intensità 1, senza luci aggiuntive, ombre o riflessi; conversione Standard sRGB, esposizione 0. Il dataset v4 nasce da immagini FLUX e generazione 3D: questa scelta evita un secondo passaggio di illuminazione sui colori già presenti nel GLB, senza pretendere di replicare una luce unica del dataset.</p>'
     page += aggregate_table
     page += '<p>Le distanze misurano la differenza tra i due output, non la qualità rispetto a un morph reale. PSNR e IoU sono calcolati su otto viste comuni; la tavola riassuntiva mostra una sola vista ad alpha=0,5. Le geometrie non vengono riallineate o riscalate separatamente.</p>'
     history = summary["historical_reproduction"]

@@ -8,11 +8,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
-#SBATCH --output=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/%x_%j.out
-#SBATCH --error=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs/%x_%j.err
-#SBATCH --mail-user=marco.barezzi@unipr.it
-#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --time=00:20:00
+#SBATCH --output=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs_gen/%x_%j.out
+#SBATCH --error=/leonardo_work/IscrC_MORPHFL/mbarezzi/logs_gen/%x_%j.err
 
 # sbatch this-file src1.glb src2.glb --ss-checkpoint ss.pt --slat-checkpoint slat.pt \
 #     --alpha 0.5 --output-dir /path/to/output [other morph_glb_pair.py options]
@@ -29,7 +27,7 @@ if [[ "$MODE" == run && -z "${SLURM_JOB_ID:-}" ]]; then
 fi
 export WORK="${WORK:-/leonardo_work/IscrC_MORPHFL}"
 export FAST="${FAST:-/leonardo_scratch/fast/IscrC_MORPHFL}"
-source "${MF_ENV_FILE:-$WORK/$USER/env.sh}"
+source "${MF_ENV_FILE:-/leonardo_work/IscrC_MORPHFL/mbarezzi/env.sh}"
 PROJECT_DIR="${PROJECT_DIR:-${MF_PROJECT_DIR:-$MORPHFLOW_REPO}}"
 BLENDER_BIN="${BLENDER_BIN:-$WORK/$USER/tools/blender-3.0.1-linux-x64/blender}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"

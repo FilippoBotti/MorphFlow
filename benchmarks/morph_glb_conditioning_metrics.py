@@ -360,7 +360,18 @@ def evaluate_pair(runroot, index):
                 historical_renders = renderer.render(historical)
                 repro["appearance"] = appearance_metrics(historical_renders, reference_renders)
                 repro["geometry"] = geometry_metrics(_raw_parts(historical), _raw_parts(reference), sample_count=20000, seed=42)
+                row["historical_vs_glb_encoded"] = {
+                    "appearance": appearance_metrics(historical_renders, encoded_renders),
+                    "geometry": geometry_metrics(_raw_parts(historical), _raw_parts(encoded), sample_count=20000, seed=42)}
+                for view_index, view in enumerate(historical_renders):
+                    _save_view(view, destination / ("historical_view_%02d.png" % view_index))
+                _save_sheet([("Risultato dataset gia salvato", historical_renders),
+                             ("Controllo dataset rigenerato", reference_renders),
+                             ("SLat da GLB", encoded_renders)], destination / "historical_comparison.png")
+                row["paths"]["historical_comparison_png"] = str(destination / "historical_comparison.png")
                 del historical_renders
+            else:
+                row["historical_vs_glb_encoded"] = {"appearance": appearance, "geometry": geometry}
             row["historical_reproducibility"] = repro
             del historical
         _write_json(destination / "metrics.json", row)
