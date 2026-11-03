@@ -112,6 +112,27 @@ Le texture provengono dal Gaussian decoder dello SLat generato dal modello;
 non sono copiate dagli oggetti sorgente. La parametrizzazione UV di mesh
 complesse puo richiedere diversi minuti per ogni alpha.
 
+ASSI DEI GLB
+------------
+Il default --glb-up-axis y segue glTF: la verticale nel file e Y.
+Alcuni esportatori salvano invece coordinate Z-up in un file .glb.
+Se gli oggetti risultano sdraiati anche nelle viste quasi orizzontali,
+provare --glb-up-axis z in una NUOVA cartella di output. La correzione
+ruota la scena importata prima di normalizzare, renderizzare e creare
+la mesh per la voxelizzazione; non ruota le sole immagini.
+Sono disponibili --src1-up-axis e --src2-up-axis per sorgenti diverse.
+Queste opzioni valgono solo per GLB, non per SLat gia codificati.
+L'orientamento errato rispetto al training puo influire su geometria e
+aspetto; correggerlo non garantisce da solo la fedelta dei colori.
+
+Per separare la ricostruzione VAE dal morphing, si puo decodificare un
+input gia salvato, senza rigenerare il modello:
+python trellis_asset_codec.py decode outputs/morph_test/inputs/src1/slat.pt \
+  --output-dir outputs/morph_test/reconstruction_src1 --no-texture
+Il file risultante e reconstruction_src1/vertex.glb. Se la ricostruzione
+ha colori corretti ma il morph no, il problema si manifesta nel modello;
+se e gia sbagliata, occorre approfondire encoding e rappresentazione.
+
 OUTPUT E RIPRESA
 ---------------
 output/run.json: configurazione, checkpoint, Blender, ambiente e memoria GPU.
@@ -138,9 +159,19 @@ python monster-exp/test_morph_assets.py
 
 VERIFICHE ED ESEMPI SALVATI
 --------------------------
-Sei test CPU passati per formati, coordinate, cache e precedenza Blender.
+Sette test CPU passati per formati, coordinate, cache e precedenza Blender.
 Prove GPU completate: GLB ad alpha 0.5 (8 viste per test rapido; default 150),
 SLat ad alpha 0/0.5/1, ripresa ed estensione della lista senza modificare
 i risultati gia prodotti. Tutti i GLB textured hanno UV e PNG incorporata
 a 2048x2048. Dettagli in VALIDATION.json.
 Esempi Leonardo: outputs/monster_exp_smoke_20261103/{glb,slat}/index.html.
+
+AGGIORNAMENTO ASSI
+------------------
+La versione con --glb-up-axis richiede di aggiornare anche il file
+trellis_asset_codec.py nella radice del progetto. Il pacchetto con suffisso
+_axes contiene entrambi. Usare una cartella nuova, ad esempio
+outputs/morph_test_zup, per evitare gli SLat gia codificati con gli assi vecchi.
+Correzione testata su due GLB equivalenti Y-up e Z-up: mesh normalizzata
+e render coincidono entro gli errori numerici. Questo verifica la coerenza
+della trasformazione, non garantisce la resa del modello su asset nuovi.

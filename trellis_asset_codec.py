@@ -68,6 +68,7 @@ import bpy
 config = json.load(open(sys.argv[sys.argv.index('--') + 1]))
 official = config.pop('official_script')
 lighting = config.pop('lighting', 'official')
+input_up_axis = config.pop('input_up_axis', 'y')
 namespace = {'__name__': 'trellis_official_renderer', '__file__': official}
 with open(official) as stream:
     source = stream.read()
@@ -79,6 +80,19 @@ original_load_object = namespace['load_object']
 
 def load_object(path):
     original_load_object(path)
+    if input_up_axis == 'z':
+        # The glTF importer already maps file Y-up to Blender Z-up.
+        # Some exporters store Z-up coordinates without this glTF conversion.
+        # Undo that extra importer rotation, for the complete scene hierarchy,
+        # before normalization, rendering, and exporting the voxelization mesh.
+        import math
+        from mathutils import Matrix
+        correction = Matrix.Rotation(-math.pi / 2, 4, 'X')
+        roots = [obj for obj in bpy.context.scene.objects if obj.parent is None]
+        for obj in roots:
+            obj.matrix_world = correction @ obj.matrix_world
+        bpy.context.view_layer.update()
+        print('[codec] Corrected input Z-up to canonical Blender Z-up before encoding')
     for obj in bpy.context.scene.objects:
         if obj.type != 'MESH' or not obj.data.vertex_colors:
             continue
@@ -164,7 +178,8 @@ class OfficialAssetCodec:
     """
 
     def __init__(self, trellis_root=None, blender_bin=None, device="cuda",
-                 dino_batch_size=4, texture_size=2048, seed=42, lighting="official"):
+                 dino_batch_size=4, texture_size=2048, seed=42, lighting="official",
+                 input_up_axis="y"):
         default_root = Path(__file__).resolve().parent.parent / "TRELLIS"
         self.trellis_root = Path(trellis_root or os.environ.get("TRELLIS_REPO", default_root)).resolve()
         default_blender = Path(__file__).resolve().parents[2] / "tools/blender-3.0.1-linux-x64/blender"
@@ -176,6 +191,9 @@ class OfficialAssetCodec:
         if lighting not in ("official", "uniform_texture"):
             raise ValueError("lighting must be official or uniform_texture")
         self.lighting = lighting
+        if input_up_axis not in ("y", "z"):
+            raise ValueError("input_up_axis must be y or z")
+        self.input_up_axis = input_up_axis
         if self.dino_batch_size < 1 or self.texture_size < 1:
             raise ValueError("dino_batch_size and texture_size must be positive")
         self._torch = None
@@ -265,13 +283,13 @@ class OfficialAssetCodec:
                   "output_folder": str(outdir), "engine": "CYCLES", "geo_mode": False,
                   "save_depth": False, "save_normal": False, "save_albedo": False,
                   "save_mist": False, "split_normal": False, "save_mesh": True,
-                  "lighting": self.lighting}
+                  "lighting": self.lighting, "input_up_axis": self.input_up_axis}
         config_path, wrapper = outdir / "render_config.json", outdir / "official_render_wrapper.py"
         write_json(config_path, config)
         wrapper.write_text(_BLENDER_WRAPPER)
         command = [self.blender_bin, "-b", "--threads", os.environ.get("OMP_NUM_THREADS", "4"),
                    "--python-exit-code", "1", "-P", str(wrapper), "--", str(config_path)]
-        print(f"[codec] Rendering {num_views} Cycles views ({self.lighting}): {glb}", flush=True)
+        print(f"[codec] Rendering {num_views} Cycles views ({self.lighting}, input_up={self.input_up_axis}): {glb}", flush=True)
         with (outdir / "blender.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
         if result.returncode or not transforms.is_file() or not (outdir / "mesh.ply").is_file():
@@ -371,6 +389,9 @@ class OfficialAssetCodec:
             identity.update(lighting=self.lighting, emission_strength=1.0,
                             color_transform="Standard sRGB, exposure=0, gamma=1",
                             wrapper_sha256=hashlib.sha256(_BLENDER_WRAPPER.encode()).hexdigest())
+        if self.input_up_axis != "y":
+            identity.update(input_up_axis=self.input_up_axis,
+                            imported_scene_rotation_degrees=[-90, 0, 0])
         manifest = outdir / "encode.json"
         old = _guard_manifest(manifest, identity)
         latent_path = outdir / "latent.pt"
@@ -506,6 +527,8 @@ def main(argv=None):
     parser.add_argument("--views", type=int, default=150)
     parser.add_argument("--lighting", choices=("official", "uniform_texture"), default="official",
                         help="uniform_texture preserves baked RGB without additional shading")
+    parser.add_argument("--input-up-axis", choices=("y", "z"), default="y",
+                        help="Actual up axis stored in the GLB: y is the glTF convention; z corrects Z-up exports")
     parser.add_argument("--dino-batch-size", type=int, default=4)
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
@@ -515,9 +538,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.preserve_input_texture and (args.operation != "roundtrip" or args.no_texture):
         parser.error("--preserve-input-texture requires roundtrip with textured export")
+    if args.preserve_input_texture and args.input_up_axis != "y":
+        parser.error("Source-texture transfer requires a standard Y-up GLB; convert the input before using --preserve-input-texture")
     codec = OfficialAssetCodec(trellis_root=args.trellis_root, blender_bin=args.blender,
                                dino_batch_size=args.dino_batch_size,
-                               texture_size=args.texture_size, seed=args.seed, lighting=args.lighting)
+                               texture_size=args.texture_size, seed=args.seed, lighting=args.lighting,
+                               input_up_axis=args.input_up_axis)
     if args.operation in ("encode", "roundtrip"):
         pack = codec.encode(args.input, args.output_dir, args.views)
         if args.operation == "roundtrip":

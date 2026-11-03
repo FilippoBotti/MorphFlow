@@ -1,6 +1,6 @@
 {
   "status": "passed",
-  "cpu_contract_tests": 6,
+  "cpu_contract_tests": 7,
   "gpu_jobs": [
     63381874,
     63381875,
@@ -86,5 +86,18 @@
       "Blender Cycles GPU render"
     ]
   },
-  "example_outputs": "/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/monster_exp_smoke_20261103"
+  "example_outputs": "/leonardo_work/IscrC_MORPHFL/mbarezzi/outputs/monster_exp_smoke_20261103",
+  "input_axis_correction": {
+    "gpu_job": 63392178,
+    "status": "passed",
+    "normalized_mesh_max_distance": 1.0133885226201597e-07,
+    "render_psnr_rgba": [
+      88.99181822903967,
+      89.70357414027077,
+      85.7600169927835,
+      74.56920878742655
+    ],
+    "description": "Equivalent source scenes after correction before normalization/render/mesh export.",
+    "scope": "Scene normalization/render/voxelization alignment; user texture quality after morphing still requires comparison."
+  }
 }

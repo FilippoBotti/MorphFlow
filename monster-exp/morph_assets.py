@@ -95,6 +95,10 @@ def parse_args(argv=None):
     parser.add_argument('--encoding-views', type=int, default=150)
     parser.add_argument('--dino-batch-size', type=int, default=4)
     parser.add_argument('--lighting', choices=('uniform_texture', 'official'), default='uniform_texture')
+    parser.add_argument('--glb-up-axis', choices=('y', 'z'), default='y',
+                        help='Actual source up axis: y for standard glTF, z for GLBs storing Z-up coordinates')
+    parser.add_argument('--src1-up-axis', choices=('y', 'z'), help='Override --glb-up-axis for src1')
+    parser.add_argument('--src2-up-axis', choices=('y', 'z'), help='Override --glb-up-axis for src2')
     parser.add_argument('--texture-size', type=int, default=2048)
     parser.add_argument('--simplify', type=float, default=0.0, help='Fraction of triangles removed; default preserves all geometry')
     parser.add_argument('--fill-holes', action='store_true')
@@ -114,6 +118,8 @@ def parse_args(argv=None):
     if args.seed < 0 or (args.slat_seed is not None and args.slat_seed < 0):
         parser.error('Seeds must be nonnegative')
     args.slat_seed = args.seed + 10000 if args.slat_seed is None else args.slat_seed
+    args.src1_up_axis = args.src1_up_axis or args.glb_up_axis
+    args.src2_up_axis = args.src2_up_axis or args.glb_up_axis
     for name in ('src1', 'src2', 'ss_checkpoint', 'slat_checkpoint'):
         value = getattr(args, name).expanduser().resolve()
         if not value.exists() or (name.endswith('checkpoint') and not value.is_file()):
@@ -135,6 +141,8 @@ def parse_args(argv=None):
         if not (args.trellis_root / 'dataset_toolkits/blender_script/render.py').is_file():
             parser.error('GLB encoding needs the official TRELLIS dataset_toolkits')
     else:
+        if args.src1_up_axis != 'y' or args.src2_up_axis != 'y':
+            parser.error('Up-axis correction applies to GLBs; encoded SLat coordinates cannot be rotated independently of their features')
         args.blender = None
         for path in (args.src1, args.src2):
             input_files(path, 'slat')
@@ -358,7 +366,9 @@ def configuration(args, old=None):
             'sampling': {'steps_ss': args.steps_ss, 'steps_slat': args.steps_slat,
                          'cfg_ss': args.cfg_ss, 'cfg_slat': args.cfg_slat, 'ss_seed': args.seed,
                          'slat_seed': args.slat_seed, 'mixed_precision': args.precision, 'allow_tf32': args.allow_tf32},
-            'encoding': {'views': args.encoding_views, 'dino_batch_size': args.dino_batch_size, 'lighting': args.lighting},
+            'encoding': {'views': args.encoding_views, 'dino_batch_size': args.dino_batch_size, 'lighting': args.lighting,
+                         **({'src1_up_axis': args.src1_up_axis, 'src2_up_axis': args.src2_up_axis}
+                            if args.input_type == 'glb' else {})},
             'texture': {'size': args.texture_size, 'simplify': args.simplify, 'fill_holes': args.fill_holes}}
 
 
@@ -372,16 +382,22 @@ def load_model(path, target, device):
 
 def prepare_inputs(args):
     from trellis_asset_codec import OfficialAssetCodec
+    import inspect
+    if args.input_type == 'glb' and 'input_up_axis' not in inspect.signature(OfficialAssetCodec).parameters:
+        raise RuntimeError('Update trellis_asset_codec.py together with monster-exp: the installed encoder lacks explicit input-axis support')
     codec = OfficialAssetCodec(trellis_root=args.trellis_root, blender_bin=args.blender,
-                               dino_batch_size=args.dino_batch_size, seed=args.seed, lighting=args.lighting)
+                               dino_batch_size=args.dino_batch_size, seed=args.seed, lighting=args.lighting,
+                               **({'input_up_axis': args.src1_up_axis} if args.input_type == 'glb' else {}))
     packs = []
     for label, source in (('src1', args.src1), ('src2', args.src2)):
+        codec.input_up_axis = getattr(args, label + '_up_axis')
         folder = args.output_dir / 'inputs' / label
         folder.mkdir(parents=True, exist_ok=True)
         if ready(folder, 'input'):
             pack = validate_pack(load_tensor(folder / 'slat.pt'))
         else:
-            print('INPUT ' + label + ' ' + str(source), flush=True)
+            print('INPUT ' + label + ' ' + str(source) +
+                  (' (up=' + codec.input_up_axis + ')' if args.input_type == 'glb' else ''), flush=True)
             for previous in (args.output_dir / 'morphs').glob('alpha_*'):
                 invalidate(previous, ('ss', 'slat', 'mesh', 'gaussian', 'export'))
             pack = codec.encode(source, folder / 'encoding', num_views=args.encoding_views) if args.input_type == 'glb' else read_slat(source)

@@ -81,6 +81,27 @@ class InputAndResumeTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 pipeline.resolve_blender(self.root / 'absent')
 
+    def test_up_axis_is_explicit_and_can_differ_between_sources(self):
+        trellis = self.root / 'TRELLIS'
+        for relative in ['trellis/models/__init__.py', 'dataset_toolkits/blender_script/render.py']:
+            path = trellis / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        for name in ['a.glb', 'b.glb']:
+            (self.root / name).write_bytes(b'glTF')
+        for name in ['ss.pt', 'slat.pt']:
+            (self.root / name).touch()
+        blender = self.root / 'blender'
+        blender.write_text('#!/bin/sh\nexit 0\n')
+        blender.chmod(0o755)
+        args = pipeline.parse_args([str(self.root / 'a.glb'), str(self.root / 'b.glb'),
+            '--alphas', '0.5', '--ss-checkpoint', str(self.root / 'ss.pt'),
+            '--slat-checkpoint', str(self.root / 'slat.pt'), '--output-dir', str(self.root / 'run'),
+            '--trellis-root', str(trellis), '--blender', str(blender),
+            '--glb-up-axis', 'z', '--src2-up-axis', 'y'])
+        self.assertEqual(args.src1_up_axis, 'z')
+        self.assertEqual(args.src2_up_axis, 'y')
+
 
 if __name__ == '__main__':
     unittest.main()
