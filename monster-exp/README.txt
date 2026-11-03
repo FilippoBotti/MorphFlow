@@ -101,6 +101,8 @@ QUALITA E PARAMETRI
 Default: SS 25 step / CFG 5; SLat 25 step / CFG 1.5; seed SS 42,
 seed SLat 10042; precisione auto (BF16 sulle GPU qui verificate).
 --steps-ss, --steps-slat, --cfg-ss, --cfg-slat, --seed, --slat-seed.
+TF32 e disabilitato per default. --cudnn-tf32 1 permette di riprodurre
+separatamente il flag delle convoluzioni usato nei vecchi benchmark.
 Encoding: 150 viste, DINOv2, VAE posterior mean, luce uniform_texture.
 --lighting official ripristina il rig di luci upstream; --dino-batch-size 1
 riduce la memoria necessaria per l'encoding.
@@ -132,6 +134,17 @@ python trellis_asset_codec.py decode outputs/morph_test/inputs/src1/slat.pt \
 Il file risultante e reconstruction_src1/vertex.glb. Se la ricostruzione
 ha colori corretti ma il morph no, il problema si manifesta nel modello;
 se e gia sbagliata, occorre approfondire encoding e rappresentazione.
+
+DIAGNOSTICA DEL MATERIALE
+------------------------
+python monster-exp/make_glb_material_variants.py /path/prediction_textured.glb
+Crea prediction_textured_matte.glb (metallic=0, roughness=1) e
+prediction_textured_unlit.glb (KHR_materials_unlit), accanto al file dato.
+Geometria, UV e byte delle texture rimangono identici; nessuna GPU richiesta.
+Il GLB ufficiale omette metallicFactor: un viewer glTF standard assume 1.
+Le copie servono a isolare materiale e illuminazione; non correggono colori
+gia errati nelle Gaussiane o errori nel baking. Il file originale e conservato.
+alpha_1 e l'estremo src1; alpha_0p5 e il morphing centrale.
 
 OUTPUT E RIPRESA
 ---------------

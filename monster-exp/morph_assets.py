@@ -103,6 +103,8 @@ def parse_args(argv=None):
     parser.add_argument('--simplify', type=float, default=0.0, help='Fraction of triangles removed; default preserves all geometry')
     parser.add_argument('--fill-holes', action='store_true')
     parser.add_argument('--allow-tf32', action='store_true')
+    parser.add_argument('--cudnn-tf32', type=int, choices=(0, 1),
+                        help='Override convolution TF32 separately; default follows --allow-tf32')
     parser.add_argument('--mode', choices=('run', 'check'), default='run')
     args = parser.parse_args(argv)
     try:
@@ -118,6 +120,7 @@ def parse_args(argv=None):
     if args.seed < 0 or (args.slat_seed is not None and args.slat_seed < 0):
         parser.error('Seeds must be nonnegative')
     args.slat_seed = args.seed + 10000 if args.slat_seed is None else args.slat_seed
+    args.cudnn_tf32 = args.allow_tf32 if args.cudnn_tf32 is None else bool(args.cudnn_tf32)
     args.src1_up_axis = args.src1_up_axis or args.glb_up_axis
     args.src2_up_axis = args.src2_up_axis or args.glb_up_axis
     for name in ('src1', 'src2', 'ss_checkpoint', 'slat_checkpoint'):
@@ -313,7 +316,7 @@ def runtime(args):
     args.precision = precision
     torch.set_num_threads(int(os.environ.get('OMP_NUM_THREADS', '4')))
     torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
-    torch.backends.cudnn.allow_tf32 = args.allow_tf32
+    torch.backends.cudnn.allow_tf32 = args.cudnn_tf32
     return torch
 
 
@@ -365,7 +368,8 @@ def configuration(args, old=None):
             'blender': str(args.blender) if args.blender else None,
             'sampling': {'steps_ss': args.steps_ss, 'steps_slat': args.steps_slat,
                          'cfg_ss': args.cfg_ss, 'cfg_slat': args.cfg_slat, 'ss_seed': args.seed,
-                         'slat_seed': args.slat_seed, 'mixed_precision': args.precision, 'allow_tf32': args.allow_tf32},
+                         'slat_seed': args.slat_seed, 'mixed_precision': args.precision, 'allow_tf32': args.allow_tf32,
+                         **({'cudnn_tf32': args.cudnn_tf32} if args.cudnn_tf32 != args.allow_tf32 else {})},
             'encoding': {'views': args.encoding_views, 'dino_batch_size': args.dino_batch_size, 'lighting': args.lighting,
                          **({'src1_up_axis': args.src1_up_axis, 'src2_up_axis': args.src2_up_axis}
                             if args.input_type == 'glb' else {})},
@@ -609,7 +613,7 @@ def run(args, metadata, torch):
             packs = prepare_inputs(args)
             # Codec intentionally disables TF32; restore the requested flow setting.
             torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
-            torch.backends.cudnn.allow_tf32 = args.allow_tf32
+            torch.backends.cudnn.allow_tf32 = args.cudnn_tf32
             folders = sample_sources(args, packs, torch, all_alphas)
             del packs
             decode_assets(folders, torch)
