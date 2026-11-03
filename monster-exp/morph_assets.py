@@ -91,7 +91,8 @@ def parse_args(argv=None):
     parser.add_argument('--cfg-slat', type=float, default=1.5)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--slat-seed', type=int, help='Default: seed+10000')
-    parser.add_argument('--mixed-precision', choices=('auto', 'bf16', 'fp16', 'no'), default='auto')
+    parser.add_argument('--mixed-precision', '--precision', choices=('fp32', 'bf16', 'fp16', 'no'), default='fp32',
+                        help='MorphFlow sampling precision (default: fp32); bf16/fp16 require an explicit choice; no aliases fp32')
     parser.add_argument('--encoding-views', type=int, default=150)
     parser.add_argument('--dino-batch-size', type=int, default=4)
     parser.add_argument('--lighting', choices=('uniform_texture', 'official'), default='uniform_texture')
@@ -100,6 +101,8 @@ def parse_args(argv=None):
     parser.add_argument('--src1-up-axis', choices=('y', 'z'), help='Override --glb-up-axis for src1')
     parser.add_argument('--src2-up-axis', choices=('y', 'z'), help='Override --glb-up-axis for src2')
     parser.add_argument('--texture-size', type=int, default=2048)
+    parser.add_argument('--material-mode', choices=('official', 'matte', 'unlit'), default='official',
+                        help='Final GLB material: upstream PBR, nonmetallic PBR, or baked appearance without extra lighting')
     parser.add_argument('--simplify', type=float, default=0.0, help='Fraction of triangles removed; default preserves all geometry')
     parser.add_argument('--fill-holes', action='store_true')
     parser.add_argument('--allow-tf32', action='store_true')
@@ -308,9 +311,9 @@ def runtime(args):
         raise RuntimeError('A different TRELLIS checkout was imported: ' + str(trellis.__file__))
     if args.mode == 'run' and not torch.cuda.is_available():
         raise RuntimeError('CUDA is required; on Leonardo submit with sbatch')
-    precision = args.mixed_precision
-    if precision == 'auto':
-        precision = 'bf16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'fp16'
+    # The shared sampling helpers use 'no' to disable autocast. Passing the
+    # user-facing 'fp32' directly would fall through to their FP16 branch.
+    precision = 'no' if args.mixed_precision in ('fp32', 'no') else args.mixed_precision
     if precision == 'bf16' and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         raise RuntimeError('This GPU does not support bf16; use --mixed-precision fp16')
     args.precision = precision
@@ -362,6 +365,8 @@ def configuration(args, old=None):
     if args.input_type == 'glb':
         core_paths += [PROJECT / 'trellis_asset_codec.py',
                        args.trellis_root / 'dataset_toolkits/blender_script/render.py']
+    if args.material_mode != 'official':
+        core_paths.append(Path(__file__).with_name('make_glb_material_variants.py'))
     return {'version': VERSION, 'inputs': inputs, 'checkpoints': checkpoints,
             'source_paths': [str(args.src1), str(args.src2)], 'input_type': args.input_type,
             'trellis_root': str(args.trellis_root), 'source_hashes': {str(p): sha256(p) for p in core_paths},
@@ -373,7 +378,8 @@ def configuration(args, old=None):
             'encoding': {'views': args.encoding_views, 'dino_batch_size': args.dino_batch_size, 'lighting': args.lighting,
                          **({'src1_up_axis': args.src1_up_axis, 'src2_up_axis': args.src2_up_axis}
                             if args.input_type == 'glb' else {})},
-            'texture': {'size': args.texture_size, 'simplify': args.simplify, 'fill_holes': args.fill_holes}}
+            'texture': {'size': args.texture_size, 'simplify': args.simplify, 'fill_holes': args.fill_holes,
+                        **({'material_mode': args.material_mode} if args.material_mode != 'official' else {})}}
 
 
 def load_model(path, target, device):
@@ -546,13 +552,23 @@ def export_assets(args, folders, torch):
                             texture_size=args.texture_size, verbose=False)
         temp = folder / 'prediction_textured.tmp.glb'
         output.export(temp)
-        temp.replace(folder / 'prediction_textured.glb')
+        exported = ['prediction.glb', 'prediction_textured.glb']
+        if args.material_mode == 'official':
+            temp.replace(folder / 'prediction_textured.glb')
+        else:
+            from make_glb_material_variants import read_glb, write_glb, material_document
+            official = folder / 'prediction_textured_official.glb'
+            temp.replace(official)
+            _, document, binary = read_glb(official)
+            write_glb(folder / 'prediction_textured.glb', material_document(document, args.material_mode), binary)
+            exported.append('prediction_textured_official.glb')
         for name in ('prediction.glb', 'prediction_textured.glb'):
             error = glb_error(folder / name, textured=name == 'prediction_textured.glb')
             if error:
                 raise RuntimeError(name + ': ' + error)
-        commit(folder, 'export', ['prediction.glb', 'prediction_textured.glb'], alpha=alpha,
-               texture_size=args.texture_size, appearance='Gaussian decoder of generated SLat; no source texture transfer')
+        commit(folder, 'export', exported, alpha=alpha,
+               texture_size=args.texture_size, material_mode=args.material_mode,
+               appearance='Gaussian decoder of generated SLat; no source texture transfer')
         print('TEXTURE_COMPLETE ' + str(folder / 'prediction_textured.glb'), flush=True)
         del data, state, mesh, gaussian, output, vertex_mesh, attrs
         release()
@@ -567,7 +583,9 @@ def gallery(root, alphas, status):
                 'textured_glb': str(folder / 'prediction_textured.glb'), 'slat': str(folder / 'slat.pt')}
         results.append(item)
         links = []
-        for name, label in (('prediction_textured.glb', 'Textured GLB'), ('prediction.glb', 'Vertex-color GLB'), ('slat.pt', 'SLat')):
+        for name, label in (('prediction_textured.glb', 'Textured GLB'),
+                            ('prediction_textured_official.glb', 'Original PBR GLB'),
+                            ('prediction.glb', 'Vertex-color GLB'), ('gaussian.pt', 'Gaussian'), ('slat.pt', 'SLat')):
             if (folder / name).is_file():
                 links.append('<a href="' + escape((folder / name).relative_to(root).as_posix(), quote=True) + '">' + label + '</a>')
         rows.append('<tr><td>' + str(alpha) + '</td><td>' + item['status'] + '</td><td>' + ' | '.join(links) + '</td></tr>')

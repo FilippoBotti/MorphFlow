@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run inside the installed environment: conda activate trellis
 # bash monster-exp/run_local.sh src1.glb src2.glb --alphas 0 .5 1 ...
+# FP32 sampling by default; append --mixed-precision bf16 or fp16 to override.
 set -euo pipefail
 MONSTER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname -- "$MONSTER_DIR")"
@@ -32,4 +33,6 @@ if [[ "${1:-}" == --doctor ]]; then
     shift
     exec "$MORPH_PYTHON" "$MONSTER_DIR/check_environment.py" "$@"
 fi
-exec "$MORPH_PYTHON" "$MONSTER_DIR/morph_assets.py" "$@"
+# Place the default first so an explicit --mixed-precision/--precision in "$@"
+# takes precedence. Environment and GPU capabilities do not select precision.
+exec "$MORPH_PYTHON" "$MONSTER_DIR/morph_assets.py" --mixed-precision fp32 "$@"

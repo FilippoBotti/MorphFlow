@@ -34,6 +34,28 @@ def write_glb(path, document, tail):
     temporary.replace(path)
 
 
+def material_document(document, mode):
+    if mode not in ('matte', 'unlit'):
+        raise ValueError('Expected matte or unlit')
+    variant = copy.deepcopy(document)
+    for material in variant['materials']:
+        pbr = material.setdefault('pbrMetallicRoughness', {})
+        pbr.update(metallicFactor=0.0, roughnessFactor=1.0)
+        if mode == 'unlit':
+            material.setdefault('extensions', {})['KHR_materials_unlit'] = {}
+        else:
+            material.get('extensions', {}).pop('KHR_materials_unlit', None)
+    for key in ('extensionsUsed', 'extensionsRequired'):
+        names = [x for x in variant.get(key, []) if x != 'KHR_materials_unlit']
+        if mode == 'unlit' and key == 'extensionsUsed':
+            names.append('KHR_materials_unlit')
+        if names:
+            variant[key] = names
+        else:
+            variant.pop(key, None)
+    return variant
+
+
 def make_variants(source, output_dir=None):
     source = Path(source).resolve()
     original, document, tail = read_glb(source)
@@ -42,22 +64,7 @@ def make_variants(source, output_dir=None):
     result = {'source': str(source), 'source_sha256': hashlib.sha256(original).hexdigest(),
               'binary_chunks_sha256': hashlib.sha256(tail).hexdigest(), 'outputs': {}}
     for mode in ('matte', 'unlit'):
-        variant = copy.deepcopy(document)
-        for material in variant['materials']:
-            pbr = material.setdefault('pbrMetallicRoughness', {})
-            pbr.update(metallicFactor=0.0, roughnessFactor=1.0)
-            if mode == 'unlit':
-                material.setdefault('extensions', {})['KHR_materials_unlit'] = {}
-            else:
-                material.get('extensions', {}).pop('KHR_materials_unlit', None)
-        for key in ('extensionsUsed', 'extensionsRequired'):
-            names = [x for x in variant.get(key, []) if x != 'KHR_materials_unlit']
-            if mode == 'unlit' and key == 'extensionsUsed':
-                names.append('KHR_materials_unlit')
-            if names:
-                variant[key] = names
-            else:
-                variant.pop(key, None)
+        variant = material_document(document, mode)
         path = output_dir / (source.stem + '_' + mode + '.glb')
         write_glb(path, variant, tail)
         _, checked, checked_tail = read_glb(path)

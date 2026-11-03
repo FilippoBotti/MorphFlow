@@ -1,8 +1,12 @@
 """CPU contract tests for source formats and interruption-safe caches."""
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 import numpy as np
@@ -101,6 +105,69 @@ class InputAndResumeTests(unittest.TestCase):
             '--glb-up-axis', 'z', '--src2-up-axis', 'y'])
         self.assertEqual(args.src1_up_axis, 'z')
         self.assertEqual(args.src2_up_axis, 'y')
+
+    def precision_args(self, *extra):
+        trellis = self.root / 'TRELLIS'
+        model_file = trellis / 'trellis/models/__init__.py'
+        model_file.parent.mkdir(parents=True, exist_ok=True)
+        model_file.touch()
+        for name in ('input.pt', 'ss.pt', 'slat.pt'):
+            (self.root / name).touch()
+        return pipeline.parse_args([str(self.root / 'input.pt'), str(self.root / 'input.pt'),
+            '--alphas', '0.5', '--ss-checkpoint', str(self.root / 'ss.pt'),
+            '--slat-checkpoint', str(self.root / 'slat.pt'), '--output-dir', str(self.root / 'run'),
+            '--trellis-root', str(trellis), '--mode', 'check', *extra])
+
+    def test_sampling_defaults_to_fp32_and_reduced_precision_is_explicit(self):
+        cases = [((), 'fp32', 'no'),
+                 (('--mixed-precision', 'fp32'), 'fp32', 'no'),
+                 (('--mixed-precision', 'no'), 'no', 'no'),
+                 (('--mixed-precision', 'bf16'), 'bf16', 'bf16'),
+                 (('--precision', 'fp16'), 'fp16', 'fp16'),
+                 (('--mixed-precision', 'fp32', '--mixed-precision', 'bf16'), 'bf16', 'bf16'),
+                 (('--mixed-precision', 'fp32', '--precision', 'fp16'), 'fp16', 'fp16')]
+        for flags, requested, resolved in cases:
+            with self.subTest(flags=flags):
+                args = self.precision_args(*flags)
+                trellis = SimpleNamespace(__file__=str(args.trellis_root / 'trellis/__init__.py'))
+                backends = SimpleNamespace(cuda=SimpleNamespace(matmul=SimpleNamespace()), cudnn=SimpleNamespace())
+                with patch.dict('sys.modules', {'trellis': trellis}), \
+                     patch.object(torch.cuda, 'is_available', return_value=True), \
+                     patch.object(torch.cuda, 'is_bf16_supported', return_value=True) as support, \
+                     patch.object(torch, 'set_num_threads'), \
+                     patch.object(torch, 'backends', backends):
+                    pipeline.runtime(args)
+                self.assertEqual(args.mixed_precision, requested)
+                self.assertEqual(args.precision, resolved)
+                self.assertFalse(backends.cuda.matmul.allow_tf32)
+                self.assertFalse(backends.cudnn.allow_tf32)
+                if requested != 'bf16':
+                    support.assert_not_called()
+
+    def test_explicit_unsupported_bf16_fails_without_fallback(self):
+        args = self.precision_args('--mixed-precision', 'bf16')
+        trellis = SimpleNamespace(__file__=str(args.trellis_root / 'trellis/__init__.py'))
+        with patch.dict('sys.modules', {'trellis': trellis}), \
+             patch.object(torch.cuda, 'is_available', return_value=True), \
+             patch.object(torch.cuda, 'is_bf16_supported', return_value=False), \
+             self.assertRaisesRegex(RuntimeError, 'does not support bf16'):
+            pipeline.runtime(args)
+
+    def test_launcher_sets_fp32_and_forwards_explicit_overrides(self):
+        executable = self.root / 'capture-python'
+        executable.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@"\n')
+        executable.chmod(0o755)
+        launcher = Path(pipeline.__file__).with_name('run_local.sh')
+        environment = {**os.environ, 'MORPH_PYTHON': str(executable)}
+        for flags in ([], ['--mixed-precision', 'bf16'], ['--precision', 'fp16']):
+            with self.subTest(flags=flags):
+                result = subprocess.check_output(['bash', str(launcher), 'a.glb', 'b.glb', *flags],
+                                                 env=environment, text=True).splitlines()
+                self.assertEqual(result, [str(launcher.with_name('morph_assets.py')),
+                                         '--mixed-precision', 'fp32', 'a.glb', 'b.glb', *flags])
+        doctor = subprocess.check_output(['bash', str(launcher), '--doctor', '--gpu'],
+                                         env=environment, text=True).splitlines()
+        self.assertEqual(doctor, [str(launcher.with_name('check_environment.py')), '--gpu'])
 
 
 if __name__ == '__main__':

@@ -99,7 +99,14 @@ quindi una scala relativa normalizzata, non la loro scala metrica originale.
 QUALITA E PARAMETRI
 ------------------
 Default: SS 25 step / CFG 5; SLat 25 step / CFG 1.5; seed SS 42,
-seed SLat 10042; precisione auto (BF16 sulle GPU qui verificate).
+seed SLat 10042; sampling MorphFlow SS/SLat in FP32, senza autocast.
+--mixed-precision bf16 oppure --mixed-precision fp16 abilita esplicitamente
+la precisione ridotta. --precision e un alias; --mixed-precision fp32
+(oppure il precedente valore no) seleziona FP32. La scelta auto e rimossa:
+il tipo di GPU non cambia la precisione predefinita.
+Questa opzione riguarda il sampling: encoder VAE, decoder SS e decoder
+Gaussian TRELLIS mantengono la precisione FP16 dei checkpoint ufficiali;
+DINO e il decoder mesh restano FP32. Il baking texture resta upstream.
 --steps-ss, --steps-slat, --cfg-ss, --cfg-slat, --seed, --slat-seed.
 TF32 e disabilitato per default. --cudnn-tf32 1 permette di riprodurre
 separatamente il flag delle convoluzioni usato nei vecchi benchmark.
@@ -108,6 +115,11 @@ Encoding: 150 viste, DINOv2, VAE posterior mean, luce uniform_texture.
 riduce la memoria necessaria per l'encoding.
 Texture: 2048 px, 100 viste a 1024 px e ottimizzazione ufficiale TRELLIS.
 --texture-size 4096 aumenta la risoluzione e il consumo di memoria/tempo.
+--material-mode unlit mostra l'aspetto baked senza illuminazione aggiuntiva
+del viewer; matte imposta metallic=0 e roughness=1. Il default official
+conserva il materiale upstream. Con unlit/matte, il GLB ufficiale originale
+rimane disponibile in prediction_textured_official.glb. Cambiare questa
+opzione richiede una nuova cartella di output, come gli altri parametri.
 Default --simplify 0 e nessun riempimento di buchi: si preserva la superficie
 decodificata. Opzioni --simplify (frazione da rimuovere) e --fill-holes.
 Le texture provengono dal Gaussian decoder dello SLat generato dal modello;
