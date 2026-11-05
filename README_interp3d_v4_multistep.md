@@ -99,7 +99,63 @@ smoke test con il padre montato.
 La precedente versione a 4 step conserva il proprio launcher e la propria
 directory. Il nuovo job usa un nome di output distinto.
 
-## Training a 8 stadi con LoRA su tutte le attention
+## Training per numero di step con LoRA sulle cross-attention
+
+Il trainer supporta `max_train_steps`: uno step e' un aggiornamento
+dell'optimizer, indipendentemente dal numero di GPU. Il contatore viene
+salvato nei checkpoint e ripristinato alla ripresa; il limite e' il totale
+della run, non un numero di aggiornamenti aggiuntivi a ogni rilancio.
+
+Il nuovo preset usa LoRA solo sulle due cross-attention (`cross_attn` e
+`cross_attn2`, proiezioni `to_q,to_kv`) per **entrambe** le fasi:
+
+| Training | Nodo | GPU | Batch per GPU | LR | Step optimizer |
+|---|---|---|---:|---:|---:|
+| SS | `wn49` | 8 `l40s_vbd` | 1 | `1e-4` | 300.000 |
+| SLat | `wn51` | 2 `h100_vbd` | 1 | `5e-5` | 300.000 |
+
+Dal login dell'Ateneo:
+
+```bash
+cd "$HOME/trellis-singularity/work/MorphFlow"
+git pull --ff-only
+bash slurm/queue_train_v4_steps.sh
+```
+
+Il dataset predefinito e' `morphing_dataset_v4_steps8`. Per usare la versione
+a 2 stadi, con lo stesso numero totale di campioni e gli stessi budget:
+
+```bash
+bash slurm/queue_train_v4_steps.sh --dataset-stages 2
+```
+
+Si possono configurare i budget senza calcolare manualmente le epoche:
+
+```bash
+bash slurm/queue_train_v4_steps.sh --ss-steps 300000 --slat-steps 300000 --check
+```
+
+`--check` verifica piano, dataset e risorse senza inviare job. Togliendolo,
+il comando invia SS e SLat come job indipendenti, con eventuale dipendenza
+dalla generazione. I wrapper diretti sono
+`train_morphflow_v4_steps_ss.slurm` e `train_morphflow_v4_steps_slat.slurm`;
+accettano anche `MAX_TRAIN_STEPS` e `DATA_STAGES` come variabili di ambiente.
+
+Il launcher calcola un tetto di epoche sufficiente per raggiungere il budget,
+poi passa al trainer `--max_train_steps` e `--expected_train_steps`. Con
+100.000 campioni dopo lo swap e batch 1 per GPU, i default equivalgono a
+24 epoche SS e 6 epoche SLat. Per budget non multipli della lunghezza
+dell'epoca, il trainer si ferma allo step esatto e completa validation e
+salvataggio anche alla fine di un'epoca parziale. Il cosine scheduler usa
+il budget di step richiesto.
+
+Le nuove run includono dataset, scope LoRA e budget nel nome, per esempio
+`v4_steps8_ss_lora_cross_bs1_lr1e-4_s300000` e
+`v4_steps8_slat_lora_cross_bs1_lr5e-5_s300000`. La ripresa richiede la stessa
+configurazione. Restano attivi token gate, source swap e prior 0,1 della
+configurazione precedente.
+
+## Preset precedente a epoche con LoRA su tutte le attention
 
 I launcher dedicati montano automaticamente la directory padre e usano
 esclusivamente `morphing_dataset_v4_steps8`:

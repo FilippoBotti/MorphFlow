@@ -45,6 +45,20 @@ def simulate(steps_per_epoch, epochs, limit, start_epoch=1, global_step=0):
 
 
 class TrainingStepLimitTests(unittest.TestCase):
+    def test_new_dataset_requested_ss_and_slat_limits_are_optimizer_steps(self):
+        for steps, epochs, limit in ((12500, 24, 300000), (50000, 6, 300000)):
+            state = simulate(steps, epochs, limit)
+            self.assertEqual(state['global_step'], limit)
+            self.assertEqual(state['observations'][-1], (epochs, steps, limit, 2.0))
+
+    def test_custom_partial_epoch_limit_is_exact_and_completed_resume_does_no_work(self):
+        state = simulate(12500, 2, 12501)
+        self.assertEqual(state['observations'][-1], (2, 1, 12501, 2.0))
+        resumed = simulate(12500, 2, 12501, start_epoch=2, global_step=12500)
+        self.assertEqual(resumed['global_step'], 12501)
+        complete = simulate(50000, 6, 300000, start_epoch=7, global_step=300000)
+        self.assertEqual(complete['observations'], [])
+
     def test_three_gpu_baseline_and_swap_finish_at_250000_with_partial_epoch_validation(self):
         for steps,epochs,last_batches in [(16667,15,16662),(33334,8,16662)]:
             state=simulate(steps,epochs,250000)

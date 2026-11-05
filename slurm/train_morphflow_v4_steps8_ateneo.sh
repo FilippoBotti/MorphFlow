@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared SS/SLat runtime for the v4 eight-stage dataset; submit the wrappers.
+# Shared SS/SLat runtime for the v4 datasets; submit the .slurm wrappers.
 set -euo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }
 FLOW_TARGET="${1:?Expected ss or slat}"
@@ -17,16 +17,24 @@ NGPUS="${NGPUS:-$DEFAULT_GPUS}"
 TRAIN_BS="${TRAIN_BS:-1}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-$DEFAULT_EPOCHS}"
 TRAIN_LR="${TRAIN_LR:-$DEFAULT_LR}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-0}"
+DATA_STAGES="${DATA_STAGES:-8}"
+LORA_ATTENTION_SCOPE="${LORA_ATTENTION_SCOPE:-all}"
+[[ "$MAX_TRAIN_STEPS" =~ ^(0|[1-9][0-9]*)$ ]] || die 'MAX_TRAIN_STEPS must be zero (epochs) or a positive optimizer-step limit.'
+[[ "$DATA_STAGES" == 8 || "$DATA_STAGES" == 2 ]] || die 'DATA_STAGES must be 8 or 2.'
+case "$LORA_ATTENTION_SCOPE" in
+  all) LORA_TARGET_MODULES=to_qkv,to_q,to_kv ;;
+  cross) LORA_TARGET_MODULES=to_q,to_kv ;;
+  *) die 'LORA_ATTENTION_SCOPE must be all or cross.' ;;
+esac
 SEED="${SEED:-42}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
-RUN_NAME="${RUN_NAME:-$DEFAULT_RUN}"
 AUTO_RESUME="${AUTO_RESUME:-1}"
 RESUME_FROM="${RESUME_FROM:-}"
 for value in "$NGPUS" "$TRAIN_BS" "$TRAIN_EPOCHS"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die 'GPU count, batch and epochs must be positive integers.'
 done
 [[ "$SEED" =~ ^[0-9]+$ && "$NUM_WORKERS" =~ ^[0-9]+$ ]] || die 'Seed/workers must be nonnegative integers.'
-[[ "$RUN_NAME" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die 'Invalid RUN_NAME.'
 [[ "$AUTO_RESUME" == 0 || "$AUTO_RESUME" == 1 ]] || die 'AUTO_RESUME must be 0 or 1.'
 python3 - "$TRAIN_LR" <<'PY_LR'
 import math, sys
@@ -38,13 +46,29 @@ if not math.isfinite(value) or value <= 0:
     raise SystemExit('TRAIN_LR must be a positive finite number')
 PY_LR
 
+GLOBAL_BATCH=$((NGPUS * TRAIN_BS))
+TRAIN_SAMPLES=100000
+STEPS_PER_EPOCH=$(((TRAIN_SAMPLES + GLOBAL_BATCH - 1) / GLOBAL_BATCH))
+if (( MAX_TRAIN_STEPS > 0 )); then
+  TRAIN_EPOCHS=$(((MAX_TRAIN_STEPS + STEPS_PER_EPOCH - 1) / STEPS_PER_EPOCH))
+  OPTIMIZER_STEPS="$MAX_TRAIN_STEPS"
+  DEFAULT_RUN="v4_steps${DATA_STAGES}_${FLOW_TARGET}_lora_${LORA_ATTENTION_SCOPE}_bs${TRAIN_BS}_lr${TRAIN_LR}_s${MAX_TRAIN_STEPS}"
+else
+  OPTIMIZER_STEPS=$((TRAIN_EPOCHS * STEPS_PER_EPOCH))
+  if [[ "$DATA_STAGES" != 8 || "$LORA_ATTENTION_SCOPE" != all ]]; then
+    DEFAULT_RUN="v4_steps${DATA_STAGES}_${FLOW_TARGET}_lora_${LORA_ATTENTION_SCOPE}_bs${TRAIN_BS}_lr${TRAIN_LR}_e${TRAIN_EPOCHS}"
+  fi
+fi
+RUN_NAME="${RUN_NAME:-$DEFAULT_RUN}"
+[[ "$RUN_NAME" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_NAME" != . && "$RUN_NAME" != .. ]] || die 'Invalid RUN_NAME.'
+
 DATA_PARENT_HOST="${DATA_PARENT_HOST:-/hpc/scratch/marco.barezzi/3d_dataset/morphing_dataset_v4_steps8_steps2}"
 DATA_PARENT_HOST="${DATA_PARENT_HOST%/}"
-DATA_ROOT_HOST="${DATA_ROOT_HOST:-$DATA_PARENT_HOST/morphing_dataset_v4_steps8}"
+DATA_ROOT_HOST="${DATA_ROOT_HOST:-$DATA_PARENT_HOST/morphing_dataset_v4_steps${DATA_STAGES}}"
 DATA_ROOT_HOST="${DATA_ROOT_HOST%/}"
-[[ "$DATA_ROOT_HOST" == "$DATA_PARENT_HOST/morphing_dataset_v4_steps8" ]] || die 'DATA_ROOT_HOST must select morphing_dataset_v4_steps8 inside DATA_PARENT_HOST.'
+[[ "$DATA_ROOT_HOST" == "$DATA_PARENT_HOST/morphing_dataset_v4_steps${DATA_STAGES}" ]] || die 'DATA_ROOT_HOST must select the requested DATA_STAGES inside DATA_PARENT_HOST.'
 DATA_PARENT_IN=/data/morphing_dataset_v4_steps8_steps2
-DATA_ROOT_IN="$DATA_PARENT_IN/morphing_dataset_v4_steps8"
+DATA_ROOT_IN="$DATA_PARENT_IN/morphing_dataset_v4_steps${DATA_STAGES}"
 ARCHIVE_HOST="${ARCHIVE_HOST:-/hpc/archive/G_VBD/marco.barezzi}"
 OUT_ROOT_HOST="$ARCHIVE_HOST/morphflow_runs"
 OUT_ROOT_IN=/archive/morphflow_runs
@@ -55,19 +79,15 @@ BENCH_HF_HOME="${BENCH_HF_HOME:-/hpc/scratch/marco.barezzi/morph-benchmark/share
 BENCH_TORCH_HOME="${BENCH_TORCH_HOME:-/hpc/scratch/marco.barezzi/morph-benchmark/shared-cache/torch-home}"
 SIF="${SIF:-$HOME/containers/trellis-py240-cu118.sif}"
 TRELLIS_BASE="${TRELLIS_BASE:-$HOME/trellis-singularity}"
-GLOBAL_BATCH=$((NGPUS * TRAIN_BS))
-TRAIN_SAMPLES=100000
-STEPS_PER_EPOCH=$(((TRAIN_SAMPLES + GLOBAL_BATCH - 1) / GLOBAL_BATCH))
-OPTIMIZER_STEPS=$((TRAIN_EPOCHS * STEPS_PER_EPOCH))
 
 echo "FLOW_TARGET=$FLOW_TARGET NGPUS=$NGPUS TRAIN_BS=$TRAIN_BS GLOBAL_BATCH=$GLOBAL_BATCH"
 echo "TRAIN_EPOCHS=$TRAIN_EPOCHS TRAIN_LR=$TRAIN_LR TRAIN_SAMPLES=$TRAIN_SAMPLES SEED=$SEED"
-echo "STEPS_PER_EPOCH=$STEPS_PER_EPOCH OPTIMIZER_STEPS=$OPTIMIZER_STEPS (informational; no step limit)"
+echo "DATA_STAGES=$DATA_STAGES STEPS_PER_EPOCH=$STEPS_PER_EPOCH OPTIMIZER_STEPS=$OPTIMIZER_STEPS MAX_TRAIN_STEPS=$MAX_TRAIN_STEPS (0: epoch control)"
 echo "RUN_NAME=$RUN_NAME"
 echo "DATA_PARENT_HOST=$DATA_PARENT_HOST"
 echo "DATA_ROOT_HOST=$DATA_ROOT_HOST"
 echo "DATA_ROOT_IN=$DATA_ROOT_IN"
-echo 'LORA_ATTENTION_SCOPE=all LORA_TARGET_MODULES=to_qkv,to_q,to_kv GATE=token SOURCE_SWAP=1 PRIOR_WEIGHT=0.1'
+echo "LORA_ATTENTION_SCOPE=$LORA_ATTENTION_SCOPE LORA_TARGET_MODULES=$LORA_TARGET_MODULES GATE=token SOURCE_SWAP=1 PRIOR_WEIGHT=0.1"
 
 # Build the model arguments once; dry-run prints the same arguments passed
 # through the container boundary. All learning-rate groups share TRAIN_LR.
@@ -98,7 +118,7 @@ TRAIN_ARGS=(
   --slat_condition_source slat --source_images_root "$FLUX_ROOT_IN"
   --dino_model dinov2_vitl14_reg
   --lora_rank 32 --lora_alpha 64 --lora_dropout 0.1
-  --lora_attention_scope all --lora_target_modules to_qkv,to_q,to_kv
+  --lora_attention_scope "$LORA_ATTENTION_SCOPE" --lora_target_modules "$LORA_TARGET_MODULES"
   --cond_resample_depth 1 --cond_resample_heads 8 --ss_flow_arch standard
   --endpoint_loss_weight 0.0 --symmetry_loss_weight 0.0
   --endpoint_loss_prob 0.0 --symmetry_loss_prob 0.0
@@ -116,6 +136,9 @@ TRAIN_ARGS=(
   --use_ema 0 --mixed_precision bf16 --allow_tf32 1 --use_checkpoint 0
   --augment_source_swap 1 --checkpoint_every 2
 )
+if (( MAX_TRAIN_STEPS > 0 )); then
+  TRAIN_ARGS+=(--max_train_steps "$MAX_TRAIN_STEPS" --expected_train_steps "$MAX_TRAIN_STEPS")
+fi
 LAUNCH_ARGS=(--num_processes "$NGPUS" --num_machines 1 --mixed_precision bf16 --dynamo_backend no)
 if (( NGPUS > 1 )); then LAUNCH_ARGS+=(--multi-gpu); fi
 if [[ "$MODE" == --dry-run ]]; then
@@ -142,23 +165,24 @@ for directory in "$PROJECT_DIR" "$TRELLIS_BASE/env" "$DATA_PARENT_HOST" "$DATA_R
 done
 [[ -s "$BENCH_TORCH_HOME/hub/facebookresearch_dinov2_main/hubconf.py" ]] || die 'DINOv2 source cache is incomplete.'
 
-# Refuse an unfinished generation and catch accidental selection of v4 K=4/2.
-python3 - "$DATA_ROOT_HOST" <<'PY_DATASET'
+# Refuse an unfinished generation or a different number of stages.
+python3 - "$DATA_ROOT_HOST" "$DATA_STAGES" <<'PY_DATASET'
 import json, os, sys
 root = sys.argv[1]
+stages = int(sys.argv[2])
 def read(name):
     with open(os.path.join(root, name)) as handle:
         return json.load(handle)
 state, plan = read('run_state.json'), read('plan.json')
 if state.get('phase') != 'complete' or state.get('status') != 'complete':
-    raise SystemExit('Eight-stage dataset generation is incomplete: %s' % state)
-if plan.get('k') != 8:
-    raise SystemExit('Expected eight alpha stages per pair, got %r' % plan.get('k'))
+    raise SystemExit('Dataset generation is incomplete: %s' % state)
+if plan.get('k') != stages:
+    raise SystemExit('Expected %d alpha stages per pair, got %r' % (stages, plan.get('k')))
 for split, count in (('train', 50000), ('val', 2000), ('test', 2000)):
     rows = read('metadata_' + split + '.json')
     if len(rows) != count:
         raise SystemExit('Unexpected %s sample count: %d != %d' % (split, len(rows), count))
-print('Eight-stage dataset complete: train=50000 (100000 with swap), val=2000, test=2000')
+print('%d-stage dataset complete: train=50000 (100000 with swap), val=2000, test=2000' % stages)
 PY_DATASET
 
 mkdir -p "$RUN_DIR_HOST/logs" "$RUN_DIR_HOST/checkpoints"
@@ -166,15 +190,19 @@ exec 9>"$RUN_DIR_HOST/.training.lock"
 flock -n 9 || die "Another job is training $RUN_NAME"
 # An interrupted run can resume only the same training configuration.
 export FLOW_TARGET NGPUS TRAIN_BS TRAIN_EPOCHS TRAIN_LR SEED RUN_NAME DATA_ROOT_HOST
+export MAX_TRAIN_STEPS LORA_ATTENTION_SCOPE LORA_TARGET_MODULES
 python3 - "$RUN_DIR_HOST/run_config.json" <<'PY_CONFIG'
 import json, os, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 keys = ('FLOW_TARGET', 'NGPUS', 'TRAIN_BS', 'TRAIN_EPOCHS', 'TRAIN_LR', 'SEED', 'RUN_NAME', 'DATA_ROOT_HOST')
 config = {key: os.environ[key] for key in keys}
-config.update({'lora_attention_scope': 'all', 'lora_target_modules': 'to_qkv,to_q,to_kv',
+config.update({'lora_attention_scope': os.environ['LORA_ATTENTION_SCOPE'],
+               'lora_target_modules': os.environ['LORA_TARGET_MODULES'],
                'lora_rank': 32, 'lora_alpha': 64, 'source_swap': 1, 'condition_gate': 'token',
                'prior_weight': 0.1, 'warmup_steps': 10000})
+if int(os.environ['MAX_TRAIN_STEPS']):
+    config['max_train_steps'] = int(os.environ['MAX_TRAIN_STEPS'])
 if path.exists():
     with path.open() as handle:
         if json.load(handle) != config:
